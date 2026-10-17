@@ -382,10 +382,16 @@ Cost model, roughly, per operation on bytes:
 | `&`, `\|`, `^` | ~500 | ~5000 |
 | `a[i]` read / write | ~70 | ~15·i |
 
-Word operations are 5 to 20 times a byte's; word `/` and `%` loop once per unit
-of the dividend. The IR optimiser turns the common idioms (clear, move, copy,
-constant multiply) into single instructions, so straight-line byte code runs at
-JIT speed. The compiler also tracks cells whose value it knows in straight-line
+Word operations are 5 to 20 times a byte's; word `/` and `%` loop once per bit
+of the dividend. The executed column is what a plain brainfuck interpreter does.
+On this machine the IR optimiser turns the common idioms (clear, move, copy,
+constant multiply) into single instructions, and it also recognises the loops
+whose trip count is a value: the byte compare, the carry and borrow chains of
+multi-byte `+` and `-`, halving (shifts, bitwise operators) and byte division
+each run as one step (`src/ir.cpp`, "loop idioms"). Measured in IR instructions
+executed, a 32-bit `+` is about 40, `<` about 120, `*` about 2 400 and `/` about
+7 000, against 10 000, 2 300, 129 000 and 108 000 without those idioms.
+`bf --profile` shows where a program's instructions go, by statement. The compiler also tracks cells whose value it knows in straight-line
 code: constants, string output and copies of known variables are emitted as the
 shortest delta, and expressions over known variables fold entirely.
 

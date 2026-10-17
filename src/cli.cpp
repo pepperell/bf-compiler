@@ -11,6 +11,8 @@
 #include <io.h>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <map>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -84,6 +86,8 @@ void usage() {
         "  --dump          print the IR and exit\n"
         "  --regs          print the device register map as a Markdown table and exit\n"
         "  --time          print run time and status to stderr\n"
+        "  --profile       run in the interpreter, then report where the executed instructions went\n"
+        "                  (by BFL statement for a .bfl file, by brainfuck byte offset otherwise)\n"
         "  --eof MODE      ',' at end of input: nochange (default), 0, 255\n"
         "  --ram N         RAM cells (default 1048576)\n"
         "  --mmio N        device window cells (default 256, 0 disables devices)\n"
@@ -92,10 +96,71 @@ void usage() {
         stderr);
 }
 
+// --profile: instructions executed per BFL statement (innermost statement only), or
+// per brainfuck byte offset of the instruction for plain brainfuck.
+void report_profile(const Program& prog, const std::vector<uint64_t>& counts, const bfl::Result* lr) {
+    uint64_t total = 0;
+    for (uint64_t n : counts) total += n;
+    fprintf(stderr, "\nprofile: %llu IR instructions executed\n", (unsigned long long)total);
+    if (!total) return;
+    {
+        static const char* names[] = {"ADD", "SET", "MUL", "MOVE", "OUT", "IN", "JZ", "JNZ", "ENDIF", "SCAN", "IDIOM", "LOOPX", "END"};
+        uint64_t per[16] = {};
+        for (size_t pc = 0; pc < counts.size(); pc++) per[prog.code[pc].op] += counts[pc];
+        fprintf(stderr, "by kind:");
+        for (int k = 0; k <= END; k++) if (per[k]) fprintf(stderr, " %s %.1f%%", names[k], 100.0 * (double)per[k] / (double)total);
+        fprintf(stderr, "\n");
+    }
+    std::map<std::pair<int, int>, uint64_t> by;          // (file, line) or (-1, source offset)
+    std::vector<int> parent;
+    if (lr) {
+        std::vector<int> st;
+        for (size_t i = 0; i < lr->stmts.size(); i++) {
+            while (!st.empty() && lr->stmts[(size_t)st.back()].end <= lr->stmts[i].start) st.pop_back();
+            parent.push_back(st.empty() ? -1 : st.back());
+            st.push_back((int)i);
+        }
+    }
+    for (size_t pc = 0; pc < counts.size(); pc++) {
+        if (!counts[pc]) continue;
+        int32_t off = prog.code[pc].src;
+        if (!lr) { by[{-1, off}] += counts[pc]; continue; }
+        auto it = std::upper_bound(lr->stmts.begin(), lr->stmts.end(), off,
+                                   [](int32_t o, const bfl::StmtRange& r) { return o < r.start; });
+        int k = (int)(it - lr->stmts.begin()) - 1;
+        while (k >= 0 && lr->stmts[(size_t)k].end <= off) k = parent[(size_t)k];
+        if (k < 0) { by[{-1, -1}] += counts[pc]; continue; }
+        by[{lr->stmts[(size_t)k].file, lr->stmts[(size_t)k].line}] += counts[pc];
+    }
+    std::vector<std::pair<uint64_t, std::pair<int, int>>> rows;
+    for (auto& kv : by) rows.push_back({kv.second, kv.first});
+    std::sort(rows.rbegin(), rows.rend());
+    for (size_t i = 0; i < rows.size() && i < 30; i++) {
+        auto [n, key] = rows[i];
+        std::string where, text;
+        if (key.first < 0) where = key.second < 0 ? "(outside statements)" : "byte " + std::to_string(key.second);
+        else {
+            where = (key.first > 0 ? lr->files[(size_t)key.first] + ":" : std::string()) + std::to_string(key.second);
+            const std::string& s = lr->sources[(size_t)key.first];
+            size_t a = 0;
+            for (int l = 1; l < key.second && a != std::string::npos; l++) { a = s.find('\n', a); if (a != std::string::npos) a++; }
+            if (a != std::string::npos) {
+                size_t b = s.find('\n', a);
+                text = s.substr(a, b == std::string::npos ? std::string::npos : b - a);
+                size_t f = text.find_first_not_of(" \t");
+                text = f == std::string::npos ? "" : text.substr(f);
+                if (!text.empty() && text.back() == '\r') text.pop_back();
+                if (text.size() > 70) text = text.substr(0, 67) + "...";
+            }
+        }
+        fprintf(stderr, "%14llu %5.1f%%  %-12s %s\n", (unsigned long long)n, 100.0 * (double)n / (double)total, where.c_str(), text.c_str());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    bool use_jit = true, optimise = true, dump = false, show_time = false, quiet = false;
+    bool use_jit = true, optimise = true, dump = false, show_time = false, quiet = false, profile = false;
     Machine::Config cfg;
     std::string src, path, serial_port, emit_path;
     bool lang = false, warn = false, check_heap = false, check_stack = false;
@@ -107,6 +172,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-opt") optimise = false;
         else if (a == "--dump") dump = true;
         else if (a == "--time") show_time = true;
+        else if (a == "--profile") profile = true;
         else if (a == "--quiet-devices") quiet = true;
         else if (a == "--ram") cfg.ram_size = strtoull(need("--ram"), nullptr, 0);
         else if (a == "--mmio") cfg.mmio_size = (uint32_t)strtoul(need("--mmio"), nullptr, 0);
@@ -133,13 +199,14 @@ int main(int argc, char** argv) {
         std::stringstream ss; ss << f.rdbuf(); src = ss.str();
         if (path.size() > 4 && path.compare(path.size() - 4, 4, ".bfl") == 0) lang = true;
     }
+    bfl::Result lr;
     if (lang) {
         bfl::Options lo;
         lo.warnings = warn;
         lo.check_heap = check_heap;
         lo.check_stack = check_stack;
         lo.file_name = path.empty() ? "<code>" : path;
-        bfl::Result lr = bfl::compile(src, cfg.mmio_size, lo);
+        lr = bfl::compile(src, cfg.mmio_size, lo);
         for (const bfl::Error& e : lr.warnings) fprintf(stderr, "%s\n", bfl::format_error(lr, e, "warning").c_str());
         if (!lr.ok()) {
             for (const bfl::Error& e : lr.errors) fprintf(stderr, "%s\n", bfl::format_error(lr, e).c_str());
@@ -196,8 +263,11 @@ int main(int argc, char** argv) {
     g_machine = &m;
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
 
+    std::vector<uint64_t> counts;
+    if (profile) m.profile = &counts;
     RunResult r = m.run(prog, use_jit);
     con.flush();
+    if (profile) report_profile(prog, counts, lang ? &lr : nullptr);
     if (show_time || (r.status != Status::Ok && r.status != Status::Halted))
         fprintf(stderr, "[%s%s%s] %.3f s, final cell %lld\n", status_name(r.status),
                 r.message.empty() ? "" : ": ", r.message.c_str(), r.seconds, (long long)r.ptr);

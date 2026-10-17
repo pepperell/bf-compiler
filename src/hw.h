@@ -161,6 +161,7 @@ struct FramebufferDevice : Device {
     uint8_t read(uint32_t rel) override {
         switch (rel) { case 3: return color; case 4: return y; case 5: return x; default: return 0; }
     }
+    bool plain(uint32_t rel) const override { return rel == 3; }     // the colour latch (x and y wrap)
     void write(uint32_t rel, uint8_t v) override {
         switch (rel) {
         case 0: color = pixels[(y % H) * W + (x % W)]; break;

@@ -5,7 +5,7 @@
 
 namespace bf {
 
-// The first 72 bytes are addressed by machine code; offsets are fixed.
+// The first 80 bytes are addressed by machine code; offsets are fixed.
 struct Ctx {
     uint8_t*  ptr;                                 // 0   current cell (absolute)
     uint8_t*  ram_base;                            // 8   tape + mmio_size  (held in r13)
@@ -17,11 +17,15 @@ struct Ctx {
     void    (*out_fn)(Ctx*, uint32_t);             // 48
     uint32_t(*in_fn)(Ctx*);                        // 56  0..255, or 256 = leave the cell alone
     void*   (*slow_fn)(Ctx*, int32_t pc);          // 64  interpret from pc, return resume address
+    int32_t (*idiom_fn)(Ctx*, int32_t idx);        // 72  run Program::idioms[idx] at ptr: 1 done, 0 run the body
     // ---- not touched by machine code ----
     uint8_t*       tape;
     size_t         tape_size;
     uint32_t       mmio_size;
     const Program* prog;          // the code being interpreted (optimised or literal)
+    const Idiom*   idioms;        // of the optimised program
+    uint64_t*      prof;          // per optimised pc execution counts, or nullptr
+    const uint8_t* plain;         // per device-window cell: 1 for a plain register (Device::plain)
     ConsoleIo*     console;
     const void* const* labels;    // per IR index: non-null where native code can resume
     // Device-window execution: the literal program and the maps between it and
@@ -57,6 +61,10 @@ struct Ctx {
 static_assert(offsetof(Ctx, ptr) == 0 && offsetof(Ctx, ram_base) == 8 && offsetof(Ctx, saved_rsp) == 16, "ctx layout");
 static_assert(offsetof(Ctx, status) == 32 && offsetof(Ctx, stop) == 36 && offsetof(Ctx, exit_common) == 40, "ctx layout");
 static_assert(offsetof(Ctx, out_fn) == 48 && offsetof(Ctx, in_fn) == 56 && offsetof(Ctx, slow_fn) == 64, "ctx layout");
+static_assert(offsetof(Ctx, idiom_fn) == 72, "ctx layout");
+
+// Ctx::idiom_fn: checks that every cell the idiom touches is on the tape first.
+int32_t idiom_thunk(Ctx* c, int32_t idx);
 
 // Interpreter.  Runs from pc.  With until_label set it returns as soon as it
 // reaches an instruction that has a native label while the pointer is in RAM
@@ -67,7 +75,10 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label);
 // interp_run status meaning "this block may touch the device window: run the literal program"
 constexpr int32_t STATUS_NEED_LITERAL = 100;
 
-inline bool is_special(Op o) { return o == JZ || o == JNZ || o == ENDIF || o == SCAN || o == END; }
+inline bool is_special(Op o) { return o == JZ || o == JNZ || o == ENDIF || o == SCAN || o == IDIOM || o == LOOPX || o == END; }
+
+// Run a loop idiom (ir.cpp) with the loop cell at p; false (nothing changed) when a guard fails.
+bool idiom_exec(const Idiom& d, uint8_t* p);
 
 // Lowest pointer offset (<= 0) reachable by the straight-line block starting at i;
 // sets j to the index after the block.

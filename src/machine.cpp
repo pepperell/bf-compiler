@@ -173,6 +173,8 @@ RunResult Machine::run(const Program& p, bool use_jit) {
     ctx.out_fn = machine_out_thunk;
     ctx.in_fn = machine_in_thunk;
     ctx.slow_fn = slow_thunk;
+    ctx.idiom_fn = idiom_thunk;
+    ctx.idioms = p.idioms.data();
     ctx.tape = tape_;
     ctx.tape_size = tape_size_;
     ctx.mmio_size = mmio_size_;
@@ -181,6 +183,7 @@ RunResult Machine::run(const Program& p, bool use_jit) {
     ctx.temp_bp = -1;             // no debugger features in a normal run
     ctx.watch_hit = -1;
 
+    if (profile) { use_jit = false; profile->assign(p.code.size(), 0); ctx.prof = profile->data(); }
     JitCode jit;
     if (use_jit) {
         if (!jit_compile(p, jit)) { r.message = "jit: " + jit.error; return r; }
@@ -197,9 +200,13 @@ RunResult Machine::run(const Program& p, bool use_jit) {
     // from the same source position instead.
     Program lit_prog;                      // interpreter view of the literal code
     lit_prog.code = p.literal;
+    lit_prog.lit_loops = p.lit_loops;
+    std::vector<uint8_t> plain(mmio_size_, 0);
+    for (uint32_t a = 0; a < mmio_size_; a++) plain[a] = dev_[a] && dev_[a]->plain(a - dev_base_[a]);
+    ctx.plain = plain.data();
     const std::vector<Instr>& L = lit_prog.code;
     std::vector<int32_t> lit_pc_of_src(p.src_size + 1, -1);
-    for (size_t i = 0; i < L.size(); i++) if ((size_t)L[i].src <= p.src_size) lit_pc_of_src[L[i].src] = (int32_t)i;
+    for (size_t i = L.size(); i-- > 0;) if ((size_t)L[i].src <= p.src_size) lit_pc_of_src[L[i].src] = (int32_t)i;   // first wins: a LOOPX before its body
     for (int32_t i = (int32_t)p.src_size - 1, last = lit_pc_of_src[p.src_size]; i >= 0; i--) {   // non-command bytes map forward
         if (lit_pc_of_src[i] < 0) lit_pc_of_src[i] = last; else last = lit_pc_of_src[i];
     }
@@ -218,6 +225,7 @@ RunResult Machine::run(const Program& p, bool use_jit) {
     }
     std::vector<int32_t> guard_min(p.code.size(), 0);
     for (size_t i = 0; i < p.code.size();) {
+        if (p.code[i].op == IDIOM) { guard_min[i] = p.code[i].off; i++; continue; }
         if (is_special(p.code[i].op)) { i++; continue; }
         size_t j; int64_t m = block_min_reach(p.code, i, j);
         guard_min[i] = (int32_t)m;

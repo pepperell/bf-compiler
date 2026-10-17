@@ -120,10 +120,17 @@ TALKING TO HARDWARE
 
 OPTIMISATION AND DEVICES
   Loops such as [>+<-] are compiled into single multiply-add instructions.
-  That never changes what a device sees: whenever the pointer can reach the
+  Loops that run a cell's value times with tests inside (a carry chain, a
+  compare, halving, byte division: what BFL's multi-byte arithmetic is made
+  of) are recognised as idioms and run in one step.  Known cell values are
+  carried from block to block, so stores of a value a cell already holds
+  disappear.
+  None of this changes what a device sees: whenever the pointer can reach the
   device window the executor runs the literal program, one command at a time
   (only runs of < and > are merged, since moving touches no cell), so a
-  trigger inside a loop fires once per iteration exactly as written.)";
+  trigger inside a loop fires once per iteration exactly as written.  The
+  only shortcut there: a move or clear loop over RAM and plain registers
+  (ones that behave like memory, such as FB_COLOR) runs in one step.)";
 
 const wchar_t* MEMORY_TEXT = LR"(MEMORY MAP
 
@@ -264,6 +271,8 @@ const wchar_t* CLI_TEXT = LR"(COMMAND LINE: bf.exe
   --dump           print the intermediate code and exit
   --regs           print the memory map as a Markdown table and exit
   --time           print run time and status to stderr
+  --profile        run in the interpreter, then list where the executed
+                   instructions went (by BFL statement for a .bfl file)
   --eof MODE       ',' at end of input: nochange (default), 0, 255
   --ram N          RAM cells (default 1048576)
   --mmio N         device window cells (default 256, 0 disables devices)

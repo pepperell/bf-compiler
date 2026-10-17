@@ -135,7 +135,21 @@ Source is compiled to an optimised IR and then to x64 machine code at run time.
 interpreter on this machine. A naive interpreter takes well over a minute.
 
 Optimisations: run folding, offset fusion (one pointer update per block), clear loops,
-multiply loops with any odd step, conditional once-only loops, scan loops, dead-loop removal.
+multiply loops with any odd step, conditional once-only loops (also with if-blocks inside),
+scan loops, dead-loop removal, known cell values carried across blocks (each block is
+rebuilt from its net effect, so a copy through a known-zero scratch cell is one
+multiply-add), and loop idioms.
+
+**Loop idioms.** BFL's multi-byte arithmetic is built from byte loops that run a cell's
+value times: a carry or borrow chain adding a byte into a number one unit at a time, the
+saturating subtract behind every compare, halving with a remainder bit, byte division.
+The optimiser executes each candidate loop body symbolically (one pass as a function of
+the cells' entry values, as a set of paths with linear expressions), compares that
+function with each idiom's one-pass rule on a set of points that covers every case, and
+on a match puts an `IDIOM` instruction at the top of the body that runs the whole loop at
+once. Scratch cells the loop always leaves holding a constant are checked on entry; if
+one holds something else the body runs as written. `bf --dump` shows them. On
+`programs/samples/raytracer.bfl` this made a frame 16 times faster (2.3 s to 85 ms).
 
 ## Memory map
 
@@ -191,6 +205,11 @@ cell on every turn), and whenever a block of optimised code could reach the devi
 runs the literal copy from the same source position until the pointer is back in RAM at a
 point where the optimised code can resume. So a trigger written inside a loop fires once
 per iteration exactly as the source says, in the JIT, the interpreter and the debugger.
+The one shortcut: a loop the optimiser would turn into multiply-adds runs in one step in
+the literal copy too when every cell it touches is RAM or a *plain* register, one that
+`Device::plain()` says behaves like memory (it reads back exactly what was written, with
+no side effects), such as the framebuffer's colour latch. Then `FB_COLOR = c` costs a few
+bus accesses instead of one per unit of the old and new values.
 
 `programs/leds.b` is a chaser that drives LEDS, paces itself with TICK_LATCH / TICKS1 and
 finishes through HALT. Comments in `.b` files must avoid the eight command characters.
@@ -231,5 +250,6 @@ the stack pointer saved in the prologue. The same handler reports a pointer that
 tape (the tape sits between two 1 GiB reserved guard regions) as status "fault".
 
 **Adding a device.** Derive from `bf::Device`, override `read(rel)` / `write(rel, v)` where
-`rel` is the offset within the mapped range, and call `Machine::map(addr, size, &dev)`. Device
+`rel` is the offset within the mapped range (and `plain(rel)` for registers that behave
+like memory), and call `Machine::map(addr, size, &dev)`. Device
 code runs on the executor thread; use the thread-safe patterns in `devices.h` for UI work.

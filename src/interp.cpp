@@ -24,6 +24,13 @@ inline bool cell_write(Ctx* c, int64_t a, uint32_t v) {
 
 } // namespace
 
+int32_t idiom_thunk(Ctx* c, int32_t idx) {
+    const Idiom& d = c->idioms[idx];
+    int64_t p = c->ptr - c->tape;
+    if (p + d.lo < (int64_t)c->mmio_size || p + d.hi >= (int64_t)c->tape_size) return 0;   // the body faults or uses the bus
+    return idiom_exec(d, c->ptr) ? 1 : 0;
+}
+
 int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
     const Instr* code = c->prog->code.data();
     int64_t p = c->ptr - c->tape;
@@ -67,6 +74,7 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
             last_p = p;
         }
         executed++;
+        if (c->prof && c->prog != c->lit) c->prof[pc]++;
         const Instr& x = code[pc];
         switch (x.op) {
         case ADD:
@@ -108,6 +116,26 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
             if (c->stop) continue;             // top of loop reports the stop
             pc++; break;
         }
+        case LOOPX: {                          // literal program: the loop at once if every cell is RAM or plain
+            const std::vector<Instr>& ops = c->prog->lit_loops[(size_t)x.arg];
+            auto fast = [&](int64_t a) { return a >= ram ? (uint64_t)a < c->tape_size : a >= 0 && c->plain && c->plain[a]; };
+            bool ok = fast(p);
+            for (size_t k = 0; k < ops.size() && ok; k++) ok = fast(p + ops[k].off) && (ops[k].op != MUL || fast(p + ops[k].target));
+            if (!ok) { pc++; break; }
+            for (const Instr& y : ops) {
+                switch (y.op) {
+                case ADD: cell_read(c, p + y.off, v); cell_write(c, p + y.off, v + y.arg); break;
+                case SET: cell_write(c, p + y.off, y.arg); break;
+                default:  cell_read(c, p + y.target, v); cell_read(c, p + y.off, w); cell_write(c, p + y.off, w + v * y.arg); break;
+                }
+            }
+            pc = x.target;
+            break;
+        }
+        case IDIOM:                            // guard_min has kept it out of the device window
+            c->ptr = c->tape + p;
+            pc = idiom_thunk(c, x.arg) ? x.target : pc + 1;
+            break;
         case END:
             c->status = (int32_t)Status::Ok;
             goto done;

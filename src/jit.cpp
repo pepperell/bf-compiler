@@ -106,6 +106,64 @@ bool jit_compile(const Program& p, JitCode& out) {
             i++; break;
         case ENDIF:
             i++; break;
+        case IDIOM: {
+            // the whole loop in one call; a loop that may reach the device window runs literally
+            size_t guard = SIZE_MAX;
+            if (x.off < 0) {
+                e.b({0x49, 0x8D}); e.r12mem(0, x.off);              // lea rax, [r12+lo]
+                e.b({0x4C, 0x39, 0xE8});                           // cmp rax, r13
+                guard = e.jcc(Emitter::CC_B);
+            }
+            const Idiom& d = p.idioms[(size_t)x.arg];
+            if (d.kind == IDIOM_DIVMOD) {
+                e.mov_ctxptr_from_r12();
+                e.mov_rcx_rbx();
+                e.b({0xBA}); e.d32(x.arg);                         // mov edx, idx
+                e.call_ctx(72);                                    // idiom_fn
+                e.b({0x85, 0xC0});                                 // test eax, eax
+                fixups.push_back({e.jcc(Emitter::CC_NE), x.target});
+            } else {
+                for (const Idiom::Guard& g : d.guards) {           // scratch cells: else run the body
+                    if (!g.check) continue;
+                    e.b({0x41, 0x80}); e.r12mem(7, g.off); e.d8(g.val);         // cmp byte [r12+off], val
+                    fixups.push_back({e.jcc(Emitter::CC_NE), (int32_t)i + 1});
+                }
+                e.b({0x41, 0x0F, 0xB6}); e.r12mem(0, 0);           // movzx eax, byte [r12]  (the pass count)
+                switch (d.kind) {
+                case IDIOM_ADD:
+                    for (size_t k = 0; k < d.cells.size(); k++) {
+                        int32_t o = d.cells[k];
+                        if (k == 0) { e.b({0x41, (uint8_t)(d.sign > 0 ? 0x00 : 0x28)}); e.r12mem(0, o); }    // add/sub [r12+o], al
+                        else { e.b({0x41, 0x80}); e.r12mem(d.sign > 0 ? 2 : 3, o); e.d8(0); }             // adc/sbb [r12+o], 0
+                    }
+                    break;
+                case IDIOM_SATSUB:
+                    e.b({0x41, 0x0F, 0xB6}); e.r12mem(1, d.cells[0]);              // movzx ecx, byte [r12+b]
+                    e.b({0x31, 0xD2});                                             // xor edx, edx
+                    e.b({0x28, 0xC1});                                             // sub cl, al
+                    e.b({0x0F, 0x42, 0xCA});                                       // cmovb ecx, edx
+                    e.b({0x41, 0x88}); e.r12mem(1, d.cells[0]);                    // mov [r12+b], cl
+                    break;
+                default:                                                           // IDIOM_HALVE
+                    e.b({0x89, 0xC1});                                             // mov ecx, eax
+                    e.b({0xD1, 0xE9});                                             // shr ecx, 1
+                    e.b({0x41, 0x00}); e.r12mem(1, d.cells[0]);                    // add [r12+h], cl
+                    e.b({0x83, 0xE0, 0x01});                                       // and eax, 1
+                    e.b({0x41, 0x00}); e.r12mem(0, d.cells[1]);                    // add [r12+bit], al
+                    break;
+                }
+                e.b({0x41, 0xC6}); e.r12mem(0, 0); e.d8(0);                        // mov byte [r12], 0
+                for (const Idiom::Guard& g : d.guards) { e.b({0x41, 0xC6}); e.r12mem(0, g.off); e.d8(g.val); }
+                fixups.push_back({e.jmp(), x.target});
+            }
+            if (guard != SIZE_MAX) {
+                size_t over = e.jmp();
+                e.bind(guard, e.pos());
+                e.slow_path((int32_t)i);
+                e.bind(over, e.pos());
+            }
+            i++; break;
+        }
         case END:
             e.b({0x31, 0xC0});                                     // xor eax, eax
             end_jumps.push_back(e.jmp());

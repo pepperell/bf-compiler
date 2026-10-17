@@ -37,6 +37,12 @@ enum Op : uint8_t {
     JNZ,    // if tape[p]!=0 goto target   (']')
     ENDIF,  // no-op; closes a JZ that has no JNZ (loop proven to run <= once)
     SCAN,   // while tape[p]!=0: p += arg
+    IDIOM,  // first instruction of a recognised loop body: run the whole loop in one step
+            // (Program::idioms[arg]) and continue at target, the loop exit; off = lowest
+            // cell offset it touches.  Falls through into the body when a guard fails.
+    LOOPX,  // literal program only: the loop that follows as multiply-adds (Program::lit_loops[arg]),
+            // done in one step when every cell it touches is RAM or a plain device register;
+            // continues at target, the loop exit.  Otherwise falls through into the loop body.
     END
 };
 
@@ -48,10 +54,30 @@ struct Instr {
     int32_t src;            // byte offset in the source of the command this came from
 };
 
+// A loop of the BFL compiler's multi-byte arithmetic that runs a cell's value
+// times (ir.cpp, "loop idioms").  Offsets are relative to the loop cell, which
+// counts the passes and ends at 0.
+enum IdiomKind : uint8_t {
+    IDIOM_ADD,      // cells: the bytes of a little-endian number, += sign * passes (carry/borrow)
+    IDIOM_SATSUB,   // cells[0] = max(cells[0] - passes, 0)
+    IDIOM_HALVE,    // cells[0] += passes / 2, cells[1] += passes % 2
+    IDIOM_DIVMOD,   // cells R, C, Q, B: per pass R++, C--, and when C reaches 0: Q++, R = 0, C = B
+};
+struct Idiom {
+    IdiomKind kind;
+    int8_t    sign = 1;                 // IDIOM_ADD
+    std::vector<int32_t> cells;
+    struct Guard { int32_t off; uint8_t val; bool check; };
+    std::vector<Guard> guards;          // scratch cells: hold val after every pass; check: must hold it on entry
+    int32_t lo = 0, hi = 0;             // range of offsets touched
+};
+
 struct Program {
     std::vector<Instr> code;     // what runs: optimised, or == literal when optimise=false
     std::vector<Instr> literal;  // one instruction per source command (runs of < > folded into one
                                  // move when optimising), always present: it runs in the device window
+    std::vector<Idiom> idioms;   // referenced by IDIOM instructions
+    std::vector<std::vector<Instr>> lit_loops;   // referenced by LOOPX instructions of the literal program
     std::string error;           // non-empty => compile failed
     size_t raw_ops = 0;          // number of brainfuck commands in the source
     size_t src_size = 0;
@@ -69,6 +95,10 @@ struct Device {
     virtual ~Device() {}
     virtual uint8_t read(uint32_t rel)            { (void)rel; return 0; }
     virtual void    write(uint32_t rel, uint8_t v) { (void)rel; (void)v; }
+    // A plain register behaves like memory: reading returns exactly the last value
+    // written and neither has side effects.  Loops over plain registers may then run
+    // as single multiply-adds instead of one bus access per step.
+    virtual bool    plain(uint32_t rel) const      { (void)rel; return false; }
 };
 
 struct ConsoleIo {               // backs the '.' and ',' commands
@@ -114,6 +144,9 @@ public:
     const Config& config() const { return cfg_; }
 
     void      reset();                           // zero RAM
+    // When set, run() uses the interpreter and counts how often each optimised
+    // instruction executes (resized to the program).
+    std::vector<uint64_t>* profile = nullptr;
     RunResult run(const Program& p, bool use_jit = true);
 
     // Thread-safe, callable while run() is executing on another thread.

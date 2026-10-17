@@ -170,8 +170,69 @@ def thirdparty_cases():
     return fails
 
 
+# BFL programs whose arithmetic compiles to the loops the optimiser runs as idioms
+# (src/ir.cpp, "loop idioms").  Each is also run with one cell poked before it
+# starts, so that scratch cells hold unexpected values and the idioms' guards
+# must send the loop through its body.  Everything is checked against the
+# reference interpreter.
+IDIOM_PROGRAMS = [
+    ("compare", "byte x = in; byte y = in; byte f = x < y; out f; f = y < x; out f; f = x >= y; out f;"),
+    ("word-carry", "word a = in; word b = in; a = a * 300 + b; word c = a + 50000; out byte(c), byte(c >> 8);"
+                   " c = a - 40000; out byte(c), byte(c >> 8);"),
+    ("long-mul-div", "long a = in; long b = in; a = a * 100003 + 7; long c = a * b;"
+                     " out byte(c), byte(c >> 8), byte(c >> 16), byte(c >> 24); c = a / (b + 1); out byte(c), byte(c >> 8);"),
+    ("bits", "byte x = in; byte y = in; out x >> 1, x & y, x | y, x ^ y, x << 3;"),
+    ("byte-divmod", "byte a = in; byte b = in; out a / b, a % b;"),
+    ("signed", "int a = in; int b = in; a = a - 100; int c = a * b; out byte(c), byte(c >> 8); c = a / 7; out byte(c), byte(c >> 8);"
+               " if (a < b) { out 1; } else { out 2; }"),
+]
+IDIOM_INPUTS = [b"\xc8\x4d", b"\x00\x00", b"\xff\x01", b"\x05\x05"]
+
+
+def idiom_cases():
+    import tempfile
+    fails = 0
+    tmp = tempfile.mkdtemp()
+    for name, prog in IDIOM_PROGRAMS:
+        bfl = os.path.join(tmp, name + ".bfl")
+        out_b = os.path.join(tmp, name + ".b")
+        open(bfl, "w").write(prog + "\n")
+        r = subprocess.run([BF, "--emit", out_b, bfl], capture_output=True, timeout=60)
+        if r.returncode:
+            print("FAIL idiom-" + name + " (compile)", r.stderr.decode("latin-1")[:300])
+            fails += 1
+            continue
+        base = "".join(ch for ch in open(out_b, encoding="latin-1").read() if ch in "+-<>.,[]")
+        variants = [("", base)] + [(f"poke{k}:{v}", ">" * k + "+" * v + "<" * k + base) for k in range(2, 16) for v in (1,)] \
+                   + [(f"poke{k}:255", ">" * k + "-" + "<" * k + base) for k in (3, 5, 7, 9)]
+        bad = []
+        for stdin in IDIOM_INPUTS:
+            for vname, src in variants:
+                # the unoptimised run executes every command as written (checked against the
+                # reference interpreter by the other cases); a poke may make a program spin
+                path = os.path.join(tmp, "variant.b")
+                open(path, "w", encoding="latin-1").write(src)
+                try:
+                    r = subprocess.run([BF, path, "--eof", "0", "--no-opt", "--quiet-devices"], input=stdin, capture_output=True, timeout=10)
+                except subprocess.TimeoutExpired:
+                    continue
+                expected = r.stdout
+                for label, flags in (("jit", []), ("interp", ["--interp"])):
+                    rc, out, err = run_path(path, stdin, flags)
+                    if rc != r.returncode or out != expected:
+                        bad.append(f"{vname} {stdin!r} {label}: rc={rc} out={out!r} expected={expected!r} {err.strip()[:100]}")
+        print(("PASS " if not bad else "FAIL ") + "idiom-" + name)
+        if bad:
+            fails += 1
+            for b in bad[:6]:
+                print("   " + b)
+    return fails, len(IDIOM_PROGRAMS)
+
+
 def main():
     fails = 0
+    idiom_fails, idiom_n = idiom_cases()
+    fails += idiom_fails
     ok, why = readme_matches_regs()
     print(("PASS " if ok else "FAIL ") + "readme-register-table")
     if not ok:
@@ -202,7 +263,7 @@ def main():
             print("   expected:", expected)
             for k, v in results.items():
                 print(f"   {k}: rc={v[0]} out={v[1]!r} err={v[2]!r}")
-    total = len(CASES) + 1 + len(THIRDPARTY)
+    total = len(CASES) + 1 + len(THIRDPARTY) + idiom_n
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 
