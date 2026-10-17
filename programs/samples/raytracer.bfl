@@ -61,10 +61,9 @@ byte bvis[4]; byte bx0[4]; byte bx1[4]; byte by0[4]; byte by1[4];   // screen bo
 long brow[4];                                   // (O - C) . d at the start of the row
 long lsx[2];  long lsy[2];  byte lvis[2];       // where the lamps appear this frame
 
-// Scalars last.  Brainfuck reaches a cell by stepping the pointer one cell at a
-// time, and temporaries live just above the last global, so the variables that
-// arithmetic works on are declared after the arrays: every operation then
-// travels a few cells instead of hundreds.
+// The working scalars.  The compiler lays out these declarations (everything up
+// to the first statement) by how often they are used, so the busiest end up
+// next to the temporaries and arithmetic travels a few cells, not hundreds.
 long ox;  long oy;  long oz;                    // camera position, Q8
 long fx;  long fy;  long fz;                    // forward, Q12
 long rx;  long rz;                              // right (its y is 0), Q12

@@ -22,6 +22,7 @@ struct Options {
     bool warnings = false;      // collect warnings (Result::warnings)
     bool check_heap = false;    // null and bounds checks on heap accesses
     bool check_stack = false;   // overflow check on rec proc calls
+    bool layout = true;         // place global variables by how often they are used (else in declaration order)
     std::string file_name;      // main file name, for messages and relative imports
 };
 

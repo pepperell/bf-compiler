@@ -1794,6 +1794,7 @@ struct Gen {
             declare(v, s.pos);
             return;
         }
+        if (scopes.size() == 1 && call_stack.empty()) place_group(s);
         auto pre = prealloc.find(&s);
         if (s.count >= 0) {
             v.cell = pre != prealloc.end() ? pre->second : alloc((int)array_total(v));
@@ -2766,12 +2767,122 @@ struct Gen {
         for (auto& s : sr->heap_init) for (size_t i = 0; i < s.second.size(); i++) put(s.first + (int64_t)i, (unsigned char)s.second[i]);
     }
 
+    // ---- layout of the global variables ---------------------------------------------------------------
+    // Brainfuck reaches a cell by stepping the pointer, and temporaries live just
+    // above the last variable, so the cost of a variable is roughly how often code
+    // refers to it times its distance from the top.  The globals are laid out before
+    // any code is generated: each is counted once per reference, a procedure's body
+    // once per inlined call, and they are placed by references per cell, the densest
+    // nearest the top (which minimises the total distance: Smith's rule).
+    void count_refs(const Expr& e, double w, std::unordered_map<std::string, double>& refs,
+                    std::unordered_map<std::string, double>& calls, const std::unordered_set<std::string>& shadow) {
+        if ((e.kind == Expr::Name) && !shadow.count(e.text)) refs[e.text] += w;
+        if (e.kind == Expr::Call) calls[e.text] += w;
+        if (e.a) count_refs(*e.a, w, refs, calls, shadow);
+        if (e.b) count_refs(*e.b, w, refs, calls, shadow);
+        for (auto& x : e.args) count_refs(*x, w, refs, calls, shadow);
+    }
+    void count_refs(const Stmt& s, double w, std::unordered_map<std::string, double>& refs,
+                    std::unordered_map<std::string, double>& calls, const std::unordered_set<std::string>& shadow) {
+        if (s.kind == Stmt::Proc) return;
+        if (s.kind == Stmt::Call) calls[s.name] += w;
+        if (s.kind == Stmt::Decl && !shadow.count(s.name) && s.e) refs[s.name] += w;
+        if (s.target) count_refs(*s.target, w, refs, calls, shadow);
+        if (s.e) count_refs(*s.e, w, refs, calls, shadow);
+        if (s.init) count_refs(*s.init, w, refs, calls, shadow);
+        if (s.step) count_refs(*s.step, w, refs, calls, shadow);
+        for (auto& x : s.args) count_refs(*x, w, refs, calls, shadow);
+        for (auto& x : s.body) count_refs(*x, w, refs, calls, shadow);
+        for (auto& x : s.else_body) count_refs(*x, w, refs, calls, shadow);
+    }
+    static void declared_names(const std::vector<StmtP>& v, std::unordered_set<std::string>& out) {
+        for (auto& s : v) {
+            if (s->kind == Stmt::Decl || s->kind == Stmt::Const) out.insert(s->name);
+            if (s->init && s->init->kind == Stmt::Decl) out.insert(s->init->name);
+            declared_names(s->body, out);
+            declared_names(s->else_body, out);
+        }
+    }
+    void layout_globals(const Program& prog) {
+        std::unordered_map<std::string, double> refs, calls;
+        std::unordered_set<std::string> none;
+        for (auto& s : prog.items) count_refs(*s, 1.0, refs, calls, none);
+        // each procedure's references, scaled by the number of times it is inlined
+        struct PRefs { std::unordered_map<std::string, double> refs, calls; };
+        std::unordered_map<std::string, PRefs> per;
+        for (auto& kv : procs) {
+            if (kv.second.prelude) continue;
+            const Stmt& d = *kv.second.decl;
+            std::unordered_set<std::string> shadow;
+            for (const Param& p : d.params) shadow.insert(p.name);
+            declared_names(d.body, shadow);
+            PRefs& pr = per[kv.first];
+            for (auto& s : d.body) count_refs(*s, 1.0, pr.refs, pr.calls, shadow);
+        }
+        std::unordered_map<std::string, double> times;          // inlined copies of each procedure
+        std::function<void(const std::string&, double, int)> visit = [&](const std::string& p, double w, int depth) {
+            auto it = per.find(p);
+            if (it == per.end() || depth > 64) return;
+            times[p] += w;
+            for (auto& c : it->second.calls) visit(c.first, w * c.second, depth + 1);
+        };
+        for (auto& c : calls) visit(c.first, c.second, 0);
+        for (auto& kv : per) {
+            double t = times.count(kv.first) ? times[kv.first] : 0.0;
+            for (auto& r : kv.second.refs) refs[r.first] += t * r.second;
+        }
+        // Groups: runs of declarations with no code between them.  A group is laid out
+        // when its first declaration is reached, so code before it keeps its
+        // temporaries close to the variables that exist then.
+        std::vector<const Stmt*> group;
+        auto flush = [&] {
+            if (group.size() > 1) {
+                auto g = std::make_shared<std::vector<const Stmt*>>(group);
+                std::stable_sort(g->begin(), g->end(), [&](const Stmt* a, const Stmt* b) {
+                    auto density = [&](const Stmt* s) {
+                        Var tv; tv.type = s->vtype; tv.count = s->count;
+                        int64_t size = s->count >= 0 ? array_total(tv) : tv.size();
+                        double r = refs.count(s->name) ? refs[s->name] : 0.0;
+                        return r / (double)std::max<int64_t>(size, 1);
+                    };
+                    return density(a) < density(b);
+                });
+                for (const Stmt* d : group) layout_group[d] = g;
+            }
+            group.clear();
+        };
+        for (auto& s : prog.items) {
+            switch (s->kind) {
+            case Stmt::Proc: case Stmt::Const: case Stmt::Struct: case Stmt::Import: case Stmt::Stack: case Stmt::Heap: continue;
+            case Stmt::Decl:
+                if (s->in_heap) continue;
+                group.push_back(s.get());              // an initialiser runs after the whole group is placed
+                continue;
+            default: flush();
+            }
+        }
+        flush();
+    }
+    std::unordered_map<const Stmt*, std::shared_ptr<std::vector<const Stmt*>>> layout_group;
+    void place_group(const Stmt& s) {
+        auto it = layout_group.find(&s);
+        if (it == layout_group.end()) return;
+        auto g = it->second;
+        for (const Stmt* d : *g) {
+            layout_group.erase(d);
+            if (prealloc.count(d)) continue;
+            Var tv; tv.type = d->vtype; tv.count = d->count;
+            prealloc[d] = alloc((int)(d->count >= 0 ? array_total(tv) : tv.size()));
+        }
+    }
+
     void run(const Program& prog) {
         register_procs(prelude, true);
         register_procs(prog, false);
         out += "# compiled by bfl\n";
         heap_init();
         if (sr && sr->main_tramp) { gen_trampoline(prog); res.cells_used = high - ram; return; }
+        if (opt.layout) layout_globals(prog);
         push_scope(true);
         ExitCtx mc; mc.kind = ExitCtx::Proc; mc.needs = contains_return(prog.items);
         if (mc.needs) { mc.alive = tmp(); set(mc.alive, 1); }

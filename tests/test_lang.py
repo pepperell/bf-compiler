@@ -515,7 +515,8 @@ def golden(update):
 def samples(update):
     """programs/samples/*.bfl must compile without warnings and print tests/samples/<name>.out
     (fed tests/samples/<name>.in when present).  A file without a .out (a module, or an animation that runs until stopped) must compile.
-    --update-golden also rewrites the .out files.  Returns (checked, failures)."""
+    --update-golden also rewrites the .out files that exist (create an empty one for a new sample;
+    animations have none, so they are never run).  Returns (checked, failures)."""
     root = os.path.join(os.path.dirname(__file__), "..")
     sdir = os.path.join(root, "programs", "samples")
     edir = os.path.join(root, "tests", "samples")
@@ -529,7 +530,7 @@ def samples(update):
         want_path = os.path.join(edir, base + ".out")
         in_path = os.path.join(edir, base + ".in")
         stdin = open(in_path, "rb").read() if os.path.exists(in_path) else b""
-        if not os.path.exists(want_path) and not update:
+        if not os.path.exists(want_path):
             r = subprocess.run([BF, "--warn", "--emit", os.path.join(TMP, base + ".b"), src], capture_output=True, timeout=120)
             ok = r.returncode == 0 and b"warning" not in r.stderr
             print(("PASS " if ok else "FAIL ") + f"sample-{name} (no expected output: must compile without warnings)")

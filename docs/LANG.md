@@ -402,6 +402,14 @@ These are the building blocks; knowing them helps read the output and write
 
 - **Temporaries** come from a stack just above the variables and are always
   returned to zero, so a fresh temporary is known to be 0.
+- **Layout of globals.** The pointer reaches a cell one step at a time, so a
+  variable costs roughly its references times its distance from the
+  temporaries. Each run of top-level declarations with no other statement
+  between them is laid out together when the first is reached: by references
+  per cell (a procedure's body counts once per inlined call), the densest
+  nearest the temporaries. The order of declarations within such a run does not
+  matter; a declaration after other statements still starts a new run above
+  the variables that exist then.
 - **Clear** `[-]`, **move** `a[-b+a]`, **copy** `a[-b+t+a]t[-a+t]`.
 - **If** `c[ body c[-] ]` on a temporary copy of the condition;
   **if/else** adds a flag cell set to 1 and cleared by the taken branch.

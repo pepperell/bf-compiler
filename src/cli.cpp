@@ -205,6 +205,7 @@ int main(int argc, char** argv) {
         lo.warnings = warn;
         lo.check_heap = check_heap;
         lo.check_stack = check_stack;
+        if (getenv("BFL_NO_LAYOUT")) lo.layout = false;            // for measuring
         lo.file_name = path.empty() ? "<code>" : path;
         lr = bfl::compile(src, cfg.mmio_size, lo);
         for (const bfl::Error& e : lr.warnings) fprintf(stderr, "%s\n", bfl::format_error(lr, e, "warning").c_str());
