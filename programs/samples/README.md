@@ -4,7 +4,8 @@ Small programs that use the newer parts of BFL: integer types, structs,
 pointers and the heap, strings, imports, and recursion. Run one with
 `bf programs\samples\NAME.bfl`, or open it in `bfui` and press F5 (Ctrl+F5 to
 debug it statement by statement). `tests\test_lang.py` runs every sample and
-compares its output with `tests\samples\NAME.out`.
+compares its output with `tests\samples\NAME.out`; `cube.bfl` runs until
+stopped, so it is only compiled there.
 
 | File | What it does | Features it shows |
 |------|--------------|-------------------|
@@ -16,6 +17,7 @@ compares its output with `tests\samples\NAME.out`.
 | `text.bfl` | Sorts words, builds a sentence, converts numbers to text and back | `import "strings.bfl"`, string pointers, `strdup` and `free` |
 | `numbers.bfl` | Factorials, Fibonacci, wrap-around, signed division, Collatz | `sbyte` `int` `dword` `long`, casts, shifts, `import "math.bfl"` |
 | `maze.bfl` + `queue.bfl` | Shortest path through a maze by breadth-first search | A program in two files, a struct passed by `ref`, heap arrays |
+| `cube.bfl` | A revolving 3D wireframe cube, every frame computed live | Integer trigonometry (Bhaskara's sine), perspective, Bresenham lines, a heap frame buffer, colour escapes |
 | `life.bfl` | Conway's Game of Life, animated in the terminal | Swapping heap grids through pointers, ANSI escapes, the `TICKS` clock |
 
 Things to try in the UI:

@@ -1,0 +1,184 @@
+// cube.bfl - a revolving 3D wireframe cube, drawn live in the terminal.
+//
+// Every frame is computed from scratch: the eight corners are rotated about
+// two axes with integer trigonometry, projected with perspective, and the
+// twelve edges are drawn with Bresenham's line algorithm into a character
+// buffer in the heap, which is then printed with VT100 escape codes.
+// There is no sine table: sine comes from Bhaskara I's rational formula,
+// which needs only whole-number arithmetic.  Far edges are drawn dim and
+// first, near edges bright and on top, so the cube reads as solid in depth.
+//
+//     bfui programs\samples\cube.bfl     F5 runs it, Shift+F5 stops
+//     bf programs\samples\cube.bfl       Ctrl+C stops (needs a VT100 console)
+
+const W = 64;              // frame buffer size in characters
+const H = 23;
+const CX = 32;             // centre of the picture
+const CY = 11;
+const SIZE = 100;          // half the edge length, in model units
+const DIST = 400;          // camera distance: smaller means stronger perspective
+const FX = 32;             // horizontal scale (terminal cells are twice as tall as wide)
+const FY = 16;             // vertical scale
+const STEP_A = 3;          // degrees per frame about the vertical axis
+const STEP_B = 2;          // degrees per frame about the horizontal axis
+const DELAY_MS = 30;       // pause between frames
+const FRAMES = 0;          // frames to show; 0 = until stopped
+
+heap byte screen[1472];    // W * H
+
+// the model: corner v has x, y, z = +-SIZE from bits 0, 1, 2 of v
+int  mx[8];
+int  my[8];
+int  mz[8];
+// projected corners for the current frame
+int  px[8];
+int  py[8];
+int  pz[8];
+// edges join corners that differ in one bit
+byte ea[12];
+byte eb[12];
+
+// Sine of a whole number of degrees, times 1024.  Bhaskara I (7th century):
+// sin x = 4x(180 - x) / (40500 - x(180 - x)) for 0 <= x <= 180, error under 0.2%.
+proc int sin1024(word deg) {
+    deg = deg % 360;
+    byte neg = 0;
+    if (deg >= 180) { deg -= 180; neg = 1; }
+    long p = long(deg) * (180 - deg);
+    int s = int(4096 * p / (40500 - p));
+    if (neg) { return -s; }
+    return s;
+}
+
+proc plot(int x, int y, byte c) {
+    if (x >= 0 && x < W && y >= 0 && y < H) { screen[word(y) * W + word(x)] = c; }
+}
+
+// Bresenham's line from (x0, y0) to (x1, y1), all octants.
+proc line(int x0, int y0, int x1, int y1, byte c) {
+    int dx = x1 - x0;
+    if (dx < 0) { dx = -dx; }
+    int dy = y1 - y0;
+    if (dy > 0) { dy = -dy; }
+    int sx = 1;
+    if (x0 > x1) { sx = -1; }
+    int sy = 1;
+    if (y0 > y1) { sy = -1; }
+    int err = dx + dy;
+    while (1) {
+        plot(x0, y0, c);
+        if (x0 == x1 && y0 == y1) { break; }
+        int e2 = err * 2;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+// The character that best follows a line's direction on screen.
+proc byte slope_char(int dx, int dy) {
+    int ax = dx;
+    if (ax < 0) { ax = -ax; }
+    int ay = dy;
+    if (ay < 0) { ay = -ay; }
+    if (ay * 2 < ax) { return '-'; }
+    if (ax * 2 < ay) { return '|'; }
+    if ((dx < 0) == (dy < 0)) { return '\\'; }
+    return '/';
+}
+
+proc wait(byte ms) {
+    pulse TICK_LATCH;
+    byte t0 = TICKS0;
+    byte gone = 0;
+    while (gone < ms) {
+        pulse TICK_LATCH;
+        gone = TICKS0 - t0;
+    }
+}
+
+// ---- set up the model ------------------------------------------------------------------
+byte v;
+byte n = 0;
+for (v = 0; v < 8; v++) {
+    mx[v] = -SIZE; if (v & 1) { mx[v] = SIZE; }
+    my[v] = -SIZE; if (v & 2) { my[v] = SIZE; }
+    mz[v] = -SIZE; if (v & 4) { mz[v] = SIZE; }
+    byte bit;
+    for (bit = 1; bit < 8; bit = bit << 1) {
+        if ((v & bit) == 0) { ea[n] = v; eb[n] = v | bit; n++; }
+    }
+}
+
+out "\e[2J\e[?25l";                       // clear the screen, hide the cursor
+word angle_a = 0;
+word angle_b = 0;
+word frame = 0;
+while (FRAMES == 0 || frame < FRAMES) {
+    int sa = sin1024(angle_a);
+    int ca = sin1024(angle_a + 90);
+    int sb = sin1024(angle_b);
+    int cb = sin1024(angle_b + 90);
+
+    // rotate about y by a, then about x by b, then project
+    for (v = 0; v < 8; v++) {
+        long x = mx[v];
+        long y = my[v];
+        long z = mz[v];
+        long x1 = (x * ca + z * sa) / 1024;
+        long z1 = (z * ca - x * sa) / 1024;
+        long y2 = (y * cb - z1 * sb) / 1024;
+        long z2 = (y * sb + z1 * cb) / 1024;
+        long d = z2 + DIST;
+        px[v] = int(CX + x1 * FX / d);
+        py[v] = int(CY + y2 * FY / d);
+        pz[v] = int(z2);
+    }
+
+    // draw: clear, far edges dim, near edges bright, then the corners
+    word i;
+    for (i = 0; i < W * H; i++) { screen[i] = ' '; }
+    byte pass;
+    for (pass = 0; pass < 2; pass++) {
+        byte e;
+        for (e = 0; e < 12; e++) {
+            byte a = ea[e];
+            byte b = eb[e];
+            byte far = pz[a] + pz[b] > 0;          // z grows away from the viewer
+            if (far == (pass == 0)) {
+                byte c = '.';
+                if (pass == 1) { c = slope_char(px[b] - px[a], py[b] - py[a]); }
+                line(px[a], py[a], px[b], py[b], c);
+            }
+        }
+    }
+    for (v = 0; v < 8; v++) {
+        if (pz[v] <= 0) { plot(px[v], py[v], 'o'); }
+    }
+
+    // show it: home the cursor and print the buffer, switching colour only when it changes
+    out "\e[H\e[1;37mBFL wireframe cube\e[0m   frame ";
+    print frame, "   angles ", angle_a, " ", angle_b, "   \n";
+    byte colour = 0;
+    byte row;
+    for (row = 0; row < H; row++) {
+        byte col;
+        for (col = 0; col < W; col++) {
+            byte ch = screen[word(row) * W + col];
+            byte want = colour;
+            if (ch == '.') { want = 1; } else if (ch == 'o') { want = 3; } else if (ch != ' ') { want = 2; }
+            if (want != colour) {
+                if (want == 1) { out "\e[0;34m"; } else if (want == 2) { out "\e[0;1;36m"; } else { out "\e[0;1;33m"; }
+                colour = want;
+            }
+            out ch;
+        }
+        out '\n';
+    }
+    out "\e[0m";
+
+    angle_a = (angle_a + STEP_A) % 360;
+    angle_b = (angle_b + STEP_B) % 360;
+    frame++;
+    wait(DELAY_MS);
+}
+out "\e[?25h";                            // cursor back on
