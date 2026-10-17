@@ -80,6 +80,10 @@ program ends after the last one or at a top-level `return;`.
 ## Procedures and recursion
 
 Procedures are declared at the top level and may appear after their first use.
+Scoping is lexical: a procedure body sees its parameters, its own locals, and the
+top-level variables and constants declared before the procedure. A call from the
+main program must also come after the declarations of every top-level variable
+the procedure uses, directly or through procedures it calls.
 `proc byte f(...)` and `proc word f(...)` return a value with `return e;`; a
 procedure without a result type uses plain `return;`, and a procedure that
 reaches its closing brace returns 0. A call with a result can be used as an
@@ -180,6 +184,25 @@ pulse TICK_LATCH; t = TICKS0;                                 // sample the cloc
 `while (REG)` and `if (REG)` test the register without writing it: the compiler
 loops on the register cell directly, or uses a pointer-resynchronising idiom (see
 below) that only reads it.
+
+## Errors and warnings
+
+The compiler checks the whole program before generating any code and reports
+every error it finds, up to 20, as `file:line:col: message` in source order.
+After a syntax error it skips to the next `;` or `}` and carries on, so one
+missing semicolon does not hide the rest. Syntax errors are reported first;
+the meaning of the program is checked once it parses.
+
+Warnings are off by default in `bf.exe` (`--warn` turns them on) and always on in
+the UI:
+
+- a variable that is never read;
+- a value truncated by an assignment, argument or return (`byte b = w;`);
+- unreachable code after `return`, `break` or `continue`;
+- combining signed and unsigned values of the same width, which is unsigned.
+
+In the UI the status bar shows the first error and how many there are; F4 and
+Shift+F4 step through errors and warnings and select the line.
 
 ## The debugger
 

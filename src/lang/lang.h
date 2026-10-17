@@ -15,6 +15,14 @@ namespace bfl {
 struct Error {
     int line, col;          // 1-based; line 0 = no position
     std::string msg;
+    int file = 0;           // index into Result::files
+};
+
+struct Options {
+    bool warnings = false;      // collect warnings (Result::warnings)
+    bool check_heap = false;    // null and bounds checks on heap accesses
+    bool check_stack = false;   // overflow check on rec proc calls
+    std::string file_name;      // main file name, for messages and relative imports
 };
 
 // One source statement and the byte range of brainfuck generated for it.
@@ -41,13 +49,18 @@ struct Result {
     std::vector<StmtRange>  stmts;
     std::vector<Symbol>     symbols;
     std::vector<Error>      errors;      // empty on success
+    std::vector<Error>      warnings;
+    std::vector<std::string> files;      // file names by index (0 = the main file)
     int64_t                 cells_used = 0;
     int64_t                 sp_cell = -1;    // trampoline stack pointer cell, -1 if no rec procs are used
     bool ok() const { return errors.empty(); }
 };
 
 // ram_start is the first RAM cell (the machine's mmio_size); the pointer starts there.
-Result compile(const std::string& source, uint32_t ram_start = 256);
+Result compile(const std::string& source, uint32_t ram_start = 256, const Options& opt = Options());
+
+// "file:line:col: message" for an error or warning.
+std::string format_error(const Result& r, const Error& e, const char* kind = nullptr);
 
 // Text form of the statement map and symbols, written next to --emit output.
 std::string describe(const Result& r);

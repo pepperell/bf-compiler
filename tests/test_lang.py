@@ -41,6 +41,43 @@ def check(name, src, expected, stdin=b"", extra=(), modes=(("jit", []), ("interp
     return ok
 
 
+def check_diags(name, src, fragments, flags=(), expect_rc=None):
+    """Every fragment must appear on its own line of stderr, in order; no other diagnostic lines."""
+    rc, out, err = run(src, b"", list(flags) + ["--mmio", "256"])
+    lines = [l for l in err.splitlines() if ": " in l and l.count(":") >= 3]
+    ok = len(lines) == len(fragments) and all(f in l for f, l in zip(fragments, lines))
+    if expect_rc is not None:
+        ok = ok and rc == expect_rc
+    print(("PASS " if ok else "FAIL ") + name)
+    if not ok:
+        print(f"   expected {fragments!r} rc={expect_rc}, got rc={rc}:")
+        for l in err.splitlines():
+            print("   | " + l)
+    return ok
+
+
+DIAGS = [
+    # several errors in one compile, each reported once, in source order
+    ("diag-several-parse-errors", "byte a = ;\nbyte b = 1 +;\nout 1\nbyte c;\n",
+     ["1:10: unexpected ';' in expression", "2:13: unexpected ';' in expression", "4:1: expected ';' before 'byte'"], (), 1),
+    ("diag-several-semantic-errors", "byte b = 300;\nc = 1;\nbreak;\nout HALT;\n",
+     ["1:10: value 300 does not fit a byte", "2:1: 'c' is not declared", "3:1: 'break' outside a loop", "4:5: HALT is write-only"], (), 1),
+    ("diag-error-recovery-in-block", "while (1) { byte x = ; out 1 2; }",
+     ["1:22: unexpected ';' in expression", "1:30: expected ';' before '2'"], (), 1),
+    ("warn-unused", "byte used = 1; byte unused = 2; proc f() { byte local; } f(); out used;",
+     ["1:16: warning: variable 'unused' is never read", "1:44: warning: variable 'local' is never read"], ["--warn"], 0),
+    ("warn-truncation", "word w = 300; byte b = w; out b;",
+     ["1:24: warning: value of type 'word' is truncated to 'byte'"], ["--warn"], 0),
+    ("warn-unreachable", "proc f() { return; out 1; } f(); byte i; for (i = 0; i < 2; i++) { break; out 2; }",
+     ["1:20: warning: unreachable code", "1:75: warning: unreachable code"], ["--warn"], 0),
+    ("warn-off-by-default", "byte unused = 2;", [], (), 0),
+    ("diag-global-after-call", "f(); byte g = 0; proc f() { g++; }",
+     ["1:1: 'f' uses 'g', which is declared after this call"], (), 1),
+    ("diag-lexical-scope", "proc f() { out x; } byte x = 1; f();",
+     ["1:16: 'x' is not declared"], (), 1),
+]
+
+
 def check_error(name, src, fragment):
     rc, out, err = run(src)
     ok = rc == 1 and fragment in err
@@ -299,7 +336,10 @@ def main():
     for name, src, frag in errors:
         if not check_error(name, src, frag):
             fails += 1
-    total = len(CASES) + 3 + len(errors)
+    for name, src, frags, flags, rc in DIAGS:
+        if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
+            fails += 1
+    total = len(CASES) + 3 + len(errors) + len(DIAGS)
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

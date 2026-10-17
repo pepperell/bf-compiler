@@ -71,8 +71,12 @@ BOOL WINAPI ctrl_handler(DWORD) { if (g_machine) g_machine->request_stop(); retu
 
 void usage() {
     fputs(
-        "usage: bf [options] program.b\n"
+        "usage: bf [options] program.b | program.bfl\n"
         "       bf [options] -e 'code'\n"
+        "  A .bfl file (or --lang) is compiled from BFL to brainfuck first.\n"
+        "  --lang          treat the input as BFL whatever its name\n"
+        "  --emit FILE     write the brainfuck produced from a .bfl file to FILE (and FILE.map), then exit\n"
+        "  --warn          report BFL warnings (unused variables, truncation, unreachable code)\n"
         "  --interp        run the IR interpreter instead of the x64 JIT\n"
         "  --no-opt        disable IR optimisation\n"
         "  --dump          print the IR and exit\n"
@@ -92,7 +96,7 @@ int main(int argc, char** argv) {
     bool use_jit = true, optimise = true, dump = false, show_time = false, quiet = false;
     Machine::Config cfg;
     std::string src, path, serial_port, emit_path;
-    bool lang = false;
+    bool lang = false, warn = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto need = [&](const char* what) -> const char* { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", what); exit(2); } return argv[++i]; };
@@ -113,6 +117,7 @@ int main(int argc, char** argv) {
         else if (a == "--serial") serial_port = need("--serial");
         else if (a == "--emit") emit_path = need("--emit");
         else if (a == "--lang") lang = true;
+        else if (a == "--warn") warn = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 2; }
         else path = a;
@@ -125,9 +130,13 @@ int main(int argc, char** argv) {
         if (path.size() > 4 && path.compare(path.size() - 4, 4, ".bfl") == 0) lang = true;
     }
     if (lang) {
-        bfl::Result lr = bfl::compile(src, cfg.mmio_size);
+        bfl::Options lo;
+        lo.warnings = warn;
+        lo.file_name = path.empty() ? "<code>" : path;
+        bfl::Result lr = bfl::compile(src, cfg.mmio_size, lo);
+        for (const bfl::Error& e : lr.warnings) fprintf(stderr, "%s\n", bfl::format_error(lr, e, "warning").c_str());
         if (!lr.ok()) {
-            for (const bfl::Error& e : lr.errors) fprintf(stderr, "%s:%d:%d: %s\n", path.empty() ? "<code>" : path.c_str(), e.line, e.col, e.msg.c_str());
+            for (const bfl::Error& e : lr.errors) fprintf(stderr, "%s\n", bfl::format_error(lr, e).c_str());
             return 1;
         }
         if (!emit_path.empty()) {

@@ -20,6 +20,7 @@
 // See docs/TRAMPOLINE.md.
 #include "lang.h"
 #include "ast.h"
+#include "sema.h"
 #include "../registers.h"
 #include <algorithm>
 #include <cstring>
@@ -172,6 +173,9 @@ struct Gen {
     }
 
     [[noreturn]] void fail(Pos p, const std::string& m) { throw Fail{p, m}; }
+    static int ret_of(const Stmt* d) { return d->vtype ? d->vtype->size : 0; }
+    static bool pw(const Param& p) { return p.type && p.type->size == 2; }
+    static bool dw(const Stmt& s) { return s.vtype && s.vtype->size == 2; }
     [[noreturn]] void internal(const std::string& m) { throw Fail{Pos{0, 0, 0}, "internal compiler error: " + m}; }
 
     int line_of(int32_t off) const {
@@ -586,6 +590,7 @@ struct Gen {
 
     // ---- expression analysis --------------------------------------------------------------------
     int width(const Expr& e) {
+        if (e.type && e.type->is_int()) return e.type->size;
         switch (e.kind) {
         case Expr::Num: return e.value > 255 ? 2 : 1;
         case Expr::Str: fail(e.pos, "a string can only appear in an out statement");
@@ -598,13 +603,12 @@ struct Gen {
         case Expr::Call: {
             ProcInfo* p = find_proc(e.text);
             if (!p) fail(e.pos, "'" + e.text + "' is not a procedure");
-            if (!p->decl->ret) fail(e.pos, "'" + e.text + "' returns nothing and cannot be used in an expression");
-            return p->decl->ret;
+            if (!ret_of(p->decl)) fail(e.pos, "'" + e.text + "' returns nothing and cannot be used in an expression");
+            return ret_of(p->decl);
         }
+        case Expr::Cast: return e.ts.base == "word" ? 2 : 1;
         case Expr::Unary:
             if (e.text == "!") return 1;
-            if (e.text == "word") return 2;
-            if (e.text == "byte") return 1;
             return width(*e.a);
         case Expr::Binary: {
             const std::string& o = e.text;
@@ -633,9 +637,9 @@ struct Gen {
         }
         case Expr::Index: {
             if (!use_known) return std::nullopt;
-            Var* v = find_var(e.text);
+            Var* v = find_var(e.a->text);
             if (!v || v->count < 0) return std::nullopt;
-            auto i = fold(*e.a, true);
+            auto i = fold(*e.b, true);
             if (!i || *i < 0 || *i >= v->count) return std::nullopt;
             return known_val(array_cell(v->cell, (int)*i));
         }
@@ -646,7 +650,12 @@ struct Gen {
             if (e.text == "-") return (-*a) & mask;
             if (e.text == "!") return *a == 0 ? 1 : 0;
             if (e.text == "~") return (~*a) & mask;
-            return *a & mask;      // byte()/word() casts
+            return *a & mask;
+        }
+        case Expr::Cast: {
+            auto a = fold(*e.a, use_known);
+            if (!a) return std::nullopt;
+            return *a & (width(e) == 2 ? 0xFFFF : 0xFF);
         }
         case Expr::Binary: {
             auto a = fold(*e.a, use_known), b = fold(*e.b, use_known);
@@ -691,11 +700,11 @@ struct Gen {
             return false;
         }
         case Expr::Index: {
-            Var* v = find_var(e.text);
+            Var* v = find_var(e.a->text);
             if (v && v->count >= 0 && overlap(v->cell, v->cell + array_cells(v->count))) return true;
-            return touches(*e.a, lo, hi);
+            return touches(*e.b, lo, hi);
         }
-        case Expr::Unary: return touches(*e.a, lo, hi);
+        case Expr::Unary: case Expr::Cast: return touches(*e.a, lo, hi);
         case Expr::Binary: return touches(*e.a, lo, hi) || touches(*e.b, lo, hi);
         case Expr::Call: return true;      // a procedure body may touch anything
         default: return false;
@@ -742,16 +751,17 @@ struct Gen {
             fail(e.pos, "'" + e.text + "' is not declared");
         }
         case Expr::Index: {
-            Var* v = find_var(e.text);
-            if (!v) fail(e.pos, "'" + e.text + "' is not declared");
-            if (v->count < 0) fail(e.pos, "'" + e.text + "' is not an array");
-            if (auto i = fold(*e.a)) {
-                if (*i < 0 || *i >= v->count) fail(e.a->pos, "index " + std::to_string(*i) + " is outside '" + e.text + "[" + std::to_string(v->count) + "]'");
+            const std::string& an = e.a->text;
+            Var* v = find_var(an);
+            if (!v) fail(e.pos, "'" + an + "' is not declared");
+            if (v->count < 0) fail(e.pos, "'" + an + "' is not an array");
+            if (auto i = fold(*e.b)) {
+                if (*i < 0 || *i >= v->count) fail(e.b->pos, "index " + std::to_string(*i) + " is outside '" + an + "[" + std::to_string(v->count) + "]'");
                 copy(array_cell(v->cell, (int)*i), dst, sign);
                 return;
             }
             int64_t i = tmp();
-            eval8(*e.a, i);
+            eval8(*e.b, i);
             if (sign == 1) array_read(v->cell, i, dst);
             else { int64_t t = tmp(); array_read(v->cell, i, t); move(t, {{dst, sign}}); release(t); }
             drop(i);
@@ -790,11 +800,16 @@ struct Gen {
                 release(t);
                 return;
             }
-            if (e.text == "word") { int64_t t = tmp2(); eval16_fresh(*e.a, t); move(t, {{dst, sign}}); release2(t); return; }
+            eval8(*e.a, dst, sign);
+            return;
+        }
+        case Expr::Cast: {
+            if (e.ts.base == "word") { int64_t t = tmp2(); eval16_fresh(*e.a, t); move(t, {{dst, sign}}); release2(t); return; }
             eval8(*e.a, dst, sign);     // byte()
             return;
         }
         case Expr::Binary: break;
+        default: fail(e.pos, "not supported here");
         }
         const std::string& o = e.text;
         const Expr& a = *e.a; const Expr& b = *e.b;
@@ -963,10 +978,12 @@ struct Gen {
             call_user(e.text, args, e.pos, dst);      // byte results land in the low cell
             return;
         }
+        case Expr::Cast:
+            if (e.ts.base == "byte") { eval8(*e.a, dst); return; }
+            eval16_fresh(*e.a, dst);
+            return;
         case Expr::Unary: {
             if (e.text == "!") { int64_t t = tmp(); eval_cond(*e.a, t); not8(t, dst, 1); release(t); return; }
-            if (e.text == "byte") { eval8(*e.a, dst); return; }
-            if (e.text == "word") { eval16_fresh(*e.a, dst); return; }
             int64_t t = tmp2(); eval16_fresh(*e.a, t); sub16(dst, t); release2(t);
             if (e.text == "~") add16_const(dst, 0xFFFF);
             return;
@@ -1093,12 +1110,13 @@ struct Gen {
     LValue lvalue(const Expr& t) {
         LValue lv{};
         if (t.kind == Expr::Index) {
-            Var* v = find_var(t.text);
-            if (!v) fail(t.pos, "'" + t.text + "' is not declared");
-            if (v->count < 0) fail(t.pos, "'" + t.text + "' is not an array");
+            const std::string& an = t.a->text;
+            Var* v = find_var(an);
+            if (!v) fail(t.pos, "'" + an + "' is not declared");
+            if (v->count < 0) fail(t.pos, "'" + an + "' is not an array");
             lv.arr = v;
-            if (auto i = fold(*t.a)) {
-                if (*i < 0 || *i >= v->count) fail(t.a->pos, "index " + std::to_string(*i) + " is outside '" + t.text + "[" + std::to_string(v->count) + "]'");
+            if (auto i = fold(*t.b)) {
+                if (*i < 0 || *i >= v->count) fail(t.b->pos, "index " + std::to_string(*i) + " is outside '" + an + "[" + std::to_string(v->count) + "]'");
                 lv.kind = LValue::Elem; lv.cell = array_cell(v->cell, (int)*i);
             } else lv.kind = LValue::ElemRT;
             return lv;
@@ -1121,9 +1139,13 @@ struct Gen {
         return true;
     }
 
+    static void copy_info(Expr& c, const Expr& e) {
+        c.kind = e.kind; c.pos = e.pos; c.value = e.value; c.text = e.text; c.arrow = e.arrow; c.ts = e.ts;
+        c.type = e.type; c.optype = e.optype; c.is_const = e.is_const; c.cval = e.cval;
+    }
     ExprP clone(const Expr& e) {
         auto c = std::make_unique<Expr>();
-        c->kind = e.kind; c->pos = e.pos; c->value = e.value; c->text = e.text;
+        copy_info(*c, e);
         if (e.a) c->a = clone(*e.a);
         if (e.b) c->b = clone(*e.b);
         for (auto& x : e.args) c->args.push_back(clone(*x));
@@ -1178,7 +1200,7 @@ struct Gen {
         }
         case LValue::ElemRT: {
             int64_t t = tmp(); eval8(e, t);
-            int64_t i = tmp(); eval8(*s.target->a, i);
+            int64_t i = tmp(); eval8(*s.target->b, i);
             array_write(lv.arr->cell, i, t);
             drop(i); drop(t);
             return;
@@ -1220,24 +1242,25 @@ struct Gen {
     }
 
     void gen_decl(const Stmt& s) {
-        Var v; v.name = s.name; v.word = s.word; v.count = s.count;
+        bool sw = dw(s);
+        Var v; v.name = s.name; v.word = sw; v.count = s.count;
         if (s.count >= 0) {
-            if (s.word) fail(s.pos, "word arrays are not supported; use two byte arrays");
+            if (sw) fail(s.pos, "word arrays are not supported; use two byte arrays");
             v.cell = alloc((int)array_cells(s.count));
         } else {
-            v.cell = alloc(s.word ? 2 : 1);
+            v.cell = alloc(sw ? 2 : 1);
             if (s.e) {
                 if (auto k = fold(*s.e)) {
-                    int64_t max = s.word ? 65535 : 255;
-                    if (*k > max) fail(s.e->pos, "value " + std::to_string(*k) + " does not fit a " + (s.word ? "word" : "byte"));
-                    if (s.word) { add(v.cell, *k & 255); add(v.cell + 1, *k >> 8); } else add(v.cell, *k);
-                } else if (s.word) eval16_fresh(*s.e, v.cell);
+                    int64_t max = sw ? 65535 : 255;
+                    if (*k > max) fail(s.e->pos, "value " + std::to_string(*k) + " does not fit a " + (sw ? "word" : "byte"));
+                    if (sw) { add(v.cell, *k & 255); add(v.cell + 1, *k >> 8); } else add(v.cell, *k);
+                } else if (sw) eval16_fresh(*s.e, v.cell);
                 else eval8(*s.e, v.cell);
             }
         }
         declare(v, s.pos);
-        Symbol sym{v.name, v.cell, (int)(s.count >= 0 ? array_cells(s.count) : (s.word ? 2 : 1)),
-                   s.count >= 0 ? 'a' : (s.word ? 'w' : 'b'), s.count >= 0 ? s.count : 1, cur_proc};
+        Symbol sym{v.name, v.cell, (int)(s.count >= 0 ? array_cells(s.count) : (sw ? 2 : 1)),
+                   s.count >= 0 ? 'a' : (sw ? 'w' : 'b'), s.count >= 0 ? s.count : 1, cur_proc};
         if (mapping()) res.symbols.push_back(sym);
     }
 
@@ -1371,22 +1394,27 @@ struct Gen {
         std::vector<ExitCtx> saved_ctxs; saved_ctxs.swap(ctxs);
         TProc* saved_tp = cur_tp; cur_tp = nullptr;
         call_stack.push_back(name);
-        ExitCtx pc; pc.kind = ExitCtx::Proc; pc.ret = proc.ret; pc.needs = contains_return(proc.body);
+        int pret = ret_of(&proc);
+        ExitCtx pc; pc.kind = ExitCtx::Proc; pc.ret = pret; pc.needs = contains_return(proc.body);
         int64_t mark = next_free;
-        if (proc.ret) pc.retval = proc.ret == 2 ? tmp2() : tmp();
+        if (pret) pc.retval = pret == 2 ? tmp2() : tmp();
         if (pc.needs) { pc.alive = tmp(); set(pc.alive, 1); }
         ctxs.push_back(pc);
+        // lexical scoping: the body sees the globals and its own parameters, not the caller's locals
+        std::vector<Scope> hidden_scopes(std::make_move_iterator(scopes.begin() + 1), std::make_move_iterator(scopes.end()));
+        scopes.resize(1);
         push_scope();
         for (size_t i = 0; i < bound.size(); i++) { Var v = bound[i]; v.name = proc.params[i].name; declare(v, proc.params[i].pos); }
         gen_stmts(proc.body);
         pop_scope();
+        for (auto& sc : hidden_scopes) scopes.push_back(std::move(sc));
         ctxs.pop_back();
         if (pc.needs) release(pc.alive);
-        if (proc.ret && result_cell >= 0) {
+        if (pret && result_cell >= 0) {
             move(pc.retval, {{result_cell, 1}});
-            if (proc.ret == 2) move(pc.retval + 1, {{result_cell + 1, 1}});
+            if (pret == 2) move(pc.retval + 1, {{result_cell + 1, 1}});
         }
-        if (proc.ret) { if (proc.ret == 2) release2(pc.retval); else release(pc.retval); }
+        if (pret) { if (pret == 2) release2(pc.retval); else release(pc.retval); }
         if (next_free != mark) internal("call frame not released");
         call_stack.pop_back();
         cur_tp = saved_tp;
@@ -1407,24 +1435,24 @@ struct Gen {
         for (size_t i = 0; i < args.size(); i++) {
             const Param& prm = proc.params[i];
             const Expr& a = *args[i];
-            Var v; v.word = prm.word; v.count = -1;
+            Var v; v.word = pw(prm); v.count = -1;
             if (prm.ref) {
                 if (a.kind != Expr::Name) fail(a.pos, "argument for 'ref " + prm.name + "' must be a variable");
                 Var* sv = find_var(a.text);
                 if (!sv || sv->is_const) fail(a.pos, "argument for 'ref " + prm.name + "' must be a variable");
                 if (prm.array) { if (sv->count < 0) fail(a.pos, "'" + prm.name + "' needs a byte array"); }
                 else {
-                    if (sv->count >= 0) fail(a.pos, "'" + prm.name + "' needs a " + (prm.word ? "word" : "byte") + ", not an array");
-                    if (sv->word != prm.word) fail(a.pos, "'" + prm.name + "' needs a " + (prm.word ? "word" : "byte") + " variable");
+                    if (sv->count >= 0) fail(a.pos, "'" + prm.name + "' needs a " + (pw(prm) ? "word" : "byte") + ", not an array");
+                    if (sv->word != pw(prm)) fail(a.pos, "'" + prm.name + "' needs a " + (pw(prm) ? "word" : "byte") + " variable");
                 }
                 v.cell = sv->cell; v.count = sv->count; v.word = sv->word; v.owned = false;
             } else {
-                v.cell = alloc(prm.word ? 2 : 1);
-                if (prm.word) eval16_fresh(a, v.cell); else eval8(a, v.cell);
+                v.cell = alloc(pw(prm) ? 2 : 1);
+                if (pw(prm)) eval16_fresh(a, v.cell); else eval8(a, v.cell);
             }
             bound.push_back(v);
         }
-        call_proc(name, bound, p, proc.ret ? result_cell : -1);
+        call_proc(name, bound, p, ret_of(&proc) ? result_cell : -1);
         next_free = mark;        // value parameters were cleared by pop_scope
     }
 
@@ -1433,9 +1461,8 @@ struct Gen {
         case Stmt::Proc:
             if (scopes.size() > 1 || !call_stack.empty()) fail(s.pos, "procedures must be declared at the top level");
             return;                                  // registered up front
-        case Stmt::Stack:
-            if (scopes.size() > 1 || !call_stack.empty()) fail(s.pos, "'stack' must appear at the top level");
-            return;                                  // read up front
+        case Stmt::Stack: case Stmt::Heap: case Stmt::Struct: case Stmt::Import:
+            return;                                  // handled up front
         case Stmt::Const: {
             auto k = fold(*s.e);
             if (!k) fail(s.e->pos, "constant '" + s.name + "' needs a constant expression");
@@ -1604,16 +1631,16 @@ struct Gen {
     ExprP hoist(const Expr& e, LowCtx& L, const Stmt& from) {
         if (e.kind == Expr::Call && is_tramp_call(e.text)) {
             ProcInfo* pi = find_proc(e.text);
-            if (!pi->decl->ret) fail(e.pos, "'" + e.text + "' returns nothing and cannot be used in an expression");
+            if (!ret_of(pi->decl)) fail(e.pos, "'" + e.text + "' returns nothing and cannot be used in an expression");
             std::vector<ExprP> args;
             for (auto& a : e.args) args.push_back(hoist(*a, L, from));
-            std::string h = hidden(L.p, pi->decl->ret == 2);
+            std::string h = hidden(L.p, ret_of(pi->decl) == 2);
             emit_call(L, pi->tp, std::move(args), e.pos, from, h);
-            auto n = std::make_unique<Expr>(); n->kind = Expr::Name; n->pos = e.pos; n->text = h;
+            auto n = std::make_unique<Expr>(); n->kind = Expr::Name; n->pos = e.pos; n->text = h; n->type = e.type;
             return n;
         }
         auto c = std::make_unique<Expr>();
-        c->kind = e.kind; c->pos = e.pos; c->value = e.value; c->text = e.text;
+        copy_info(*c, e);
         if (e.a) c->a = hoist(*e.a, L, from);
         if (e.b) c->b = hoist(*e.b, L, from);
         for (auto& x : e.args) c->args.push_back(hoist(*x, L, from));
@@ -1668,9 +1695,9 @@ struct Gen {
             return;
         }
         case Stmt::Decl: {
-            Var v; v.name = s.name; v.word = s.word; v.count = s.count;
+            Var v; v.name = s.name; v.word = dw(s); v.count = s.count;
             if (s.count >= 0 && !p->is_main()) fail(s.pos, "arrays cannot be local to a rec proc; declare '" + s.name + "' at the top level");
-            if (s.count >= 0 && s.word) fail(s.pos, "word arrays are not supported; use two byte arrays");
+            if (s.count >= 0 && dw(s)) fail(s.pos, "word arrays are not supported; use two byte arrays");
             frame_add(p, v, s.pos);
             if (s.count >= 0) return;                      // global array: zero from the start
             ExprP init = s.e ? hoist(*s.e, L, s) : mk_num(s.pos, 0);
@@ -1804,7 +1831,7 @@ struct Gen {
         if (p->decl) {
             for (const Param& prm : p->decl->params) {
                 if (prm.array) fail(prm.pos, "rec procs cannot take array parameters; use a top-level array");
-                Var v; v.name = prm.name; v.word = prm.word;
+                Var v; v.name = prm.name; v.word = pw(prm);
                 frame_add(p, v, prm.pos);
             }
         }
@@ -1867,7 +1894,7 @@ struct Gen {
             int64_t mark = next_free;
             std::vector<int64_t> vals;
             for (size_t i = 0; i < a.args.size(); i++) {
-                bool w = decl.params[i].word;
+                bool w = pw(decl.params[i]);
                 int64_t t = w ? tmp2() : tmp();
                 if (w) eval16_fresh(*a.args[i], t); else eval8(*a.args[i], t);
                 vals.push_back(t);
@@ -1993,7 +2020,7 @@ struct Gen {
         for (auto& kv : procs) {
             if (!kv.second.tramp) continue;
             auto tp = std::make_unique<TProc>();
-            tp->name = kv.first; tp->decl = kv.second.decl; tp->ret = kv.second.decl->ret;
+            tp->name = kv.first; tp->decl = kv.second.decl; tp->ret = ret_of(kv.second.decl);
             kv.second.tp = tp.get();
             tprocs.push_back(std::move(tp));
         }
@@ -2034,7 +2061,6 @@ struct Gen {
     }
 
     void run(const Program& prog) {
-        prelude = parse(PRELUDE);
         register_procs(prelude, true);
         register_procs(prog, false);
         out += "# compiled by bfl\n";
@@ -2053,18 +2079,56 @@ struct Gen {
 
 } // namespace
 
-Result compile(const std::string& source, uint32_t ram_start) {
+// Language features enabled so far (docs/ROADMAP.md phases).
+static Features current_features() {
+    Features f;
+    f.wide_ints = false;
+    f.heap = false;
+    f.structs = false;
+    return f;
+}
+
+Result compile(const std::string& source, uint32_t ram_start, const Options& opt) {
     Gen g(source, ram_start);
+    g.res.files.push_back(opt.file_name.empty() ? "<source>" : opt.file_name);
+    auto err = [&](const Pos& p, const std::string& m) { g.res.errors.push_back(Error{p.line, p.col, m, p.file}); };
+    std::vector<ParseError> perr;
+    Program prog = parse(source, 0, perr);
+    for (const ParseError& e : perr) err(e.pos, e.msg);
+    if (!g.res.errors.empty()) return std::move(g.res);
+    Types types;
     try {
-        Program prog = parse(source);
+        g.prelude = parse(PRELUDE, -1);
+    } catch (const ParseError& e) {
+        err(Pos{}, "internal compiler error in the prelude: " + e.msg);
+        return std::move(g.res);
+    }
+    SemaResult sr = analyse(g.prelude, prog, types, current_features(), opt.warnings);
+    auto by_pos = [](const Diag& a, const Diag& b) {
+        if (a.pos.file != b.pos.file) return a.pos.file < b.pos.file;
+        return a.pos.line != b.pos.line ? a.pos.line < b.pos.line : a.pos.col < b.pos.col;
+    };
+    std::stable_sort(sr.errors.begin(), sr.errors.end(), by_pos);
+    std::stable_sort(sr.warnings.begin(), sr.warnings.end(), by_pos);
+    for (const Diag& d : sr.errors) err(d.pos, d.msg);
+    for (const Diag& d : sr.warnings) g.res.warnings.push_back(Error{d.pos.line, d.pos.col, d.msg, d.pos.file});
+    if (!g.res.errors.empty()) return std::move(g.res);
+    try {
         g.run(prog);
     } catch (const ParseError& e) {
-        g.res.errors.push_back(Error{e.pos.line, e.pos.col, e.msg});
+        err(e.pos, e.msg);
     } catch (const Fail& f) {
-        g.res.errors.push_back(Error{f.pos.line, f.pos.col, f.msg});
+        err(f.pos, f.msg);
     }
     if (!g.res.errors.empty()) { g.res.bf.clear(); g.res.stmts.clear(); }
     return std::move(g.res);
+}
+
+std::string format_error(const Result& r, const Error& e, const char* kind) {
+    std::string f = e.file >= 0 && e.file < (int)r.files.size() ? r.files[(size_t)e.file] : std::string("<library>");
+    std::string s = f + ":" + std::to_string(e.line) + ":" + std::to_string(e.col) + ": ";
+    if (kind) s += std::string(kind) + ": ";
+    return s + e.msg;
 }
 
 std::string describe(const Result& r) {

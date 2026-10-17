@@ -41,6 +41,7 @@ KEYS
   Ctrl+G      jump to the memory viewer's address box
   Ctrl+F      show or hide the framebuffer window
   Ctrl+B      show the brainfuck generated from a BFL program
+  F4          next BFL error or warning (Shift+F4: previous)
   F1          this help
 
 Dropping a .b or .bfl file onto the window loads and runs it.  A .bfl file

@@ -55,7 +55,7 @@ enum : int {
     ID_TB_SPEED, ID_TB_INTERP,
     ID_WATCHLIST, ID_WATCH_ADD, ID_WATCH_PTR, ID_WATCH_REMOVE, ID_WATCH_DEV,
     ID_VIEW_FB, ID_LANG, ID_VIEW_GEN, ID_EXPORT_BF, ID_GENEDIT, ID_GEN_ANNOTATED, ID_GEN_COMPACT, ID_GEN_COPY, ID_GEN_INFO,
-    ID_NEWLINE, ID_TB_NEWLINE,
+    ID_NEWLINE, ID_TB_NEWLINE, ID_NEXT_DIAG,
     ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400,  // ID_SER_COM_BASE + n = COMn
     ID_HELP_BASE = 700                                             // ID_HELP_BASE + (int)help::Topic
 };
@@ -138,6 +138,10 @@ struct App {
     bool gen_is_compact = false;
     std::vector<std::pair<int32_t, int32_t>> src_pc;   // (source offset, pc) of the debug program, sorted
     std::set<int64_t> auto_watch;                 // watch rows added from the symbol table
+    // diagnostics from the last BFL compile: errors first, then warnings (F4 steps through them)
+    struct DiagItem { int line, col; std::wstring msg; bool warning; };
+    std::vector<DiagItem> diags;
+    int diag_at = -1;
 } app;
 
 int px(int v) { return MulDiv(v, (int)app.dpi, 96); }
@@ -512,20 +516,39 @@ void gen_update() {
 }
 
 // Compile the editor contents: BFL -> brainfuck -> IR, or brainfuck -> IR.
+// Show diagnostic i: select its line in the editor and describe it in the status bar.
+void show_diag(int i) {
+    if (app.diags.empty()) { set_status(L"No errors or warnings."); return; }
+    app.diag_at = ((i % (int)app.diags.size()) + (int)app.diags.size()) % (int)app.diags.size();
+    const auto& d = app.diags[(size_t)app.diag_at];
+    std::wstring text = editor_text();
+    int32_t p = offset_of(text, d.line, d.col);
+    editor_select(p, line_end(text, p), true);
+    SetFocus(app.editor);
+    int errors = 0;
+    for (const auto& x : app.diags) if (!x.warning) errors++;
+    wchar_t buf[600];
+    swprintf(buf, 600, L"%s %d of %d, line %d col %d: %s%s", d.warning ? L"Warning" : L"Error", app.diag_at + 1, (int)app.diags.size(),
+             d.line, d.col, d.msg.c_str(), app.diags.size() > 1 ? L"   (F4: next)" : L"");
+    set_status(buf);
+}
+
 bool compile_editor(bool optimise) {
     std::wstring text = editor_text();
     std::string s = latin1(text);
     if (app.lang) {
         for (char& c : s) if (c == '\r') c = '\n';
-        app.lr = bfl::compile(s, app.machine->mmio_size());
+        bfl::Options opt;
+        opt.warnings = true;
+        opt.file_name = app.path.empty() ? "untitled.bfl" : latin1(app.path);
+        app.lr = bfl::compile(s, app.machine->mmio_size(), opt);
+        app.diags.clear();
+        app.diag_at = -1;
+        for (const bfl::Error& e : app.lr.errors) if (e.file == 0) app.diags.push_back({e.line, e.col, widen(e.msg), false});
+        for (const bfl::Error& e : app.lr.errors) if (e.file != 0) app.diags.push_back({1, 1, widen(bfl::format_error(app.lr, e)), false});
+        for (const bfl::Error& e : app.lr.warnings) if (e.file == 0) app.diags.push_back({e.line, e.col, widen(e.msg), true});
         if (!app.lr.ok()) {
-            const bfl::Error& e = app.lr.errors[0];
-            wchar_t buf[512];
-            swprintf(buf, 512, L"BFL error, line %d col %d: %s", e.line, e.col, widen(e.msg).c_str());
-            set_status(buf);
-            int32_t p = offset_of(text, e.line, e.col);
-            editor_select(p, line_end(text, p), true);
-            SetFocus(app.editor);
+            show_diag(0);
             gen_update();
             return false;
         }
@@ -558,6 +581,7 @@ bool load_file(const std::wstring& path) {
     set_lang(is_bfl_path(path));
     if (!compile_editor(true)) return false;
     wchar_t buf[256];
+    if (app.lang && !app.diags.empty()) { show_diag(0); return true; }
     if (app.lang) swprintf(buf, 256, L"Loaded BFL: %zu brainfuck commands, %lld cells, %zu IR instructions, %zu bytes of x64. F5 runs, Ctrl+F5 debugs, Ctrl+B shows the brainfuck.", app.prog.raw_ops, (long long)app.lr.cells_used, app.prog.code.size(), jit_code_size(app.prog));
     else swprintf(buf, 256, L"Loaded: %zu commands, %zu IR instructions, %zu bytes of x64. F5 runs, Ctrl+F5 debugs.", app.prog.raw_ops, app.prog.code.size(), jit_code_size(app.prog));
     set_status(buf);
@@ -1072,6 +1096,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(run, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(run, MF_STRING, ID_LANG, L"Source is &BFL (compile to brainfuck first)");
         AppendMenuW(run, MF_STRING, ID_VIEW_GEN, L"Show &generated brainfuck\tCtrl+B");
+        AppendMenuW(run, MF_STRING, ID_NEXT_DIAG, L"Next &error or warning\tF4");
         AppendMenuW(run, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(run, MF_STRING, ID_INTERP, L"Use &interpreter instead of JIT");
         HMENU baud = CreatePopupMenu();
@@ -1240,6 +1265,8 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (id == ID_VIEW_GEN) { gen_show(!IsWindowVisible(app.genwnd)); return 0; }
         if (id == ID_LANG) { if (app.mode == Mode::Idle) set_lang(!app.lang); return 0; }
         if (id == ID_EXPORT_BF) { export_bf(); return 0; }
+        if (id == ID_NEXT_DIAG) { show_diag(app.diag_at + 1); return 0; }
+        if (id == ID_NEXT_DIAG + 1000) { show_diag(app.diag_at - 1); return 0; }
         if (id == ID_SER_NONE) { serial_select(""); return 0; }
         if (id == ID_SER_LOOP) { serial_select("loopback"); return 0; }
         if (id > ID_SER_COM_BASE && id <= ID_SER_COM_BASE + 255) { serial_select("COM" + std::to_string(id - ID_SER_COM_BASE)); return 0; }
@@ -1354,7 +1381,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
     app.fb.on_first_plot = [] { PostMessageW(app.wnd, WM_APP_FBSHOW, 0, 0); };
 
     ACCEL acc[] = {
-        {FVIRTKEY | FCONTROL, 'F', ID_VIEW_FB}, {FVIRTKEY | FCONTROL, 'B', ID_VIEW_GEN}, {FVIRTKEY, VK_F1, ID_HELP_BASE + (int)help::START},
+        {FVIRTKEY | FCONTROL, 'F', ID_VIEW_FB}, {FVIRTKEY | FCONTROL, 'B', ID_VIEW_GEN}, {FVIRTKEY, VK_F4, ID_NEXT_DIAG}, {FVIRTKEY | FSHIFT, VK_F4, ID_NEXT_DIAG + 1000}, {FVIRTKEY, VK_F1, ID_HELP_BASE + (int)help::START},
         {FVIRTKEY, VK_F5, ID_RUN}, {FVIRTKEY | FSHIFT, VK_F5, ID_STOP}, {FVIRTKEY | FCONTROL, VK_F5, ID_DEBUG},
         {FVIRTKEY, VK_F11, ID_STEP}, {FVIRTKEY, VK_F10, ID_STEP_OVER}, {FVIRTKEY | FCONTROL, VK_F10, ID_RUN_TO_CURSOR},
         {FVIRTKEY, VK_F6, ID_PAUSE}, {FVIRTKEY, VK_F9, ID_TOGGLE_BP},
