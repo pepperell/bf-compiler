@@ -118,8 +118,22 @@ CASES = [
 ]
 
 
+def readme_matches_regs():
+    """README.md's register table must equal `bf --regs` (generated from src/registers.h)."""
+    regs = subprocess.run([BF, "--regs"], capture_output=True, timeout=30).stdout.decode().replace("\r\n", "\n")
+    readme = open(os.path.join(os.path.dirname(__file__), "..", "README.md"), encoding="utf-8").read().replace("\r\n", "\n")
+    if regs in readme:
+        return True, ""
+    return False, "README.md register table differs from `bf --regs`; paste its output into the README"
+
+
 def main():
     fails = 0
+    ok, why = readme_matches_regs()
+    print(("PASS " if ok else "FAIL ") + "readme-register-table")
+    if not ok:
+        fails += 1
+        print("   " + why)
     for case in CASES:
         name, src, stdin, eof, expected, devices = case[:6]
         extra = list(case[6]) if len(case) > 6 else []
@@ -144,7 +158,7 @@ def main():
             print("   expected:", expected)
             for k, v in results.items():
                 print(f"   {k}: rc={v[0]} out={v[1]!r} err={v[2]!r}")
-    print(f"{len(CASES) - fails}/{len(CASES)} passed")
+    print(f"{len(CASES) + 1 - fails}/{len(CASES) + 1} passed")
     sys.exit(1 if fails else 0)
 
 

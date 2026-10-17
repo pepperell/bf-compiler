@@ -19,7 +19,7 @@ cl %CXX% %CORE% src\cli.cpp /Fe:out\bf.exe %LNK% /SUBSYSTEM:CONSOLE
 if errorlevel 1 exit /b 1
 
 if exist src\ui.cpp (
-  cl %CXX% %CORE% src\terminal.cpp src\ui.cpp /Fe:out\bfui.exe user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib winmm.lib %LNK% /SUBSYSTEM:WINDOWS
+  cl %CXX% %CORE% src\terminal.cpp src\help.cpp src\ui.cpp /Fe:out\bfui.exe user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib winmm.lib %LNK% /SUBSYSTEM:WINDOWS
   if errorlevel 1 exit /b 1
 )
 echo build ok

@@ -15,6 +15,14 @@
 #include <string>
 #include <vector>
 
+// windows.h defines IN and OUT as empty macros; they would mangle the opcodes.
+#ifdef IN
+#undef IN
+#endif
+#ifdef OUT
+#undef OUT
+#endif
+
 namespace bf {
 
 // ---- intermediate representation -------------------------------------------

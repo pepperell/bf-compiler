@@ -2,6 +2,7 @@
 #include "bf.h"
 #include "devices.h"
 #include "hw.h"
+#include "registers.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <conio.h>
@@ -61,6 +62,7 @@ void usage() {
         "  --interp        run the IR interpreter instead of the x64 JIT\n"
         "  --no-opt        disable IR optimisation\n"
         "  --dump          print the IR and exit\n"
+        "  --regs          print the device register map as a Markdown table and exit\n"
         "  --time          print run time and status to stderr\n"
         "  --eof MODE      ',' at end of input: nochange (default), 0, 255\n"
         "  --ram N         RAM cells (default 1048576)\n"
@@ -79,6 +81,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto need = [&](const char* what) -> const char* { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", what); exit(2); } return argv[++i]; };
+        if (a == "--regs") { fputs(register_map_markdown().c_str(), stdout); return 0; }
         if (a == "--interp") use_jit = false;
         else if (a == "--no-opt") optimise = false;
         else if (a == "--dump") dump = true;

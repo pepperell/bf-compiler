@@ -18,6 +18,7 @@
 #include "bf.h"
 #include "devices.h"
 #include "hw.h"
+#include "help.h"
 #include "terminal.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -52,7 +53,8 @@ enum : int {
     ID_MEM_FOCUS, ID_BAUD0, ID_BAUD1, ID_BAUD2, ID_BAUD3, ID_BAUD4,
     ID_TB_SPEED, ID_TB_INTERP,
     ID_WATCHLIST, ID_WATCH_ADD, ID_WATCH_PTR, ID_WATCH_REMOVE, ID_WATCH_DEV,
-    ID_VIEW_FB, ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400   // ID_SER_COM_BASE + n = COMn
+    ID_VIEW_FB, ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400,  // ID_SER_COM_BASE + n = COMn
+    ID_HELP_BASE = 700                                             // ID_HELP_BASE + (int)help::Topic
 };
 enum : UINT { WM_APP_FBSHOW = WM_APP + 10 };
 const int BAUDS[5] = {0, 115200, 38400, 9600, 2400};
@@ -795,7 +797,14 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(debug, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(debug, MF_STRING, ID_WATCH_ADD, L"&Watch cell at viewer address");
         AppendMenuW(debug, MF_STRING, ID_WATCH_PTR, L"Watch cell at &pointer");
-        AppendMenuW(help, MF_STRING, ID_MEMMAP, L"&Memory map...");
+        AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::START, L"&Contents\tF1");
+        AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::SYMBOLS, L"&Brainfuck symbols");
+        AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::MEMORY_MAP, L"&Memory map");
+        AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::DEVICES, L"&Devices");
+        AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::DEBUGGER, L"De&bugger");
+        AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::TERMINAL, L"&Terminal");
+        AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::COMMAND_LINE, L"Command &line");
         HMENU devices = CreatePopupMenu(), serial = CreatePopupMenu();
         AppendMenuW(serial, MF_STRING | MF_CHECKED, ID_SER_NONE, L"&None");
         AppendMenuW(serial, MF_STRING, ID_SER_LOOP, L"&Loopback (TX wired to RX)");
@@ -979,25 +988,9 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_MEM_DEV:   mem_goto(0); break;
         case ID_MEM_PTR:   { int64_t p = current_ptr(); if (p >= 0) mem_goto((p - MEM_ROWS / 2 * MEM_COLS) & ~(int64_t)(MEM_COLS - 1)); break; }
         case ID_MEM_FOCUS: SetFocus(app.mem_addr); SendMessageW(app.mem_addr, EM_SETSEL, 0, -1); break;
-        case ID_MEMMAP:
-            MessageBoxW(h,
-                L"The pointer starts at cell 0x100 (256).  Cells 0..0xFF are the device window;\n"
-                L"\"<n\" is the number of '<' from the start cell.  Readable registers are\n"
-                L"latches, so [>+<-] style copies work on them.\n\n"
-                L"0xFF  <1    LEDS         r/w  8 lamps, bit 7 leftmost\n"
-                L"0xFE  <2    KEY_STATUS   r/w  1 when a key waits; write pops a key into KEY_DATA\n"
-                L"0xFD  <3    KEY_DATA     r/w  last popped key\n"
-                L"0xFC  <4    CONOUT       w    byte to console, same as '.'\n"
-                L"0xFB..0xF8  <5..<8  TICKS0..3  r/w  ms since run start, 0xFB low byte\n"
-                L"0xF7..0xF6  <9,<10  NUMBER0..1 r/w  16-bit display, 0xF7 low byte\n"
-                L"0xF5  <11   HALT         w    end the program\n"
-                L"0xF4  <12   RANDOM       r/w  last random byte\n"
-                L"0xF3  <13   TICK_LATCH   w    load TICKS0..3 with the current time\n"
-                L"0xF2  <14   ROLL         w    load RANDOM with a new byte\n\n"
-                L"Memory viewer: rows marked D are in the device window; [xx] marks the pointer.\n"
-                L"Debugger: Ctrl+F5 starts paused at the first command; F10 steps one command;\n"
-                L"F9 toggles a breakpoint on the command at the caret (shown in red); F5 continues.",
-                L"Memory map", MB_OK);
+        default:
+            if (id >= ID_HELP_BASE && id < ID_HELP_BASE + (int)help::TOPIC_COUNT)
+                help::show(h, GetModuleHandleW(nullptr), app.mono, app.ui_font, (help::Topic)(id - ID_HELP_BASE));
             break;
         }
         return 0;
@@ -1055,7 +1048,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
     app.fb.on_first_plot = [] { PostMessageW(app.wnd, WM_APP_FBSHOW, 0, 0); };
 
     ACCEL acc[] = {
-        {FVIRTKEY | FCONTROL, 'F', ID_VIEW_FB},
+        {FVIRTKEY | FCONTROL, 'F', ID_VIEW_FB}, {FVIRTKEY, VK_F1, ID_HELP_BASE + (int)help::START},
         {FVIRTKEY, VK_F5, ID_RUN}, {FVIRTKEY | FSHIFT, VK_F5, ID_STOP}, {FVIRTKEY | FCONTROL, VK_F5, ID_DEBUG},
         {FVIRTKEY, VK_F11, ID_STEP}, {FVIRTKEY, VK_F10, ID_STEP_OVER}, {FVIRTKEY | FCONTROL, VK_F10, ID_RUN_TO_CURSOR},
         {FVIRTKEY, VK_F6, ID_PAUSE}, {FVIRTKEY, VK_F9, ID_TOGGLE_BP},

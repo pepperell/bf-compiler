@@ -65,29 +65,37 @@ Cells are 8-bit. The tape is `mmio_size` device cells followed by `ram_size` RAM
 The pointer starts at the first RAM cell, so hardware lives just to the left of it.
 `<n` is how many `<` reach the register from the start cell. Defaults: 256 device cells, 1 MiB RAM.
 
+The table below is generated from `src/registers.h` by `bf --regs`, and the test suite
+fails if it differs, so it is always current. The same table appears in the UI's help
+(F1, or Help > Memory map).
+
 | Cell | From start | Register | Access | Meaning |
 |------|-----------|----------|--------|---------|
-| 0xFF | <1  | LEDS       | r/w | 8 lamps, bit 7 is leftmost |
-| 0xFE | <2  | KEY_STATUS | r/w | reads 1 when a key waits; a write pops the next key into KEY_DATA |
-| 0xFD | <3  | KEY_DATA   | r/w | latch holding the last popped key |
-| 0xFC | <4  | CONOUT     | w   | writes a byte to the console, same as `.` |
-| 0xFB..0xF8 | <5..<8 | TICKS0..3 | r/w | milliseconds since run start, 0xFB low byte |
-| 0xF7..0xF6 | <9,<10 | NUMBER0..1 | r/w | 16-bit numeric display, 0xF7 low byte |
-| 0xF5 | <11 | HALT       | w   | any write ends the program with status "halted" |
-| 0xF4 | <12 | RANDOM     | r/w | latch holding the last random byte |
-| 0xF3 | <13 | TICK_LATCH | w   | writing loads TICKS0..3 with the current time |
-| 0xF2 | <14 | ROLL       | w   | writing loads RANDOM with a new byte |
+| 0xFF | <1 | LEDS | r/w | 8 lamps, bit 7 is leftmost |
+| 0xFE | <2 | KEY_STATUS | r/w | reads 1 when a key waits; a write pops the next key into KEY_DATA |
+| 0xFD | <3 | KEY_DATA | r/w | latch holding the last popped key |
+| 0xFC | <4 | CONOUT | w | writes a byte to the console, same as '.' |
+| 0xFB | <5 | TICKS0 | r/w | milliseconds since run start, low byte (loaded by TICK_LATCH) |
+| 0xFA | <6 | TICKS1 | r/w | milliseconds, second byte (256 ms units) |
+| 0xF9 | <7 | TICKS2 | r/w | milliseconds, third byte |
+| 0xF8 | <8 | TICKS3 | r/w | milliseconds, high byte |
+| 0xF7 | <9 | NUMBER0 | r/w | 16-bit numeric display, low byte |
+| 0xF6 | <10 | NUMBER1 | r/w | 16-bit numeric display, high byte |
+| 0xF5 | <11 | HALT | w | any write ends the program with status "halted" |
+| 0xF4 | <12 | RANDOM | r/w | latch holding the last random byte (loaded by ROLL) |
+| 0xF3 | <13 | TICK_LATCH | w | writing loads TICKS0..3 with the current time |
+| 0xF2 | <14 | ROLL | w | writing loads RANDOM with a new random byte |
 | 0xF1 | <15 | SER_STATUS | r/w | reads 1 while a received byte waits; a write pops it into SER_DATA |
-| 0xF0 | <16 | SER_DATA   | r/w | latch: byte to send, or the byte last popped |
-| 0xEF | <17 | SER_TX     | w   | transmit SER_DATA |
-| 0xEE | <18 | SER_CTRL   | r/w | write 0 close, 1 open; reads bit0 open, bit7 error |
-| 0xED | <19 | SER_BAUD   | r/w | 0:300 1:1200 2:2400 3:9600 4:19200 5:38400 6:57600 7:115200 |
-| 0xEC | <20 | FB_X       | r/w | framebuffer cursor column 0..127 |
-| 0xEB | <21 | FB_Y       | r/w | framebuffer cursor row 0..63 |
-| 0xEA | <22 | FB_COLOR   | r/w | latch, colour as RRRGGGBB |
-| 0xE9 | <23 | FB_PLOT    | w   | plot FB_COLOR at the cursor, then advance (wraps to the next row) |
-| 0xE8 | <24 | FB_FILL    | w   | fill the screen with the written value |
-| 0xE7 | <25 | FB_READ    | w   | load FB_COLOR with the pixel under the cursor |
+| 0xF0 | <16 | SER_DATA | r/w | latch: the byte to send, or the byte last popped |
+| 0xEF | <17 | SER_TX | w | transmit SER_DATA |
+| 0xEE | <18 | SER_CTRL | r/w | write 0 close, 1 open the port; reads bit0 open, bit7 error |
+| 0xED | <19 | SER_BAUD | r/w | 0:300 1:1200 2:2400 3:9600 4:19200 5:38400 6:57600 7:115200 |
+| 0xEC | <20 | FB_X | r/w | framebuffer cursor column 0..127 |
+| 0xEB | <21 | FB_Y | r/w | framebuffer cursor row 0..63 |
+| 0xEA | <22 | FB_COLOR | r/w | colour latch, RRRGGGBB |
+| 0xE9 | <23 | FB_PLOT | w | plot FB_COLOR at the cursor, then advance (wraps to the next row) |
+| 0xE8 | <24 | FB_FILL | w | fill the whole screen with the written value |
+| 0xE7 | <25 | FB_READ | w | load FB_COLOR with the pixel under the cursor |
 
 The serial device (`src/hw.h`) talks to a real COM port chosen from the UI's Devices menu
 or with `bf --serial COM3`; `loopback` wires TX to RX for testing without hardware.
