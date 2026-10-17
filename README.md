@@ -18,6 +18,15 @@ The UI has a device panel (lamps, number display), a source editor, a VT100 term
 memory viewer. F5 compiles and runs whatever is in the editor; Shift+F5 stops; Ctrl+O opens,
 Ctrl+S saves, Ctrl+R reloads from disk, Ctrl+L clears the terminal. Dropping a `.b` file on
 the window loads and runs it. Drag the bar between editor and terminal to resize them.
+View > Memory viewer (Ctrl+M) hides the memory column to give the editor and terminal
+the full width, and View > Terminal width fixes the terminal at 80, 120 or 132 columns
+(`hanoi.b` needs about 120) instead of fitting the window.
+
+The UI remembers its settings in `%APPDATA%\bfmachine\settings.ini`: newline mode,
+terminal speed and width, interpreter choice, the check options, window placement,
+terminal height, which panes are shown and the last file. Started without a file, it
+reopens the last one without running it. (The environment variable `BFUI_SETTINGS`
+names a different settings file.)
 
 The terminal (`src/terminal.cpp`) is a real VT100/ANSI emulator: cursor addressing, erase
 display and line, scroll regions, insert and delete, SGR colours and attributes, cursor
@@ -47,7 +56,10 @@ the program paused, its line and column and the current cell's value, and the me
 viewer follows the pointer.
 
 The watch list under the memory viewer shows chosen cells live in hex, decimal and as a
-character (add one from the viewer's address box or at the pointer). Ticking a row makes
+character (add one from the viewer's address box or at the pointer). For a BFL program it
+is filled with the global variables by name, each shown whole: 16 and 32-bit values in
+one row, signed types as negative numbers, pointers with the heap byte they point at,
+and array elements of any width. Ticking a row makes
 it a data breakpoint: the program pauses as soon as that cell is written, which works for
 device registers too. "Break on entering device window" pauses when the pointer first
 moves into the device cells.
@@ -91,6 +103,13 @@ code (with a `# L12: source` comment before each statement) and a statement map.
 In the UI, Ctrl+B shows the generated brainfuck, annotated or compacted to one
 continuous string of commands, and the debugger works on the source: F11 steps a statement (into calls), F10 steps over, F9 breakpoints by
 line, and the watch list is filled with the program's variables by name.
+The editor colours BFL keywords, types, numbers, strings, comments and register
+names. Compiler errors and warnings are listed in a pane under the editor;
+double-click one, or press F4, to go to it. When the debugger stops in an imported
+file, that file is shown read-only in the editor's place; the File box in the
+toolbar switches between the program and its imports, and F9 sets breakpoints in
+imported files too. Run > Check heap accesses and Run > Check recursion stack
+compile in the same checks as `bf --check-heap` and `--check-stack`.
 `programs/leds.bfl`, `serial_echo.bfl`, `fb.bfl` and `primes.bfl` are examples;
 `tests/golden/` holds their generated code, and `tests\test_lang.py` fails if it
 changes (run it with `--update-golden` after a deliberate codegen change).

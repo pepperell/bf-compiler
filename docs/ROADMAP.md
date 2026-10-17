@@ -1,6 +1,9 @@
 # Roadmap: BFL towards modern programming
 
-Status: proposed, not started. Hardware and devices are out of scope here.
+Status: implemented (phases 0 to 8). Hardware and devices are out of scope here.
+The sections below are the plan as written. Where the result differs, docs/HEAP.md
+(phase 0), docs/TRAMPOLINE.md (phase 7) and the note under phase 8 say what was
+built, and docs/LANG.md describes the language as it is.
 
 BFL today has bytes and 16-bit words, byte arrays, inlined procedures with return
 values, and recursion through `rec proc` (docs/LANG.md, docs/TRAMPOLINE.md). What
@@ -213,6 +216,15 @@ with `new`, and a recursive procedure with array locals.
   file list lets you set breakpoints in imported files.
 - **Error list.** A pane under the editor listing compiler errors and warnings;
   double-click jumps to the line.
+
+As built: the settings file also keeps the check options, terminal width, pane
+visibility and the generated-code view mode, and `BFUI_SETTINGS` can point at
+another file. The terminal width option offers 80, 120 and 132 columns; with a
+fixed width the window grows to fit when the screen allows. Colouring goes
+through the RichEdit Text Object Model with undo suspended, so it neither
+touches breakpoint backgrounds nor fills the undo history. Watch rows show
+multi-byte, signed and pointer values whole. Run > Check heap accesses and Run >
+Check recursion stack match the `bf` flags.
 
 ## 11. Decisions for you
 

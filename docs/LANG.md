@@ -340,8 +340,9 @@ the UI:
 - unreachable code after `return`, `break` or `continue`;
 - combining signed and unsigned values of the same width, which is unsigned.
 
-In the UI the status bar shows the first error and how many there are; F4 and
-Shift+F4 step through errors and warnings and select the line.
+In the UI the errors and warnings are listed in a pane under the editor and the
+status bar shows the first one; double-click a row, or press F4 and Shift+F4, to
+step through them and select the line, also in imported files.
 
 ## The debugger
 
@@ -351,7 +352,11 @@ runs to completion, a call runs its body, and a recursive call runs until the
 stack pointer is back at the current depth); Ctrl+F10 runs to the statement at
 the caret; F9 toggles a breakpoint on the caret's line. The current statement is
 highlighted, the status bar shows its line, and the watch list is filled with
-the program's variables by name (arrays up to their first 16 elements).
+the program's global variables by name (arrays up to their first 16 elements),
+each shown whole: wide and signed values in one row, pointers with the heap byte
+they point at. When the current statement is in an imported file, that file is
+shown read-only in the editor's place; the toolbar's File box switches between
+the program and its imports, and breakpoints can be set in imported files.
 `print` and `input` are implemented as library procedures written in BFL; the
 debugger does not step into them.
 

@@ -2812,6 +2812,7 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
         if (imp.dirs[0].empty() && !opt.file_name.empty() && opt.file_name[0] != '<') imp.dirs[0] = ".";
     }
     imp.expand(prog, 0);
+    res.sources = texts;
     for (const ParseError& e : perr) err(e.pos, e.msg);
     if (!res.errors.empty()) return res;
     Types types;
@@ -2870,6 +2871,7 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
     } else g = generate(INT64_MAX, false);
     Result outr = std::move(g->res);
     outr.files = res.files;
+    outr.sources = res.sources;
     outr.warnings = res.warnings;
     if (!outr.errors.empty()) { outr.bf.clear(); outr.stmts.clear(); }
     return outr;

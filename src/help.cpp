@@ -39,6 +39,7 @@ KEYS
   Ctrl+O      open    Ctrl+S save    Ctrl+R reload from disk
   Ctrl+L      clear the terminal
   Ctrl+G      jump to the memory viewer's address box
+  Ctrl+M      show or hide the memory viewer and watch list
   Ctrl+F      show or hide the framebuffer window
   Ctrl+B      show the brainfuck generated from a BFL program
   F4          next BFL error or warning (Shift+F4: previous)
@@ -48,6 +49,15 @@ Dropping a .b or .bfl file onto the window loads and runs it.  A .bfl file
 is written in BFL, a small language that compiles to brainfuck (see the
 "BFL language" topic).  Drag the bar between
 the editor and the terminal to resize them.
+
+VIEW AND SETTINGS
+View > Memory viewer (Ctrl+M) hides the memory column so the editor and the
+terminal get the full width.  View > Terminal width fixes the terminal at 80,
+120 or 132 columns instead of fitting the window.  View > Error list shows or
+hides the BFL error list under the editor.  Settings (newline mode, terminal
+speed and width, interpreter, check options, window placement, terminal
+height, panes and the last file) are kept in %APPDATA%\bfmachine\settings.ini.
+Started without a file, the program reopens the last one without running it.
 
 HOW A RUN WORKS
 The source is compiled to an optimised intermediate form and then to x64
@@ -200,6 +210,17 @@ WATCH LIST (under the memory viewer)
   program pauses as soon as that cell is written, which works for device
   registers too.  "Break on entering device window" pauses when the pointer
   first moves left of the start cell.
+  For a BFL program the list is filled with the global variables by name.
+  Each row shows the whole value: words and dwords in one row, signed types
+  as negative numbers, pointers with the heap byte they point at (*=), and
+  array elements of any width.  Ticking a wide row watches all its bytes.
+
+IMPORTED FILES (BFL)
+  When the debugger stops in a file brought in by import, that file is shown
+  read-only in the editor's place, with the current statement selected.  The
+  File box on the toolbar switches between the program and its imports; F9
+  in an imported file sets a breakpoint there, and Ctrl+F10 runs to its
+  caret line.  The editor comes back when the session ends.
 
 Debug sessions use the interpreter with one instruction per source command,
 so they are far slower than a normal run.  Use them for logic, not timing.)";
@@ -218,6 +239,10 @@ programs such as programs\thirdparty\hanoi.b draw correctly.
 
 Run > Terminal speed (also the toolbar box) paces output like a serial line.
 Programs that finish in milliseconds at full speed become watchable at 9600.
+
+View > Terminal width keeps the terminal at a fixed 80, 120 or 132 columns
+(hanoi.b wants about 120) instead of as many as fit; the window widens to
+fit when it can, and the area past the margin is shaded.
 
 NEWLINE MODE
 Programs written for Unix end lines with LF only and rely on the terminal
@@ -244,6 +269,9 @@ const wchar_t* CLI_TEXT = LR"(COMMAND LINE: bf.exe
   --serial PORT    attach the serial device to COMn, or 'loopback'
   --emit FILE      compile a .bfl file to brainfuck in FILE (and FILE.map)
   --lang           treat the input as BFL whatever its name
+  --warn           report BFL warnings (unused variables, truncation, ...)
+  --check-heap     BFL: halt with a message on a null or out-of-range heap access
+  --check-stack    BFL: halt with a message when the recursion stack overflows
   --quiet-devices  do not report LED / number display changes on stderr
 
 Exit code 0 when the program ends or halts, 3 on stop, fault or error.
@@ -266,11 +294,16 @@ by nesting) or compacted to the commands alone as one continuous string;
 Copy puts the shown form on the clipboard and File > Export writes a .b file.  The debugger steps by statement: F11
 steps into a procedure call, F10 steps over it, F9 sets a breakpoint on the
 statement at the caret, and the watch list is filled with the program's
-global variables.  The full specification is docs/LANG.md in the repository.
+global variables.  The editor colours keywords, types, numbers, strings,
+comments and register names.  Errors and warnings are listed under the
+editor: double-click one or press F4 to go to it, also in imported files.
+Run > Check heap accesses and Run > Check recursion stack add the checks of
+bf --check-heap and --check-stack.  The full specification is docs/LANG.md
+in the repository.
 
 The compiler always knows where the pointer is: every variable has a fixed
 cell (from 0x100 upward), procedures are inlined at each call, and registers
-are addressed by name.  There is no stack and no recursion.
+are addressed by name.  Recursion uses rec proc, described below.
 
 TYPES AND DECLARATIONS
   byte x;  byte y = 7;        one cell, 0..255, wraps.  Zero unless initialised

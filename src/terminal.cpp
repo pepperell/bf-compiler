@@ -22,6 +22,8 @@ struct Term {
     HFONT font = nullptr;
     int   cw = 8, chh = 16;                   // cell size in pixels
     int   cols = 80, rows = 25;
+    int   fixed_cols = 0;                     // host setting: 0 = as many columns as fit
+    int   win_w = 0, win_h = 0;               // last client size
     std::vector<Line> screen;
     std::deque<Line>  scrollback;
     size_t max_scrollback = 5000;
@@ -241,7 +243,8 @@ struct Term {
 
     // ---- resizing / scrolling ------------------------------------------------------
     void resize_to(int w, int h) {
-        int nc = std::max(2, w / cw), nr = std::max(2, h / chh);
+        win_w = w; win_h = h;
+        int nc = fixed_cols > 0 ? fixed_cols : std::max(2, w / cw), nr = std::max(2, h / chh);
         if (nc == cols && nr == rows) return;
         while ((int)screen.size() > nr) {                 // push surplus top rows into history
             if (cy > 0) { scrollback.push_back(std::move(screen[0])); screen.erase(screen.begin()); cy--; }
@@ -314,6 +317,12 @@ struct Term {
             RECT cr{cx * cw, cy * chh, (cx + 1) * cw, (cy + 1) * chh};
             if (GetFocus() == hwnd) InvertRect(mem, &cr);
             else FrameRect(mem, &cr, (HBRUSH)GetStockObject(GRAY_BRUSH));
+        }
+        if (fixed_cols > 0 && cols * cw < rc.right) {          // shade the area past a fixed right margin
+            RECT past{cols * cw, 0, rc.right, rc.bottom};
+            HBRUSH b = CreateSolidBrush(RGB(48, 48, 52));
+            FillRect(mem, &past, b);
+            DeleteObject(b);
         }
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, oldb);
@@ -423,6 +432,14 @@ void clear(HWND h) { if (Term* t = get(h)) { auto k = t->on_key; t->reset_all();
 void set_cursor_visible(HWND h, bool v) { if (Term* t = get(h)) { t->host_cursor = v; InvalidateRect(h, nullptr, FALSE); } }
 void set_newline_mode(HWND h, bool on) { if (Term* t = get(h)) { t->host_lnm = t->lnm = on; } }
 bool newline_mode(HWND h) { Term* t = get(h); return t ? t->host_lnm : true; }
+void set_columns(HWND h, int cols) {
+    if (Term* t = get(h)) {
+        t->fixed_cols = cols > 0 ? std::clamp(cols, 2, 1000) : 0;
+        if (t->win_w > 0) { int w = t->win_w, hh = t->win_h; t->win_w = -1; t->cols = -1; t->resize_to(w, hh); }
+        InvalidateRect(h, nullptr, FALSE);
+    }
+}
+int columns_setting(HWND h) { Term* t = get(h); return t ? t->fixed_cols : 0; }
 void get_size(HWND h, int& cols, int& rows) { Term* t = get(h); cols = t ? t->cols : 0; rows = t ? t->rows : 0; }
 void get_cell_size(HWND h, int& cw, int& ch) { Term* t = get(h); cw = t ? t->cw : 8; ch = t ? t->chh : 16; }
 

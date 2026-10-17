@@ -5,8 +5,10 @@
 //   | device panel: lamps, number display, status  |                  |
 //   | toolbar: Open Save Run Debug Step Pause Stop |  memory viewer   |
 //   +----------------------------------------------+  (hex dump of    |
-//   | source editor (RichEdit; breakpoints in red) |   any tape       |
-//   +----------------------------------------------+   region)        |
+//   | source editor (RichEdit; breakpoints in red; |   any tape       |
+//   |  imported files in a read-only viewer)       |   region) and    |
+//   | error list (BFL)                             |   watch list     |
+//   +----------------------------------------------+   (Ctrl+M hides) |
 //   | VT100 terminal (keys typed here feed ',')    |                  |
 //   +----------------------------------------------+------------------+
 //   | status bar                                                      |
@@ -20,6 +22,7 @@
 #include "hw.h"
 #include "help.h"
 #include "lang/lang.h"
+#include "registers.h"
 #include "terminal.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -27,6 +30,8 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <richedit.h>
+#include <richole.h>
+#include <tom.h>
 #include <shellapi.h>
 #include <mmsystem.h>
 #include <windowsx.h>
@@ -34,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -56,12 +62,15 @@ enum : int {
     ID_WATCHLIST, ID_WATCH_ADD, ID_WATCH_PTR, ID_WATCH_REMOVE, ID_WATCH_DEV,
     ID_VIEW_FB, ID_LANG, ID_VIEW_GEN, ID_EXPORT_BF, ID_GENEDIT, ID_GEN_ANNOTATED, ID_GEN_COMPACT, ID_GEN_COPY, ID_GEN_INFO,
     ID_NEWLINE, ID_TB_NEWLINE, ID_NEXT_DIAG,
+    ID_VIEW_MEM, ID_TERM_FIT, ID_TERM_80, ID_TERM_120, ID_TERM_132, ID_CHECK_HEAP, ID_CHECK_STACK,
+    ID_VIEW_ERRORS, ID_ERRLIST, ID_FILESEL, ID_VIEWER,
     ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400,  // ID_SER_COM_BASE + n = COMn
     ID_HELP_BASE = 700                                             // ID_HELP_BASE + (int)help::Topic
 };
 enum : UINT { WM_APP_FBSHOW = WM_APP + 10 };
 const int BAUDS[5] = {0, 115200, 38400, 9600, 2400};
-enum : int { TIMER_MEM = 1 };
+enum : int { TIMER_MEM = 1, TIMER_COLOUR = 2 };
+const int TERM_COLS[4] = {0, 80, 120, 132};       // ID_TERM_FIT.. ID_TERM_132
 
 constexpr int PANEL_H = 72;
 constexpr int MEM_ROWS = 32, MEM_COLS = 16;
@@ -139,9 +148,21 @@ struct App {
     std::vector<std::pair<int32_t, int32_t>> src_pc;   // (source offset, pc) of the debug program, sorted
     std::set<int64_t> auto_watch;                 // watch rows added from the symbol table
     // diagnostics from the last BFL compile: errors first, then warnings (F4 steps through them)
-    struct DiagItem { int line, col; std::wstring msg; bool warning; };
+    struct DiagItem { int file, line, col; std::wstring msg; bool warning; };
     std::vector<DiagItem> diags;
     int diag_at = -1;
+    HWND errlist = nullptr;                       // error list pane under the editor
+    bool show_errors = true;
+    // imported files: shown read-only in `viewer` in place of the editor
+    HWND viewer = nullptr, filesel = nullptr;
+    int  view_file = 0;                           // 0: the editor is visible, else the file index in lr.files
+    std::set<std::pair<std::string, int>> ext_bps;   // (file name, line) breakpoints in imported files
+    bool show_mem = true;                         // memory viewer and watch list column
+    bool check_heap = false, check_stack = false;
+    // watch rows: the first cell is the row's lParam; wide values read more cells
+    struct WatchInfo { std::vector<int64_t> cells; bool is_signed = false; bool is_ptr = false; };
+    std::map<int64_t, WatchInfo> watch_info;
+    std::wstring settings_file;
 } app;
 
 int px(int v) { return MulDiv(v, (int)app.dpi, 96); }
@@ -162,18 +183,19 @@ std::wstring window_text(HWND h) {
 
 // Editor text with CR-only line breaks: character offsets equal RichEdit
 // positions, so IR source offsets map straight onto the editor.
-std::wstring editor_text() {
+std::wstring rich_text(HWND ed) {
     GETTEXTLENGTHEX gl{GTL_DEFAULT | GTL_NUMCHARS, 1200};
-    LRESULT n = SendMessageW(app.editor, EM_GETTEXTLENGTHEX, (WPARAM)&gl, 0);
+    LRESULT n = SendMessageW(ed, EM_GETTEXTLENGTHEX, (WPARAM)&gl, 0);
     std::wstring w((size_t)n + 1, 0);
     GETTEXTEX gt{};
     gt.cb = (DWORD)((n + 1) * sizeof(wchar_t));
     gt.flags = GT_DEFAULT;
     gt.codepage = 1200;
-    LRESULT got = SendMessageW(app.editor, EM_GETTEXTEX, (WPARAM)&gt, (LPARAM)w.data());
+    LRESULT got = SendMessageW(ed, EM_GETTEXTEX, (WPARAM)&gt, (LPARAM)w.data());
     w.resize((size_t)got);
     return w;
 }
+std::wstring editor_text() { return rich_text(app.editor); }
 // One byte per editor character, so compile offsets match editor positions.
 std::string latin1(const std::wstring& w) {
     std::string s(w.size(), 0);
@@ -196,13 +218,17 @@ int line_of_offset(const std::wstring& text, int32_t pos) { int l = 1; for (int3
 
 void set_status(const std::wstring& s) { SendMessageW(app.status, SB_SETTEXTW, 0, (LPARAM)s.c_str()); }
 void update_title();
+void lang_changed();
 void set_lang(bool on) {
     app.lang = on;
     CheckMenuItem(app.menu, ID_LANG, on ? MF_CHECKED : MF_UNCHECKED);
     EnableMenuItem(app.menu, ID_VIEW_GEN, on ? MF_ENABLED : MF_GRAYED);
     EnableMenuItem(app.menu, ID_EXPORT_BF, on ? MF_ENABLED : MF_GRAYED);
     update_title();
+    lang_changed();
 }
+void set_check_heap(bool on)  { app.check_heap = on;  CheckMenuItem(app.menu, ID_CHECK_HEAP, on ? MF_CHECKED : MF_UNCHECKED); }
+void set_check_stack(bool on) { app.check_stack = on; CheckMenuItem(app.menu, ID_CHECK_STACK, on ? MF_CHECKED : MF_UNCHECKED); }
 
 void set_baud_index(int i) {
     app.con.baud = BAUDS[i];
@@ -270,14 +296,36 @@ int64_t watch_addr(int i) {
 bool watch_checked(int i) { return ((SendMessageW(app.watchlist, LVM_GETITEMSTATE, i, LVIS_STATEIMAGEMASK) >> 12) - 1) == 1; }
 int  watch_find(int64_t a) { for (int i = 0; i < watch_count(); i++) if (watch_addr(i) == a) return i; return -1; }
 
+// The cells a watch row covers, low byte first: one, or every byte of a wide value.
+std::vector<int64_t> watch_cells(int64_t a) {
+    auto it = app.watch_info.find(a);
+    return it == app.watch_info.end() ? std::vector<int64_t>{a} : it->second.cells;
+}
 void refresh_watches() {
-    wchar_t buf[32];
+    wchar_t buf[48];
     for (int i = 0; i < watch_count(); i++) {
-        uint8_t v = app.machine->bus_read(watch_addr(i));
+        int64_t a = watch_addr(i);
+        auto wi = app.watch_info.find(a);
+        bool sg = wi != app.watch_info.end() && wi->second.is_signed;
+        bool ptr = wi != app.watch_info.end() && wi->second.is_ptr;
+        std::vector<int64_t> cells = watch_cells(a);
+        int n = std::min((int)cells.size(), 8);
+        uint64_t v = 0;
+        for (int k = 0; k < n; k++) v |= (uint64_t)app.machine->bus_read(cells[(size_t)k]) << (8 * k);
+        int64_t sv = (int64_t)v;
+        if (sg && n < 8 && ((v >> (8 * n - 1)) & 1)) sv = (int64_t)(v | (~0ull << (8 * n)));
         LVITEMW it{}; it.mask = LVIF_TEXT; it.iItem = i; it.pszText = buf;
-        it.iSubItem = 1; swprintf(buf, 32, L"%02X", v);  SendMessageW(app.watchlist, LVM_SETITEMW, 0, (LPARAM)&it);
-        it.iSubItem = 2; swprintf(buf, 32, L"%u", v);    SendMessageW(app.watchlist, LVM_SETITEMW, 0, (LPARAM)&it);
-        it.iSubItem = 3; swprintf(buf, 32, L"%lc", (v >= 32 && v < 127) ? (wchar_t)v : L'.'); SendMessageW(app.watchlist, LVM_SETITEMW, 0, (LPARAM)&it);
+        it.iSubItem = 1; swprintf(buf, 48, L"%0*llX", 2 * n, (unsigned long long)v); SendMessageW(app.watchlist, LVM_SETITEMW, 0, (LPARAM)&it);
+        it.iSubItem = 2;
+        if (sg) swprintf(buf, 48, L"%lld", (long long)sv); else swprintf(buf, 48, L"%llu", (unsigned long long)v);
+        SendMessageW(app.watchlist, LVM_SETITEMW, 0, (LPARAM)&it);
+        it.iSubItem = 3;
+        if (n == 1) swprintf(buf, 48, L"%lc", (v >= 32 && v < 127) ? (wchar_t)v : L'.');
+        else if (ptr && v == 0) wcscpy(buf, L"null");
+        else if (ptr && app.lr.heap_cell >= 0 && v < (uint64_t)app.lr.heap_size)       // the byte it points at
+            swprintf(buf, 48, L"*=%u", app.machine->bus_read(app.lr.heap_cell + 5 * (int64_t)v + 4));
+        else buf[0] = 0;
+        SendMessageW(app.watchlist, LVM_SETITEMW, 0, (LPARAM)&it);
     }
 }
 void watch_add(int64_t a) {
@@ -290,14 +338,17 @@ void watch_add(int64_t a) {
 void watch_remove_selected() {
     int i = (int)SendMessageW(app.watchlist, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
     if (i < 0) return;
-    if (app.dbg) app.dbg->set_watch(watch_addr(i), false);
+    int64_t a = watch_addr(i);
+    if (app.dbg) for (int64_t c : watch_cells(a)) app.dbg->set_watch(c, false);
+    app.watch_info.erase(a);
+    app.auto_watch.erase(a);
     SendMessageW(app.watchlist, LVM_DELETEITEM, i, 0);
 }
 bool watch_dev_checked() { return SendMessageW(app.watch_dev, BM_GETCHECK, 0, 0) == BST_CHECKED; }
 void watches_to_session() {
     if (!app.dbg) return;
     app.dbg->clear_watches();
-    for (int i = 0; i < watch_count(); i++) if (watch_checked(i)) app.dbg->set_watch(watch_addr(i), true);
+    for (int i = 0; i < watch_count(); i++) if (watch_checked(i)) for (int64_t c : watch_cells(watch_addr(i))) app.dbg->set_watch(c, true);
     app.dbg->set_watch_device_window(watch_dev_checked());
 }
 void watch_add_named(int64_t a, const std::wstring& label) {
@@ -308,19 +359,31 @@ void watch_add_named(int64_t a, const std::wstring& label) {
 // Replace the rows that came from the BFL symbol table with the current globals.
 void auto_watches() {
     for (int i = watch_count() - 1; i >= 0; i--) if (app.auto_watch.count(watch_addr(i))) SendMessageW(app.watchlist, LVM_DELETEITEM, i, 0);
+    for (int64_t a : app.auto_watch) app.watch_info.erase(a);
     app.auto_watch.clear();
-    wchar_t buf[96];
+    wchar_t buf[128];
+    auto add = [&](int64_t first, const std::wstring& label, std::vector<int64_t> cells, bool sg, bool ptr) {
+        if (watch_find(first) >= 0) return;
+        watch_add_named(first, label);
+        app.auto_watch.insert(first);
+        if (cells.size() > 1 || sg || ptr) app.watch_info[first] = App::WatchInfo{std::move(cells), sg, ptr};
+    };
     for (const bfl::Symbol& v : app.lr.symbols) {
         if (!v.scope.empty()) continue;
         std::wstring name = widen(v.name);
-        if (v.kind == 'b') { swprintf(buf, 96, L"%s  %llX", name.c_str(), (long long)v.cell); watch_add_named(v.cell, buf); app.auto_watch.insert(v.cell); }
-        else if (v.kind == 'w') {
-            swprintf(buf, 96, L"%s lo  %llX", name.c_str(), (long long)v.cell); watch_add_named(v.cell, buf); app.auto_watch.insert(v.cell);
-            swprintf(buf, 96, L"%s hi  %llX", name.c_str(), (long long)v.cell + 1); watch_add_named(v.cell + 1, buf); app.auto_watch.insert(v.cell + 1);
+        if (v.kind != 'a') {                       // one row per value, all its bytes
+            std::vector<int64_t> cells;
+            for (int k = 0; k < v.cells; k++) cells.push_back(v.cell + k);
+            swprintf(buf, 128, L"%s  %llX", name.c_str(), (long long)v.cell);
+            add(v.cell, buf, cells, v.is_signed, v.kind == 'p');
         } else {
+            // one plane per byte of the element (docs/LANG.md): byte b of element k is in plane b
+            int64_t plane = 3 * ((int64_t)v.count + 1);
             for (int k = 0; k < v.count && k < 16; k++) {
-                int64_t c = bfl::array_cell(v.cell, k);
-                swprintf(buf, 96, L"%s[%d]  %llX", name.c_str(), k, (long long)c); watch_add_named(c, buf); app.auto_watch.insert(c);
+                std::vector<int64_t> cells;
+                for (int b = 0; b < v.elem && b < 8; b++) cells.push_back(bfl::array_cell(v.cell + plane * b, k));
+                swprintf(buf, 128, L"%s[%d]  %llX", name.c_str(), k, (long long)cells[0]);
+                add(cells[0], buf, cells, v.is_signed && v.elem <= 8, false);
             }
         }
     }
@@ -371,26 +434,117 @@ void mem_show_ptr() {
 bool mem_auto() { return SendMessageW(app.mem_auto, BM_GETCHECK, 0, 0) == BST_CHECKED; }
 
 // ---- editor helpers ------------------------------------------------------------------
-void editor_select(int32_t a, int32_t b, bool scroll) {
+void edit_select(HWND ed, int32_t a, int32_t b, bool scroll) {
     CHARRANGE cr{a, b};
-    SendMessageW(app.editor, EM_EXSETSEL, 0, (LPARAM)&cr);
-    if (scroll) SendMessageW(app.editor, EM_SCROLLCARET, 0, 0);
+    SendMessageW(ed, EM_EXSETSEL, 0, (LPARAM)&cr);
+    if (scroll) SendMessageW(ed, EM_SCROLLCARET, 0, 0);
 }
+void editor_select(int32_t a, int32_t b, bool scroll) { edit_select(app.editor, a, b, scroll); }
 void editor_get_sel(CHARRANGE& cr) { SendMessageW(app.editor, EM_EXGETSEL, 0, (LPARAM)&cr); }
 
-void mark_bp(int32_t pos, bool on) {
+// Breakpoints show as a red background on one character (the editor or the viewer).
+void mark_char(HWND ed, int32_t pos, bool on) {
     app.suppress_change++;
-    CHARRANGE save; editor_get_sel(save);
-    SendMessageW(app.editor, WM_SETREDRAW, FALSE, 0);
-    editor_select(pos, pos + 1, false);
+    CHARRANGE save; SendMessageW(ed, EM_EXGETSEL, 0, (LPARAM)&save);
+    SendMessageW(ed, WM_SETREDRAW, FALSE, 0);
+    edit_select(ed, pos, pos + 1, false);
     CHARFORMAT2W cf{};
     cf.cbSize = sizeof cf;
     cf.dwMask = CFM_BACKCOLOR;
     if (on) cf.crBackColor = BP_COLOUR; else cf.dwEffects = CFE_AUTOBACKCOLOR;
-    SendMessageW(app.editor, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-    SendMessageW(app.editor, EM_EXSETSEL, 0, (LPARAM)&save);
-    SendMessageW(app.editor, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(app.editor, nullptr, FALSE);
+    SendMessageW(ed, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    SendMessageW(ed, EM_EXSETSEL, 0, (LPARAM)&save);
+    SendMessageW(ed, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(ed, nullptr, FALSE);
+    app.suppress_change--;
+}
+void mark_bp(int32_t pos, bool on) { mark_char(app.editor, pos, on); }
+
+// ---- syntax colouring (BFL) ----------------------------------------------------------------
+// Only the text colour is set, through the Text Object Model with undo suspended,
+// so the breakpoint backgrounds and the undo history are left alone.
+ITextDocument* text_doc(HWND ed) {
+    IRichEditOle* ole = nullptr;
+    if (!SendMessageW(ed, EM_GETOLEINTERFACE, 0, (LPARAM)&ole) || !ole) return nullptr;
+    static const GUID iid_doc = {0x8CC497C0, 0xA1DF, 0x11CE, {0x80, 0x98, 0x00, 0xAA, 0x00, 0x47, 0xBE, 0x5D}};
+    ITextDocument* doc = nullptr;
+    if (FAILED(ole->QueryInterface(iid_doc, (void**)&doc))) doc = nullptr;
+    ole->Release();
+    return doc;
+}
+enum class Tk { Comment, String, Number, Keyword, Type, Register };
+COLORREF tk_colour(Tk k) {
+    switch (k) {
+    case Tk::Comment:  return RGB(0, 128, 0);
+    case Tk::String:   return RGB(163, 21, 21);
+    case Tk::Number:   return RGB(152, 80, 0);
+    case Tk::Keyword:  return RGB(0, 0, 200);
+    case Tk::Type:     return RGB(0, 128, 128);
+    case Tk::Register: return RGB(140, 0, 160);
+    }
+    return 0;
+}
+bool bfl_word(const std::wstring& w, Tk& k) {
+    static const std::set<std::wstring> types = {L"byte", L"sbyte", L"word", L"int", L"dword", L"long", L"string"};
+    static const std::set<std::wstring> kws = {L"const", L"proc", L"rec", L"ref", L"if", L"else", L"while", L"for", L"break", L"continue",
+        L"out", L"print", L"pulse", L"halt", L"asm", L"in", L"input", L"return", L"stack", L"heap", L"struct", L"import", L"sizeof", L"new", L"null"};
+    static std::set<std::wstring> regs;
+    if (regs.empty()) for (const RegisterInfo& r : register_map()) regs.insert(widen(r.name));
+    if (types.count(w)) { k = Tk::Type; return true; }
+    if (kws.count(w)) { k = Tk::Keyword; return true; }
+    if (regs.count(w)) { k = Tk::Register; return true; }
+    return false;
+}
+// Calls paint(start, end, kind) for every coloured token of BFL source.
+template <class F> void bfl_tokens(const std::wstring& t, F paint) {
+    size_t i = 0, n = t.size();
+    auto eol = [&](size_t j) { return t[j] == L'\r' || t[j] == L'\n'; };
+    while (i < n) {
+        wchar_t c = t[i];
+        if (c == L'/' && i + 1 < n && t[i + 1] == L'/') { size_t j = i; while (j < n && !eol(j)) j++; paint(i, j, Tk::Comment); i = j; continue; }
+        if (c == L'/' && i + 1 < n && t[i + 1] == L'*') {
+            size_t j = i + 2;
+            while (j + 1 < n && !(t[j] == L'*' && t[j + 1] == L'/')) j++;
+            j = std::min(n, j + 2);
+            paint(i, j, Tk::Comment); i = j; continue;
+        }
+        if (c == L'"' || c == L'\'') {
+            size_t j = i + 1;
+            while (j < n && t[j] != c && !eol(j)) { if (t[j] == L'\\') j++; j++; }
+            j = std::min(n, j + 1);
+            paint(i, j, c == L'"' ? Tk::String : Tk::Number); i = j; continue;
+        }
+        if (iswdigit(c)) { size_t j = i; while (j < n && (iswalnum(t[j]) || t[j] == L'_')) j++; paint(i, j, Tk::Number); i = j; continue; }
+        if (iswalpha(c) || c == L'_') {
+            size_t j = i; while (j < n && (iswalnum(t[j]) || t[j] == L'_')) j++;
+            Tk k; if (bfl_word(t.substr(i, j - i), k)) paint(i, j, k);
+            i = j; continue;
+        }
+        i++;
+    }
+}
+void colour_source(HWND ed, bool bfl) {
+    ITextDocument* doc = text_doc(ed);
+    if (!doc) return;
+    std::wstring t = rich_text(ed);
+    app.suppress_change++;
+    bool ro = (GetWindowLongW(ed, GWL_STYLE) & ES_READONLY) != 0;    // TOM refuses to format read-only text
+    if (ro) SendMessageW(ed, EM_SETREADONLY, FALSE, 0);
+    doc->Undo(tomSuspend, nullptr);
+    long frozen = 0; doc->Freeze(&frozen);
+    auto paint = [&](size_t a, size_t b, long colour) {
+        ITextRange* r = nullptr;
+        if (FAILED(doc->Range((long)a, (long)b, &r)) || !r) return;
+        ITextFont* f = nullptr;
+        if (SUCCEEDED(r->GetFont(&f)) && f) { f->SetForeColor(colour); f->Release(); }
+        r->Release();
+    };
+    paint(0, t.size(), tomAutoColor);
+    if (bfl) bfl_tokens(t, [&](size_t a, size_t b, Tk k) { paint(a, b, (long)tk_colour(k)); });
+    doc->Unfreeze(&frozen);
+    doc->Undo(tomResume, nullptr);
+    doc->Release();
+    if (ro) SendMessageW(ed, EM_SETREADONLY, TRUE, 0);
     app.suppress_change--;
 }
 
@@ -437,30 +591,106 @@ int stmt_at(int32_t src) {
     }
     return best;
 }
-// Statements starting on a source line, outermost first.
-std::vector<int> stmts_on_line(int line) {
+// Statements starting on a line of a source file, outermost first.
+std::vector<int> stmts_on_line(int file, int line) {
     std::vector<int> v;
-    for (size_t i = 0; i < app.lr.stmts.size(); i++) if (app.lr.stmts[i].line == line) v.push_back((int)i);
+    for (size_t i = 0; i < app.lr.stmts.size(); i++) if (app.lr.stmts[i].line == line && app.lr.stmts[i].file == file) v.push_back((int)i);
     std::sort(v.begin(), v.end(), [](int a, int b) { return app.lr.stmts[a].depth < app.lr.stmts[b].depth; });
+    return v;
+}
+std::vector<int32_t> pcs_for_line(int file, int line) {
+    std::vector<int32_t> v;
+    for (int i : stmts_on_line(file, line)) {
+        int32_t pc = first_pc_in(app.lr.stmts[i].start, app.lr.stmts[i].end);
+        if (pc >= 0) v.push_back(pc);
+    }
     return v;
 }
 // The debug-program pcs a breakpoint at editor position pos stands for.
 std::vector<int32_t> pcs_for_bp(int32_t pos, const std::wstring& text) {
     std::vector<int32_t> v;
     if (!app.lang) { auto r = app.pc_of_src.equal_range(pos); for (auto it = r.first; it != r.second; ++it) v.push_back(it->second); return v; }
-    for (int i : stmts_on_line(line_of_offset(text, pos))) {
-        int32_t pc = first_pc_in(app.lr.stmts[i].start, app.lr.stmts[i].end);
-        if (pc >= 0) v.push_back(pc);
-    }
-    return v;
+    return pcs_for_line(0, line_of_offset(text, pos));
 }
-void select_stmt(int i, const std::wstring& text) {
+int file_index(const std::string& name) {
+    for (size_t i = 0; i < app.lr.files.size(); i++) if (app.lr.files[i] == name) return (int)i;
+    return -1;
+}
+std::wstring short_name(const std::string& f) {
+    size_t s = f.find_last_of("\\/");
+    std::wstring w = widen(s == std::string::npos ? f : f.substr(s + 1));
+    return f.rfind("<std>/", 0) == 0 ? w + L" (library)" : w;
+}
+
+// ---- imported files: the read-only viewer ------------------------------------------------------
+int view_loaded = -1;                // file index whose text the viewer holds
+int32_t first_nonblank(const std::wstring& text, int line) {
+    int32_t p = offset_of(text, line, 1);
+    while (p < (int32_t)text.size() && (text[p] == L' ' || text[p] == L'\t')) p++;
+    return p;
+}
+// Show file f of the last compile: 0 is the editor, any other index the viewer.
+void show_file(int f) {
+    if (f < 0 || f >= (int)app.lr.files.size() || f >= (int)app.lr.sources.size()) f = 0;
+    if (f != 0 && f != view_loaded) {
+        const std::string& src = app.lr.sources[(size_t)f];
+        std::string crlf; crlf.reserve(src.size() + src.size() / 20);
+        for (char c : src) { if (c == '\r') continue; if (c == '\n') crlf += "\r\n"; else crlf += c; }
+        SetWindowTextW(app.viewer, widen(crlf).c_str());
+        view_loaded = f;
+        colour_source(app.viewer, true);
+        std::wstring text = rich_text(app.viewer);
+        for (const auto& bp : app.ext_bps) if (bp.first == app.lr.files[(size_t)f]) mark_char(app.viewer, first_nonblank(text, bp.second), true);
+    }
+    app.view_file = f;
+    ShowWindow(app.viewer, f == 0 ? SW_HIDE : SW_SHOW);
+    ShowWindow(app.editor, f == 0 ? SW_SHOW : SW_HIDE);
+    if (app.filesel) SendMessageW(app.filesel, CB_SETCURSEL, f, 0);
+}
+// Refill the file selector after a compile.
+void fill_filesel() {
+    view_loaded = -1;
+    SendMessageW(app.filesel, CB_RESETCONTENT, 0, 0);
+    if (!app.lang || app.lr.files.empty()) {
+        SendMessageW(app.filesel, CB_ADDSTRING, 0, (LPARAM)L"File: (no imports)");
+        SendMessageW(app.filesel, CB_SETCURSEL, 0, 0);
+        EnableWindow(app.filesel, FALSE);
+        show_file(0);
+        return;
+    }
+    for (size_t i = 0; i < app.lr.files.size(); i++) {
+        std::wstring s = L"File: " + short_name(app.lr.files[i]) + (i == 0 ? L"  (editor)" : L"");
+        SendMessageW(app.filesel, CB_ADDSTRING, 0, (LPARAM)s.c_str());
+    }
+    EnableWindow(app.filesel, app.lr.files.size() > 1);
+    show_file(app.view_file < (int)app.lr.files.size() ? app.view_file : 0);
+}
+HWND file_edit(int f) { return f == 0 ? app.editor : app.viewer; }
+void select_stmt(int i) {
     const bfl::StmtRange& r = app.lr.stmts[i];
+    show_file(r.file);
+    HWND ed = file_edit(app.view_file);
+    std::wstring text = rich_text(ed);
     int32_t a = offset_of(text, r.line, r.col);
-    editor_select(a, line_end(text, a), true);
+    edit_select(ed, a, line_end(text, a), true);
 }
 
 void toggle_bp_at_caret() {
+    if (app.lang && app.view_file != 0) {             // a breakpoint in an imported file
+        std::wstring text = rich_text(app.viewer);
+        CHARRANGE cr; SendMessageW(app.viewer, EM_EXGETSEL, 0, (LPARAM)&cr);
+        int line = line_of_offset(text, cr.cpMin);
+        int32_t pos = first_nonblank(text, line);
+        if (pos >= (int32_t)text.size() || text[pos] == L'\r') { set_status(L"Empty line."); return; }
+        auto key = std::make_pair(app.lr.files[(size_t)app.view_file], line);
+        bool on = !app.ext_bps.count(key);
+        if (on) app.ext_bps.insert(key); else app.ext_bps.erase(key);
+        mark_char(app.viewer, pos, on);
+        if (app.dbg) for (int32_t pc : pcs_for_line(app.view_file, line)) app.dbg->set_breakpoint(pc, on);
+        wchar_t buf[200]; swprintf(buf, 200, L"Breakpoint %s at %s line %d.", on ? L"set" : L"cleared", short_name(key.first).c_str(), line);
+        set_status(buf);
+        return;
+    }
     std::wstring text = editor_text();
     CHARRANGE cr; editor_get_sel(cr);
     int32_t pos = cr.cpMin;
@@ -478,6 +708,11 @@ void toggle_bp_at_caret() {
 void clear_all_bps() {
     for (int32_t p : app.bps) mark_bp(p, false);
     app.bps.clear();
+    if (view_loaded > 0) {
+        std::wstring text = rich_text(app.viewer);
+        for (const auto& bp : app.ext_bps) if (bp.first == app.lr.files[(size_t)view_loaded]) mark_char(app.viewer, first_nonblank(text, bp.second), false);
+    }
+    app.ext_bps.clear();
     if (app.dbg) app.dbg->clear_breakpoints();
     set_status(L"Breakpoints cleared.");
 }
@@ -516,21 +751,58 @@ void gen_update() {
 }
 
 // Compile the editor contents: BFL -> brainfuck -> IR, or brainfuck -> IR.
-// Show diagnostic i: select its line in the editor and describe it in the status bar.
+// ---- error list pane ---------------------------------------------------------------------------
+void fill_errlist() {
+    SendMessageW(app.errlist, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(app.errlist, LVM_DELETEALLITEMS, 0, 0);
+    auto row = [](int at, LPARAM param, const std::wstring& kind, const std::wstring& file, const std::wstring& line, const std::wstring& msg) {
+        LVITEMW it{}; it.mask = LVIF_TEXT | LVIF_PARAM; it.iItem = at; it.pszText = (LPWSTR)kind.c_str(); it.lParam = param;
+        int i = (int)SendMessageW(app.errlist, LVM_INSERTITEMW, 0, (LPARAM)&it);
+        it.mask = LVIF_TEXT; it.iItem = i;
+        it.iSubItem = 1; it.pszText = (LPWSTR)file.c_str(); SendMessageW(app.errlist, LVM_SETITEMW, 0, (LPARAM)&it);
+        it.iSubItem = 2; it.pszText = (LPWSTR)line.c_str(); SendMessageW(app.errlist, LVM_SETITEMW, 0, (LPARAM)&it);
+        it.iSubItem = 3; it.pszText = (LPWSTR)msg.c_str();  SendMessageW(app.errlist, LVM_SETITEMW, 0, (LPARAM)&it);
+    };
+    if (app.diags.empty()) row(0, -1, L"", L"", L"", L"No errors or warnings.");
+    for (size_t i = 0; i < app.diags.size(); i++) {
+        const auto& d = app.diags[i];
+        std::wstring f = d.file >= 0 && d.file < (int)app.lr.files.size() ? short_name(app.lr.files[(size_t)d.file]) : L"";
+        row((int)i, (LPARAM)i, d.warning ? L"warning" : L"error", f, d.line > 0 ? std::to_wstring(d.line) + L":" + std::to_wstring(d.col) : L"", d.msg);
+    }
+    SendMessageW(app.errlist, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(app.errlist, nullptr, TRUE);
+}
+
+// Show diagnostic i: select its line in the editor (or the viewer for an imported
+// file), highlight it in the error list and describe it in the status bar.
 void show_diag(int i) {
     if (app.diags.empty()) { set_status(L"No errors or warnings."); return; }
     app.diag_at = ((i % (int)app.diags.size()) + (int)app.diags.size()) % (int)app.diags.size();
     const auto& d = app.diags[(size_t)app.diag_at];
-    std::wstring text = editor_text();
+    show_file(d.file);
+    HWND ed = file_edit(app.view_file);
+    std::wstring text = rich_text(ed);
     int32_t p = offset_of(text, d.line, d.col);
-    editor_select(p, line_end(text, p), true);
-    SetFocus(app.editor);
-    int errors = 0;
-    for (const auto& x : app.diags) if (!x.warning) errors++;
-    wchar_t buf[600];
-    swprintf(buf, 600, L"%s %d of %d, line %d col %d: %s%s", d.warning ? L"Warning" : L"Error", app.diag_at + 1, (int)app.diags.size(),
-             d.line, d.col, d.msg.c_str(), app.diags.size() > 1 ? L"   (F4: next)" : L"");
+    edit_select(ed, p, line_end(text, p), true);
+    SetFocus(ed);
+    LVITEMW st{}; st.stateMask = LVIS_SELECTED | LVIS_FOCUSED; st.state = LVIS_SELECTED | LVIS_FOCUSED;
+    SendMessageW(app.errlist, LVM_SETITEMSTATE, (WPARAM)app.diag_at, (LPARAM)&st);
+    SendMessageW(app.errlist, LVM_ENSUREVISIBLE, (WPARAM)app.diag_at, FALSE);
+    std::wstring where = d.file != 0 && d.file < (int)app.lr.files.size() ? short_name(app.lr.files[(size_t)d.file]) + L" " : L"";
+    wchar_t buf[700];
+    swprintf(buf, 700, L"%s %d of %d, %sline %d col %d: %s%s", d.warning ? L"Warning" : L"Error", app.diag_at + 1, (int)app.diags.size(),
+             where.c_str(), d.line, d.col, d.msg.c_str(), app.diags.size() > 1 ? L"   (F4: next)" : L"");
     set_status(buf);
+}
+
+void layout();
+// BFL on or off: colouring, file selector and error list follow.
+void lang_changed() {
+    if (!app.editor || !app.errlist) return;
+    colour_source(app.editor, app.lang);
+    fill_filesel();
+    fill_errlist();
+    layout();
 }
 
 bool compile_editor(bool optimise) {
@@ -540,13 +812,18 @@ bool compile_editor(bool optimise) {
         for (char& c : s) if (c == '\r') c = '\n';
         bfl::Options opt;
         opt.warnings = true;
+        opt.check_heap = app.check_heap;
+        opt.check_stack = app.check_stack;
         opt.file_name = app.path.empty() ? "untitled.bfl" : latin1(app.path);
         app.lr = bfl::compile(s, app.machine->mmio_size(), opt);
         app.diags.clear();
         app.diag_at = -1;
-        for (const bfl::Error& e : app.lr.errors) if (e.file == 0) app.diags.push_back({e.line, e.col, widen(e.msg), false});
-        for (const bfl::Error& e : app.lr.errors) if (e.file != 0) app.diags.push_back({1, 1, widen(bfl::format_error(app.lr, e)), false});
-        for (const bfl::Error& e : app.lr.warnings) if (e.file == 0) app.diags.push_back({e.line, e.col, widen(e.msg), true});
+        for (int w = 0; w < 2; w++)                   // errors first, then warnings; the main file first
+            for (int main = 1; main >= 0; main--)
+                for (const bfl::Error& e : w ? app.lr.warnings : app.lr.errors)
+                    if ((e.file == 0) == (main == 1)) app.diags.push_back({e.file, e.line, e.col, widen(e.msg), w == 1});
+        fill_filesel();
+        fill_errlist();
         if (!app.lr.ok()) {
             show_diag(0);
             gen_update();
@@ -578,6 +855,8 @@ bool load_file(const std::wstring& path) {
     app.bps.clear();
     app.path = path;
     app.modified = false;
+    app.view_file = 0;
+    app.diags.clear();
     set_lang(is_bfl_path(path));
     if (!compile_editor(true)) return false;
     wchar_t buf[256];
@@ -696,10 +975,14 @@ void show_paused() {
     int32_t pc = app.dbg->pc();
     const Instr& x = app.prog.code[pc];
     int line, col;
+    std::wstring where;
     if (app.lang) {
-        std::wstring text = editor_text();
         int stmt = x.op == END ? -1 : stmt_at(x.src);
-        if (stmt >= 0) { select_stmt(stmt, text); line = app.lr.stmts[stmt].line - 1; col = app.lr.stmts[stmt].col - 1; }
+        if (stmt >= 0) {
+            select_stmt(stmt);
+            line = app.lr.stmts[stmt].line - 1; col = app.lr.stmts[stmt].col - 1;
+            if (app.lr.stmts[stmt].file != 0) where = short_name(app.lr.files[(size_t)app.lr.stmts[stmt].file]) + L" ";
+        }
         else { editor_select(0, 0, false); line = col = -1; }
     } else {
         editor_select(x.src, x.src + (x.op == END ? 0 : 1), true);
@@ -721,7 +1004,7 @@ void show_paused() {
     wchar_t buf[320];
     if (x.op == END) swprintf(buf, 320, L"%s - at end of program.  cell 0x%llX = %u", why, (long long)p, v);
     else if (line < 0) swprintf(buf, 320, L"%s - between statements (brainfuck offset %d, IR %d)   cell 0x%llX = %u (0x%02X)", why, x.src, pc, (long long)p, v, v);
-    else swprintf(buf, 320, L"%s - line %d col %d (IR %d)   cell 0x%llX = %u (0x%02X)", why, line + 1, col + 1, pc, (long long)p, v, v);
+    else swprintf(buf, 320, L"%s - %sline %d col %d (IR %d)   cell 0x%llX = %u (0x%02X)", why, where.c_str(), line + 1, col + 1, pc, (long long)p, v, v);
     set_status(buf);
     mem_show_ptr();
 }
@@ -749,6 +1032,8 @@ void start_debug() {
         PostMessageW(app.wnd, WM_APP_DEBUG, (WPARAM)e, 0);
     });
     for (int32_t s : app.bps) for (int32_t pc : pcs_for_bp(s, text)) app.dbg->set_breakpoint(pc, true);
+    if (app.lang)
+        for (const auto& bp : app.ext_bps) { int f = file_index(bp.first); if (f > 0) for (int32_t pc : pcs_for_line(f, bp.second)) app.dbg->set_breakpoint(pc, true); }
     if (app.lang) {
         std::vector<uint8_t> marks(app.prog.code.size(), 0);
         for (const bfl::StmtRange& r : app.lr.stmts) { if (r.cont) continue; int32_t pc = first_pc_in(r.start, r.end); if (pc >= 0) marks[pc] = 1; }
@@ -773,6 +1058,7 @@ void debug_event(Debugger::Event e) {
     app.have_last = true;
     app.dbg.reset();                       // joins the session thread
     set_mode(Mode::Idle);
+    show_file(0);
     editor_select(0, 0, false);
     set_status(result_text(app.last));
     notify_device();
@@ -813,7 +1099,12 @@ void debug_run_to_cursor() {
     CHARRANGE cr; editor_get_sel(cr);
     int32_t pos = cr.cpMin;
     if (app.lang) {
-        std::vector<int32_t> pcs = pcs_for_bp(pos, text);
+        std::vector<int32_t> pcs;
+        if (app.view_file != 0) {
+            std::wstring vt = rich_text(app.viewer);
+            CHARRANGE vr; SendMessageW(app.viewer, EM_EXGETSEL, 0, (LPARAM)&vr);
+            pcs = pcs_for_line(app.view_file, line_of_offset(vt, vr.cpMin));
+        } else pcs = pcs_for_bp(pos, text);
         if (pcs.empty()) { set_status(L"No statement starts on this line."); return; }
         set_mode(Mode::DebugRunning);
         set_status(L"Running to the caret...");
@@ -1024,7 +1315,7 @@ void layout() {
     RECT sb; GetWindowRect(app.status, &sb);
     int sbh = sb.bottom - sb.top;
     int panel = px(PANEL_H);
-    int memw = px(620);
+    int memw = app.show_mem ? std::min(px(620), (int)rc.right / 2) : 0;
     int left_w = rc.right - memw;
     int body_top = panel, body_h = rc.bottom - sbh - panel;
     int gap = px(6);
@@ -1038,15 +1329,31 @@ void layout() {
     MoveWindow(app.tb_speed, tx, ty, px(140), tbh * 8, TRUE);
     tx += px(148);
     MoveWindow(app.tb_newline, tx, ty, px(130), tbh, TRUE);
+    tx += px(136);
+    MoveWindow(app.filesel, tx, ty, px(260), tbh * 10, TRUE);
     body_top += tbh + px(10);
     body_h -= tbh + px(10);
 
+    bool errs = app.show_errors && app.lang;
+    int err_h = errs ? px(100) : 0, err_gap = errs ? px(3) : 0;
+    ShowWindow(app.errlist, errs ? SW_SHOWNA : SW_HIDE);
     int min_edit = px(60);
-    app.console_h = std::clamp(app.console_h, px(40), std::max(px(40), body_h - gap - min_edit));
-    int edit_h = body_h - gap - app.console_h;
+    app.console_h = std::clamp(app.console_h, px(40), std::max(px(40), body_h - gap - min_edit - err_h - err_gap));
+    int edit_h = body_h - gap - app.console_h - err_h - err_gap;
     MoveWindow(app.editor, 0, body_top, left_w, edit_h, TRUE);
-    app.splitter = RECT{0, body_top + edit_h, left_w, body_top + edit_h + gap};
+    MoveWindow(app.viewer, 0, body_top, left_w, edit_h, TRUE);
+    if (errs) {
+        MoveWindow(app.errlist, 0, body_top + edit_h + err_gap, left_w, err_h, TRUE);
+        SendMessageW(app.errlist, LVM_SETCOLUMNWIDTH, 3, LVSCW_AUTOSIZE_USEHEADER);   // the message column fills the rest
+    }
+    int split_top = body_top + edit_h + err_gap + err_h;
+    app.splitter = RECT{0, split_top, left_w, split_top + gap};
     MoveWindow(app.console, 0, app.splitter.bottom, left_w, app.console_h, TRUE);
+
+    HWND memctl[] = {app.mem_addr, app.mem_buttons[0], app.mem_buttons[1], app.mem_buttons[2], app.mem_buttons[3], app.mem_buttons[4],
+                     app.mem_buttons[5], app.mem_auto, app.memview, app.watch_add, app.watch_ptr, app.watch_remove, app.watch_dev, app.watchlist};
+    for (HWND c : memctl) if (((GetWindowLongW(c, GWL_STYLE) & WS_VISIBLE) != 0) != app.show_mem) ShowWindow(c, app.show_mem ? SW_SHOWNA : SW_HIDE);
+    if (!app.show_mem) return;
 
     int x = left_w + px(6), y = body_top + px(6), bh = px(24);
     MoveWindow(app.mem_addr, x, y, px(80), bh, TRUE); x += px(84);
@@ -1063,6 +1370,123 @@ void layout() {
     MoveWindow(app.watch_remove, wx, wy, px(64), bh, TRUE); wx += px(72);
     MoveWindow(app.watch_dev, wx, wy, px(230), bh, TRUE);
     MoveWindow(app.watchlist, left_w + px(6), wy + bh + px(6), memw - px(12), watch_h, TRUE);
+}
+
+// ---- view options ----------------------------------------------------------------------
+void set_show_mem(bool on) {
+    app.show_mem = on;
+    CheckMenuItem(app.menu, ID_VIEW_MEM, on ? MF_CHECKED : MF_UNCHECKED);
+    layout();
+    InvalidateRect(app.wnd, nullptr, TRUE);
+}
+void set_show_errors(bool on) {
+    app.show_errors = on;
+    CheckMenuItem(app.menu, ID_VIEW_ERRORS, on ? MF_CHECKED : MF_UNCHECKED);
+    layout();
+    InvalidateRect(app.wnd, nullptr, TRUE);
+}
+// Terminal column count (0 = fit the window).  With grow, a window too narrow
+// for the chosen count is widened as far as the screen allows.
+void set_term_cols(int cols, bool grow) {
+    int idx = 0;
+    for (int i = 0; i < 4; i++) if (TERM_COLS[i] == cols) idx = i;
+    cols = TERM_COLS[idx];
+    term::set_columns(app.console, cols);
+    CheckMenuRadioItem(app.menu, ID_TERM_FIT, ID_TERM_132, ID_TERM_FIT + idx, MF_BYCOMMAND);
+    if (!grow || cols == 0) return;
+    int cw, ch; term::get_cell_size(app.console, cw, ch);
+    RECT cr; GetClientRect(app.console, &cr);
+    int need = cols * cw - cr.right;
+    if (need > 0 && !IsZoomed(app.wnd)) {
+        RECT wr; GetWindowRect(app.wnd, &wr);
+        MONITORINFO mi{}; mi.cbSize = sizeof mi;
+        GetMonitorInfoW(MonitorFromWindow(app.wnd, MONITOR_DEFAULTTONEAREST), &mi);
+        int w = std::min<int>(wr.right - wr.left + need, mi.rcWork.right - mi.rcWork.left);
+        int x = std::max<int>(mi.rcWork.left, std::min<int>(wr.left, mi.rcWork.right - w));
+        SetWindowPos(app.wnd, nullptr, x, wr.top, w, wr.bottom - wr.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        GetClientRect(app.console, &cr);
+    }
+    wchar_t buf[160];
+    if (cols * cw > cr.right) swprintf(buf, 160, L"Terminal: %d columns; the window is too narrow for all of them - hide the memory viewer (Ctrl+M).", cols);
+    else swprintf(buf, 160, L"Terminal: %d columns.", cols);
+    set_status(buf);
+}
+
+// ---- settings: %APPDATA%\bfmachine\settings.ini (BFUI_SETTINGS overrides the path) ----------
+void settings_init() {
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"BFUI_SETTINGS", buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) { app.settings_file = buf; return; }
+    n = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    std::wstring dir = std::wstring(buf) + L"\\bfmachine";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    app.settings_file = dir + L"\\settings.ini";
+}
+int ini_int(const wchar_t* k, int def) {
+    return app.settings_file.empty() ? def : (int)GetPrivateProfileIntW(L"bfui", k, def, app.settings_file.c_str());
+}
+std::wstring ini_str(const wchar_t* k) {
+    wchar_t b[2048] = L"";
+    if (!app.settings_file.empty()) GetPrivateProfileStringW(L"bfui", k, L"", b, 2048, app.settings_file.c_str());
+    return b;
+}
+void ini_put(const wchar_t* k, const std::wstring& v) {
+    if (!app.settings_file.empty()) WritePrivateProfileStringW(L"bfui", k, v.c_str(), app.settings_file.c_str());
+}
+void ini_put(const wchar_t* k, int v) { ini_put(k, std::to_wstring(v)); }
+
+void apply_settings() {
+    set_newline(ini_int(L"newline", 1) != 0);
+    set_baud_index(std::clamp(ini_int(L"terminal_speed", 0), 0, 4));
+    set_interp(ini_int(L"interpreter", 0) != 0);
+    set_check_heap(ini_int(L"check_heap", 0) != 0);
+    set_check_stack(ini_int(L"check_stack", 0) != 0);
+    app.show_errors = ini_int(L"error_list", 1) != 0;
+    CheckMenuItem(app.menu, ID_VIEW_ERRORS, app.show_errors ? MF_CHECKED : MF_UNCHECKED);
+    app.show_mem = ini_int(L"memory_viewer", 1) != 0;
+    CheckMenuItem(app.menu, ID_VIEW_MEM, app.show_mem ? MF_CHECKED : MF_UNCHECKED);
+    int ch = ini_int(L"console_height", 0);
+    if (ch > 0) app.console_h = px(ch);
+    app.gen_is_compact = ini_int(L"generated_compact", 0) != 0;
+    SendMessageW(app.gen_annotated, BM_SETCHECK, app.gen_is_compact ? BST_UNCHECKED : BST_CHECKED, 0);
+    SendMessageW(app.gen_compact, BM_SETCHECK, app.gen_is_compact ? BST_CHECKED : BST_UNCHECKED, 0);
+    layout();
+    set_term_cols(ini_int(L"terminal_columns", 0), false);
+    InvalidateRect(app.wnd, nullptr, TRUE);
+}
+bool restore_placement(HWND h) {
+    int l, t, r, b, mx;
+    if (swscanf(ini_str(L"window").c_str(), L"%d %d %d %d %d", &l, &t, &r, &b, &mx) != 5 || r - l < 300 || b - t < 200) return false;
+    RECT rc{l, t, r, b};
+    if (!MonitorFromRect(&rc, MONITOR_DEFAULTTONULL)) return false;      // that monitor is gone
+    WINDOWPLACEMENT wp{}; wp.length = sizeof wp;
+    wp.rcNormalPosition = rc;
+    wp.showCmd = mx ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+    return SetWindowPlacement(h, &wp) != 0;
+}
+void save_settings() {
+    if (app.settings_file.empty()) return;
+    ini_put(L"newline", term::newline_mode(app.console) ? 1 : 0);
+    int speed = 0;
+    for (int i = 0; i < 5; i++) if (BAUDS[i] == app.con.baud.load()) speed = i;
+    ini_put(L"terminal_speed", speed);
+    ini_put(L"interpreter", app.use_interp ? 1 : 0);
+    ini_put(L"check_heap", app.check_heap ? 1 : 0);
+    ini_put(L"check_stack", app.check_stack ? 1 : 0);
+    ini_put(L"terminal_columns", term::columns_setting(app.console));
+    ini_put(L"error_list", app.show_errors ? 1 : 0);
+    ini_put(L"memory_viewer", app.show_mem ? 1 : 0);
+    ini_put(L"console_height", MulDiv(app.console_h, 96, (int)app.dpi));
+    ini_put(L"generated_compact", app.gen_is_compact ? 1 : 0);
+    ini_put(L"last_file", app.path);
+    WINDOWPLACEMENT wp{}; wp.length = sizeof wp;
+    if (GetWindowPlacement(app.wnd, &wp)) {
+        wchar_t buf[96];
+        const RECT& r = wp.rcNormalPosition;
+        swprintf(buf, 96, L"%ld %ld %ld %ld %d", r.left, r.top, r.right, r.bottom, wp.showCmd == SW_SHOWMAXIMIZED ? 1 : 0);
+        ini_put(L"window", buf);
+    }
 }
 
 HWND make(const wchar_t* cls, const wchar_t* text, DWORD style, int id, HFONT font) {
@@ -1098,6 +1522,8 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(run, MF_STRING, ID_LANG, L"Source is &BFL (compile to brainfuck first)");
         AppendMenuW(run, MF_STRING, ID_VIEW_GEN, L"Show &generated brainfuck\tCtrl+B");
         AppendMenuW(run, MF_STRING, ID_NEXT_DIAG, L"Next &error or warning\tF4");
+        AppendMenuW(run, MF_STRING, ID_CHECK_HEAP, L"Check &heap accesses (null and bounds)");
+        AppendMenuW(run, MF_STRING, ID_CHECK_STACK, L"Check recursion stac&k overflow");
         AppendMenuW(run, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(run, MF_STRING, ID_INTERP, L"Use &interpreter instead of JIT");
         HMENU baud = CreatePopupMenu();
@@ -1140,6 +1566,15 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)file, L"&File");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)run, L"&Run");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)debug, L"&Debug");
+        HMENU view = CreatePopupMenu(), tcols = CreatePopupMenu();
+        AppendMenuW(view, MF_STRING | MF_CHECKED, ID_VIEW_MEM, L"&Memory viewer and watch list\tCtrl+M");
+        AppendMenuW(view, MF_STRING | MF_CHECKED, ID_VIEW_ERRORS, L"&Error list (BFL)");
+        AppendMenuW(tcols, MF_STRING | MF_CHECKED, ID_TERM_FIT, L"&Fit the window");
+        AppendMenuW(tcols, MF_STRING, ID_TERM_80, L"&80 columns");
+        AppendMenuW(tcols, MF_STRING, ID_TERM_120, L"&120 columns");
+        AppendMenuW(tcols, MF_STRING, ID_TERM_132, L"1&32 columns");
+        AppendMenuW(view, MF_POPUP, (UINT_PTR)tcols, L"&Terminal width");
+        AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)view, L"&View");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)devices, L"De&vices");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)help, L"&Help");
         SetMenu(h, app.menu);
@@ -1157,6 +1592,25 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SendMessageW(app.editor, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
         SendMessageW(app.editor, EM_SETEVENTMASK, 0, ENM_CHANGE);
         SendMessageW(app.editor, EM_SETTARGETDEVICE, 0, 1);         // no word wrap
+        // imported files are shown read-only here, in the editor's place
+        app.viewer = CreateWindowExW(0, MSFTEDIT_CLASS, L"", WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL | ES_READONLY,
+                                     0, 0, 10, 10, h, (HMENU)(INT_PTR)ID_VIEWER, nullptr, nullptr);
+        SendMessageW(app.viewer, WM_SETFONT, (WPARAM)app.mono, TRUE);
+        SendMessageW(app.viewer, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+        SendMessageW(app.viewer, EM_SETTARGETDEVICE, 0, 1);
+        SendMessageW(app.viewer, EM_SETBKGNDCOLOR, 0, RGB(246, 246, 240));
+        app.errlist = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+                                      0, 0, 10, 10, h, (HMENU)(INT_PTR)ID_ERRLIST, nullptr, nullptr);
+        SendMessageW(app.errlist, WM_SETFONT, (WPARAM)app.ui_font, TRUE);
+        SendMessageW(app.errlist, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT);
+        {
+            const wchar_t* cols_[4] = {L"Kind", L"File", L"Line", L"Message (double-click to go there)"};
+            const int widths[4] = {60, 150, 60, 900};
+            for (int i = 0; i < 4; i++) {
+                LVCOLUMNW c{}; c.mask = LVCF_TEXT | LVCF_WIDTH; c.pszText = (LPWSTR)cols_[i]; c.cx = px(widths[i]);
+                SendMessageW(app.errlist, LVM_INSERTCOLUMNW, i, (LPARAM)&c);
+            }
+        }
         term::Config tc;
         tc.font = app.mono;
         tc.on_key = [](uint8_t k) { if (app.running) app.dev.keys.push(k); };
@@ -1181,14 +1635,15 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SendMessageW(app.tb_speed, CB_SETCURSEL, 0, 0);
         app.tb_newline = make(L"BUTTON", L"LF = new line", BS_AUTOCHECKBOX, ID_TB_NEWLINE, app.ui_font);
         SendMessageW(app.tb_newline, BM_SETCHECK, BST_CHECKED, 0);
+        app.filesel = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_FILESEL, app.ui_font);
 
         app.watchlist = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                                         0, 0, 10, 10, h, (HMENU)(INT_PTR)ID_WATCHLIST, nullptr, nullptr);
         SendMessageW(app.watchlist, WM_SETFONT, (WPARAM)app.memfont, TRUE);
         SendMessageW(app.watchlist, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
         {
-            const wchar_t* cols[4] = {L"Break / cell", L"Hex", L"Dec", L"Chr"};
-            const int widths[4] = {110, 50, 50, 40};
+            const wchar_t* cols[4] = {L"Break / cell", L"Hex", L"Dec", L"Chr / *p"};
+            const int widths[4] = {150, 80, 100, 80};
             for (int i = 0; i < 4; i++) {
                 LVCOLUMNW c{}; c.mask = LVCF_TEXT | LVCF_WIDTH; c.pszText = (LPWSTR)cols[i]; c.cx = px(widths[i]);
                 SendMessageW(app.watchlist, LVM_INSERTCOLUMNW, i, (LPARAM)&c);
@@ -1245,7 +1700,10 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CTLCOLORSTATIC:
         if ((HWND)l == app.memview) { SetBkColor((HDC)w, RGB(255, 255, 255)); return (LRESULT)GetStockObject(WHITE_BRUSH); }
         break;
-    case WM_TIMER: if (w == TIMER_MEM) refresh_memory(); return 0;
+    case WM_TIMER:
+        if (w == TIMER_MEM) refresh_memory();
+        if (w == TIMER_COLOUR) { KillTimer(h, TIMER_COLOUR); if (app.lang) colour_source(app.editor, true); }
+        return 0;
     case WM_DROPFILES: {
         wchar_t file[MAX_PATH];
         if (DragQueryFileW((HDROP)w, 0, file, MAX_PATH)) { if (app.mode == Mode::Idle && load_file(file)) start_run(); }
@@ -1256,8 +1714,18 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int id = LOWORD(w), code = HIWORD(w);
         if (id == ID_EDITOR && code == EN_CHANGE) {
             if (!app.suppress_change && !app.modified) { app.modified = true; update_title(); }
+            if (!app.suppress_change && app.lang) SetTimer(h, TIMER_COLOUR, 400, nullptr);   // recolour after a pause in typing
             return 0;
         }
+        if (id == ID_FILESEL) {
+            if (code == CBN_SELCHANGE) { show_file((int)SendMessageW(app.filesel, CB_GETCURSEL, 0, 0)); SetFocus(file_edit(app.view_file)); }
+            return 0;
+        }
+        if (id == ID_VIEW_MEM) { set_show_mem(!app.show_mem); return 0; }
+        if (id == ID_VIEW_ERRORS) { set_show_errors(!app.show_errors); return 0; }
+        if (id >= ID_TERM_FIT && id <= ID_TERM_132) { set_term_cols(TERM_COLS[id - ID_TERM_FIT], true); return 0; }
+        if (id == ID_CHECK_HEAP) { set_check_heap(!app.check_heap); return 0; }
+        if (id == ID_CHECK_STACK) { set_check_stack(!app.check_stack); return 0; }
         if (id == ID_MEM_AUTO && code == BN_CLICKED) {
             if (mem_auto() && app.mode != Mode::Idle) SetTimer(h, TIMER_MEM, 150, nullptr); else KillTimer(h, TIMER_MEM);
             return 0;
@@ -1334,7 +1802,12 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (nm->idFrom == ID_WATCHLIST && nm->code == LVN_ITEMCHANGED) {
             auto* lv = (NMLISTVIEW*)l;
             if ((lv->uChanged & LVIF_STATE) && ((lv->uNewState ^ lv->uOldState) & LVIS_STATEIMAGEMASK) && app.dbg)
-                app.dbg->set_watch(watch_addr(lv->iItem), watch_checked(lv->iItem));
+                for (int64_t c : watch_cells(watch_addr(lv->iItem))) app.dbg->set_watch(c, watch_checked(lv->iItem));
+        }
+        if (nm->idFrom == ID_ERRLIST && nm->code == LVN_ITEMACTIVATE) {
+            auto* ia = (NMITEMACTIVATE*)l;
+            LVITEMW it{}; it.mask = LVIF_PARAM; it.iItem = ia->iItem;
+            if (ia->iItem >= 0 && SendMessageW(app.errlist, LVM_GETITEMW, 0, (LPARAM)&it) && it.lParam >= 0) show_diag((int)it.lParam);
         }
         return 0;
     }
@@ -1353,6 +1826,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         stop_any();
         if (app.worker.joinable()) app.worker.join();
         app.dbg.reset();
+        save_settings();
         DestroyWindow(h);
         return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -1369,6 +1843,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
     INITCOMMONCONTROLSEX icc{sizeof icc, ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
+    settings_init();
     Machine::Config cfg;
     Machine machine(cfg);
     app.machine = &machine;
@@ -1387,7 +1862,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
         {FVIRTKEY, VK_F11, ID_STEP}, {FVIRTKEY, VK_F10, ID_STEP_OVER}, {FVIRTKEY | FCONTROL, VK_F10, ID_RUN_TO_CURSOR},
         {FVIRTKEY, VK_F6, ID_PAUSE}, {FVIRTKEY, VK_F9, ID_TOGGLE_BP},
         {FVIRTKEY | FCONTROL, 'O', ID_OPEN}, {FVIRTKEY | FCONTROL, 'S', ID_SAVE}, {FVIRTKEY | FCONTROL, 'R', ID_RELOAD},
-        {FVIRTKEY | FCONTROL, 'L', ID_CLEAR}, {FVIRTKEY | FCONTROL, 'G', ID_MEM_FOCUS},
+        {FVIRTKEY | FCONTROL, 'L', ID_CLEAR}, {FVIRTKEY | FCONTROL, 'G', ID_MEM_FOCUS}, {FVIRTKEY | FCONTROL, 'M', ID_VIEW_MEM},
     };
     app.accel = CreateAcceleratorTableW(acc, (int)(sizeof acc / sizeof acc[0]));
 
@@ -1401,14 +1876,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
     HWND h = CreateWindowExW(0, wc.lpszClassName, L"Brainfuck Machine", WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT, 1400, 860, nullptr, nullptr, inst, nullptr);
     app.con.hwnd = h;
-    ShowWindow(h, SW_SHOW);
+    if (!restore_placement(h)) ShowWindow(h, SW_SHOW);
     fb_create(inst);
     gen_create(inst);
     set_lang(false);
+    apply_settings();
 
+    // A file named on the command line is run; otherwise the last file is reopened (not run).
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(cmdline, &argc);
-    if (argv && argc >= 1 && cmdline[0]) { if (load_file(argv[0])) start_run(); }
+    if (argv && argc >= 1 && cmdline[0] && argv[0][0]) { if (load_file(argv[0])) start_run(); }
+    else {
+        std::wstring last = ini_str(L"last_file");
+        if (!last.empty() && GetFileAttributesW(last.c_str()) != INVALID_FILE_ATTRIBUTES) load_file(last);
+    }
     if (argv) LocalFree(argv);
 
     MSG msg;

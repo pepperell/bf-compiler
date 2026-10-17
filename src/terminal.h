@@ -32,6 +32,10 @@ void set_cursor_visible(HWND h, bool visible);        // host override (e.g. pro
 // clear() and ESC c return it to the host setting.
 void set_newline_mode(HWND h, bool on);
 bool newline_mode(HWND h);
+// Fixed column count (0: as many as fit the window).  With a fixed count wider
+// than the window the right part is cut off; narrower leaves a shaded margin.
+void set_columns(HWND h, int cols);
+int  columns_setting(HWND h);
 void get_size(HWND h, int& cols, int& rows);
 void get_cell_size(HWND h, int& cw, int& ch);         // pixel size of one character cell
 
