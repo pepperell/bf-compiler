@@ -208,7 +208,11 @@ assignable location, such as `p->x`) of the same type, and an array parameter
 (`ref byte name[]`) must be an array of that element type.
 
 A plain `proc` is **inlined** at every call: its body is copied into the caller
-with its own locals, so it cannot call itself. A `rec proc` may call itself and
+with its own locals, so it cannot call itself. A value parameter of an integer
+type that the body never assigns (nor passes to a `ref` parameter) and that
+receives a constant argument becomes a constant in that copy, so everything
+computed from it folds, inside loops and branches too: `plot(x, 3)` costs no
+more than writing the 3 into the body by hand. A `rec proc` may call itself and
 other `rec proc`s freely; it is compiled as a **trampoline** (docs/TRAMPOLINE.md):
 
 - Its body is cut into numbered blocks at every call to a `rec proc`. A state

@@ -917,8 +917,10 @@ struct Gen {
         if (e.is_const) return wrap(e.cval, conv_type(t));
         switch (e.kind) {
         case Expr::Name: {
-            if (!use_known) return std::nullopt;
             Var* v = find_var(e.text);
+            // a parameter bound to a constant argument (call_user)
+            if (v && v->is_const && v->count < 0 && v->type && v->type->is_scalar() && !v->type->is_ptr()) return wrap(v->cval, conv_type(v->type));
+            if (!use_known) return std::nullopt;
             if (!v || v->is_const || v->count >= 0 || !v->type || !v->type->is_scalar()) return std::nullopt;
             return known_int(v->cell, conv_type(v->type));
         }
@@ -2041,6 +2043,54 @@ struct Gen {
         next_free = mark;
     }
 
+    // Does the body of proc assign its parameter i (or pass it to a ref parameter)?
+    std::map<std::pair<const Stmt*, size_t>, bool> written_cache;
+    bool param_written(const Stmt& proc, size_t i) {
+        auto key = std::make_pair(&proc, i);
+        auto it = written_cache.find(key);
+        if (it != written_cache.end()) return it->second;
+        const std::string& n = proc.params[i].name;
+        std::function<bool(const Expr&)> root = [&](const Expr& e) {
+            const Expr* x = &e;
+            while (x->kind == Expr::Field || x->kind == Expr::Index) x = x->a.get();
+            return x->kind == Expr::Name && x->text == n;
+        };
+        std::function<bool(const Expr&)> in_expr = [&](const Expr& e) -> bool {
+            if (e.kind == Expr::Call) {
+                ProcInfo* pi = find_proc(e.text);
+                for (size_t k = 0; k < e.args.size(); k++) {
+                    if (root(*e.args[k]) && (!pi || k >= pi->decl->params.size() || pi->decl->params[k].ref)) return true;
+                }
+            }
+            if (e.kind == Expr::AddrOf && root(*e.a)) return true;
+            if (e.a && in_expr(*e.a)) return true;
+            if (e.b && in_expr(*e.b)) return true;
+            for (auto& x : e.args) if (in_expr(*x)) return true;
+            return false;
+        };
+        std::function<bool(const Stmt&)> in_stmt = [&](const Stmt& st) -> bool {
+            if ((st.kind == Stmt::Assign || st.kind == Stmt::IncDec) && st.target && root(*st.target)) return true;
+            if (st.kind == Stmt::Call) {
+                ProcInfo* pi = find_proc(st.name);
+                for (size_t k = 0; k < st.args.size(); k++)
+                    if (root(*st.args[k]) && (!pi || k >= pi->decl->params.size() || pi->decl->params[k].ref)) return true;
+            }
+            if (st.kind == Stmt::Asm) return true;
+            if (st.target && in_expr(*st.target)) return true;
+            if (st.e && in_expr(*st.e)) return true;
+            if (st.init && in_stmt(*st.init)) return true;
+            if (st.step && in_stmt(*st.step)) return true;
+            for (auto& x : st.args) if (in_expr(*x)) return true;
+            for (auto& x : st.body) if (in_stmt(*x)) return true;
+            for (auto& x : st.else_body) if (in_stmt(*x)) return true;
+            return false;
+        };
+        bool w = false;
+        for (auto& st : proc.body) if (in_stmt(*st)) { w = true; break; }
+        written_cache[key] = w;
+        return w;
+    }
+
     // Evaluate arguments and inline.  result_cell: where the value goes (added), -1 to discard.
     void call_user(const std::string& name, const std::vector<const Expr*>& args, Pos p, int64_t result_cell) {
         auto it = procs.find(name);
@@ -2080,6 +2130,15 @@ struct Gen {
                 bound.push_back(v);
                 writeback.emplace_back(lv, v.cell);
                 continue;
+            }
+            // A constant argument for a parameter the body never writes is bound as a
+            // constant: everything computed from it folds, in loops and branches too.
+            if (prm.type->is_scalar() && !prm.type->is_ptr() && prm.type->kind != TK::Struct && !param_written(proc, i)) {
+                if (auto k = fold(a, true)) {
+                    v.is_const = true; v.owned = false; v.cval = wrap(*k, conv_type(prm.type));
+                    bound.push_back(v);
+                    continue;
+                }
             }
             v.cell = alloc(std::max(prm.type->size, 1));
             eval_into(a, v.cell, prm.type);
