@@ -327,6 +327,13 @@ EXPRESSIONS
   Numbers with an L suffix (5L) are long.
   && and || only evaluate the right side when needed.
 
+STRUCTS
+  struct Point { int x; int y; }      fields in order, no padding
+  Point p;  p.x = 3;  Point q = p;    in cells; copied, passed and returned by value
+  Point pts[8];  pts[i].y = -1;       arrays of structs
+  heap Point hp[50];  Point* r = &hp[2];  r->x = 1;   in the heap, through pointers
+  sizeof(Point)                        4
+
 POINTERS AND THE HEAP
   heap 16384;                 heap size in bytes (default 8192, at most 65535)
   heap byte buf[100];         a static array in the heap

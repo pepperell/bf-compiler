@@ -50,7 +50,34 @@ Variables are allocated upward from the first RAM cell (0x100). A variable
 declared inside `{ }` exists until the closing brace and is cleared there, so a
 loop body's locals start at zero on every iteration. Top-level variables keep
 their cells for the whole program. Arrays cannot be initialised in the
-declaration and `word` arrays are not supported (use two byte arrays).
+declaration. Arrays in cells may hold any type (`int a[10]`, `Point pts[8]`);
+a runtime index into one is a byte, so only the first 256 elements are reachable
+that way. Larger arrays belong in the heap.
+
+## Structs
+
+```
+struct Point { int x; int y; }
+struct Node  { int val; Node* next; }        // a pointer to its own type is fine
+struct Buf   { byte data[16]; byte len; }    // fixed-size array fields
+
+Point p;                     // a struct in cells: fields are consecutive cells
+p.x = 3;
+Point q = p;                 // whole-struct copy
+Point pts[8];                // an array of structs in cells
+pts[i].y = -1;
+heap Node pool[100];         // structs in the heap
+Node* n = &pool[0];
+n->next = &pool[1];          // -> through a pointer
+print sizeof(Node);          // 4
+```
+
+Structs are declared at the top level. Fields are laid out in order with no
+padding. A struct can be assigned, passed and returned by value, passed by `ref`,
+stored in arrays and in the heap, and contain other structs and arrays; it
+cannot contain itself (use a pointer). Structs cannot be compared or printed.
+An array field of a struct held in cells needs a constant index; in the heap any
+index works. A field of a returned struct can be read directly (`mk().x`).
 
 ## Pointers and the heap
 

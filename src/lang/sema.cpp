@@ -810,7 +810,7 @@ struct Sema {
             st->fields.push_back(Field{f.name, ft, off});
             off += ft->size;
         }
-        if (off == 0) error(s.pos, "struct '" + s.name + "' has no fields");
+        if (s.fields.empty()) error(s.pos, "struct '" + s.name + "' has no fields");
         st->size = std::max(off, 1);
         T.finish_struct(st);
     }

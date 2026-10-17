@@ -77,6 +77,11 @@ DIAGS = [
     ("err-deref-int", "byte x; out *x;", ["1:13: '*' needs a pointer, not 'byte'"], (), 1),
     ("err-heap-too-small", "heap 100; heap byte b[200];", ["1:1: heap arrays and string literals need 207 bytes of heap but the heap has 100; declare a larger one with 'heap N;'"], (), 1),
     ("err-pointer-int-assign", "heap byte b[2]; byte* p = 5;", ["1:27: cannot convert 'byte' to 'byte*' without a cast"], (), 1),
+    ("err-struct-unknown-field", "struct Point { int x; int y; } Point p; p.z = 1;", ["1:42: 'Point' has no field 'z'"], (), 1),
+    ("err-struct-compare", "struct Point { int x; int y; } Point a; Point b; out a == b;", ["1:56: invalid operands to '==' ('Point' and 'Point')"], (), 1),
+    ("err-struct-self", "struct S { S inner; }", ["1:12: a struct cannot contain itself; use a pointer"], (), 1),
+    ("err-dot-on-pointer", "struct Point { int x; int y; } heap Point h[1]; Point* p = h; p.x = 1;", ["1:64: 'Point*' is a pointer: use '->'"], (), 1),
+    ("err-cell-struct-runtime-index", "struct B { byte d[3]; } B b; byte i = 1; b.d[i] = 2;", ["1:46: an array field of a struct held in cells needs a constant index; put the struct in the heap"], (), 1),
     ("err-int-range", "int a = 40000; sbyte s = 300;",
      ["1:9: value 40000 does not fit an int", "1:26: value 300 does not fit a sbyte"], (), 1),
     ("diag-global-after-call", "f(); byte g = 0; proc f() { g++; }",
@@ -251,6 +256,30 @@ def case(name, src, expected, stdin=b"", extra=()):
 
 
 case("hello", 'out "Hello\\n";', b"Hello\n")
+# ---- structs (phase 4) ----
+case("struct-basics", "struct Point { int x; int y; } Point p; p.x = -3; p.y = 7; print p.x + p.y; Point q = p; q.x = 10; print \" \", p.x, \" \", q.x, \" \", q.y, \" \", sizeof(Point);",
+     b"4 -3 10 7 4")
+case("struct-nested", "struct Point { int x; int y; } struct Rect { Point a; Point b; byte color; } Rect r; r.a.x = 1; r.a.y = 2; r.b.x = 30; r.b.y = 40; r.color = 9; print (r.b.x - r.a.x) * (r.b.y - r.a.y), \" \", r.color, \" \", sizeof(Rect);",
+     b"1102 9 9")
+case("struct-array-cells", "struct Point { int x; int y; } Point pts[5]; byte i; for (i = 0; i < 5; i++) { pts[i].x = int(i) * 10; pts[i].y = -int(i); } int sx = 0; int sy = 0; for (i = 0; i < 5; i++) { sx += pts[i].x; sy += pts[i].y; } print sx, \" \", sy, \" \", pts[3].x;",
+     b"100 -10 30")
+case("struct-params-return", "struct Point { int x; int y; } proc Point mk(int x, int y) { Point p; p.x = x; p.y = y; return p; } proc int dot(Point a, Point b) { return a.x * b.x + a.y * b.y; } Point u = mk(3, -4); print dot(u, mk(2, 5)), \" \", mk(7, 8).y, \" \", u.y;",
+     b"-14 8 -4")
+case("struct-ref-param", "struct Point { int x; int y; } proc shift(ref Point p, int dx) { p.x += dx; p.y -= dx; } Point a; a.x = 1; a.y = 1; shift(a, 5); shift(a, 2); print a.x, \" \", a.y;", b"8 -6")
+case("struct-swap-sort", "struct Point { int x; int y; } Point v[4]; v[0].x = 3; v[1].x = 1; v[2].x = 4; v[3].x = 2; byte i; byte j; for (i = 0; i < 4; i++) { v[i].y = int(i) * 100; } for (i = 0; i < 3; i++) { for (j = 0; j < 3 - i; j++) { if (v[j].x > v[j + 1].x) { Point t = v[j]; v[j] = v[j + 1]; v[j + 1] = t; } } } for (i = 0; i < 4; i++) { print v[i].x, \":\", v[i].y, \" \"; }",
+     b"1:100 2:300 3:0 4:200 ")
+case("struct-heap-list", "struct Node { int val; Node* next; } heap Node pool[6]; Node* head = null; byte i; for (i = 0; i < 6; i++) { Node* n = &pool[i]; n->val = int(i) * int(i) - 10; n->next = head; head = n; } int sum = 0; Node* p = head; while (p) { sum += p->val; p = p->next; } print sum, \" \", head->val, \" \", head->next->next->val, \" \", sizeof(Node);",
+     b"-5 15 -1 4")
+case("struct-array-field", "struct Buf { byte data[4]; byte len; } Buf b; b.data[0] = 'h'; b.data[3] = 'k'; b.len = 2; heap Buf hb[3]; byte i; for (i = 0; i < 4; i++) { hb[1].data[i] = 'a' + i; } out b.data[0], b.data[3], hb[1].data[2], '0' + b.len; print \" \", sizeof(Buf);",
+     b"hkc2 5")
+case("struct-heap-copy", "struct Point { int x; int y; } heap Point hp[2]; Point a; a.x = 11; a.y = -22; hp[1] = a; Point b = hp[1]; Point* pp = &hp[1]; pp->x += 1; print b.x, \" \", b.y, \" \", hp[1].x, \" \", (*pp).y;", b"11 -22 12 -22")
+case("rec-struct-list", "struct Node { int val; Node* next; } heap Node pool[5]; rec proc int total(Node* p) { if (!p) { return 0; } return p->val + total(p->next); } byte i; for (i = 0; i < 5; i++) { pool[i].val = int(i) + 1; if (i < 4) { pool[i].next = &pool[i + 1]; } } print total(pool);",
+     b"15")
+case("rec-struct-local", "struct Point { int x; int y; } rec proc int f(byte n) { Point p; p.x = int(n); p.y = 1; if (n == 0) { return p.y; } return p.x + f(n - 1); } print f(5);", b"16")
+
+case("wide-arrays-cells", "word w[5]; long l[3]; byte i; for (i = 0; i < 5; i++) { w[i] = word(i) * 1000; } for (i = 0; i < 3; i++) { l[i] = -long(i) * 100000; } i = 4; print w[i], \" \", w[2] + w[3], \" \", l[2], \" \", l[i - 3];",
+     b"4000 5000 -200000 -100000")
+
 # ---- heap and pointers (phase 3) ----
 case("heap-array", "heap byte b[20]; byte i; for (i = 0; i < 20; i++) { b[i] = 'a' + i; } out b[0], b[5], b[19]; i = 7; out b[i], b[i + 3];", b"afthk")
 case("heap-wide-array", "heap long big[8]; heap int n[5]; byte i; for (i = 0; i < 8; i++) { big[i] = long(i) * -100000; } for (i = 0; i < 5; i++) { n[i] = int(i) - 2; } print big[7], \" \", big[3] + n[0], \" \", n[4];",
@@ -466,7 +495,6 @@ def main():
         ("err-syntax", "byte x = ;", "expression"),
         ("err-unterminated-string", 'out "abc;', "unterminated string"),
         ("err-string-in-expr", 'byte x = "a";', "string"),
-        ("err-word-array", "word w[3];", "word arrays"),
         ("err-pulse-var", "byte x; pulse x;", "not a register"),
     ]
     for name, src, frag in errors:

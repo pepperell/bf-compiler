@@ -1419,7 +1419,20 @@ struct Gen {
             if (n == 1) { eval8(e, dst); return; }      // a register
             fail(e.pos, "'" + e.text + "' is not declared");
         }
-        case Expr::Index: case Expr::Field: case Expr::Deref:
+        case Expr::Field:
+            if (!e.arrow && e.a->kind == Expr::Call) {          // a field of a returned struct
+                int bn = sz(*e.a);
+                int64_t t = tmpN(bn);
+                eval_same(*e.a, t);
+                const Field* f = e.a->type->st->field(e.text);
+                for (int k = 0; k < n; k++) move(t + f->offset + k, {{dst + k, 1}});
+                clearN(t, bn);
+                releaseN(t, bn);
+                return;
+            }
+            read_lv(lvalue(e), dst);
+            return;
+        case Expr::Index: case Expr::Deref:
             read_lv(lvalue(e), dst);
             return;
         case Expr::AddrOf:
@@ -2549,7 +2562,7 @@ static Features current_features() {
     f.wide_ints = true;
     f.heap = true;
     f.alloc = false;
-    f.structs = false;
+    f.structs = true;
     return f;
 }
 
