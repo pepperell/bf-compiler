@@ -4,8 +4,8 @@ Small programs that use the newer parts of BFL: integer types, structs,
 pointers and the heap, strings, imports, and recursion. Run one with
 `bf programs\samples\NAME.bfl`, or open it in `bfui` and press F5 (Ctrl+F5 to
 debug it statement by statement). `tests\test_lang.py` runs every sample and
-compares its output with `tests\samples\NAME.out`; `cube.bfl` runs until
-stopped, so it is only compiled there.
+compares its output with `tests\samples\NAME.out`; `cube.bfl` and
+`starfield.bfl` run until stopped, so they are only compiled there.
 
 | File | What it does | Features it shows |
 |------|--------------|-------------------|
@@ -18,6 +18,7 @@ stopped, so it is only compiled there.
 | `numbers.bfl` | Factorials, Fibonacci, wrap-around, signed division, Collatz | `sbyte` `int` `dword` `long`, casts, shifts, `import "math.bfl"` |
 | `maze.bfl` + `queue.bfl` | Shortest path through a maze by breadth-first search | A program in two files, a struct passed by `ref`, heap arrays |
 | `cube.bfl` | A revolving 3D wireframe cube, every frame computed live | Integer trigonometry (Bhaskara's sine), perspective, Bresenham lines, a heap frame buffer, colour escapes |
+| `starfield.bfl` | The Enterprise-D's main viewscreen: stars at impulse, then streaking at warp, with LCARS panels, Ops and Conn, and the captain giving the order | A 3D starfield with perspective, double-buffered output that sends only changed characters, 256-colour backgrounds, a pixel-map picture |
 | `life.bfl` | Conway's Game of Life, animated in the terminal | Swapping heap grids through pointers, ANSI escapes, the `TICKS` clock |
 
 Things to try in the UI:

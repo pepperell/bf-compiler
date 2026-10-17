@@ -1,0 +1,408 @@
+// starfield.bfl - the main viewscreen of the Enterprise-D's bridge: stars
+// streaming past at impulse, then stretching into streaks at warp, with LCARS
+// panels, the Ops and Conn consoles, and the captain in the corner giving the
+// order.  (A fan tribute; the art is original block drawing.)
+//
+// The starfield is simulated, not recorded: 48 stars have 3D positions and
+// fly towards the viewer; each frame they are projected with perspective, and
+// each star is drawn as a streak from where it was three frames ago to where it
+// is now, so at warp the streaks stretch out from the centre.  Stars that leave
+// the screen are reborn far ahead.  The picture is kept in two heap buffers
+// and only the characters that changed are sent to the terminal.  The bridge
+// uses 256-colour backgrounds (ESC[48;5;Nm) for the LCARS blocks and the
+// captain, who is drawn from a small pixel map.
+//
+//     bfui programs\samples\starfield.bfl   F5 runs it, Shift+F5 stops
+//                                          (the terminal needs 80 x 24 characters)
+//     bf programs\samples\starfield.bfl     Ctrl+C stops (needs a VT100 console)
+
+const STARS = 48;
+const VW = 62;              // viewscreen interior, in characters
+const VH = 11;
+const ROW0 = 3;             // screen row and column of its top left character
+const COL0 = 10;
+const CX = 31;              // vanishing point inside the viewscreen
+const CY = 5;
+const FX = 31;              // perspective scales (cells are twice as tall as wide)
+const FY = 10;
+const ZFAR = 1000;
+const IMPULSE = 6;          // depth units per frame
+const WARP = 60;
+const DELAY_MS = 30;
+
+// LCARS colours (xterm 256-colour indexes)
+const ORANGE = 214;
+const PEACH = 216;
+const LILAC = 183;
+const BLUE = 111;
+const PURPLE = 140;
+const FRAME = 244;
+
+heap byte bufa[682];        // VW * VH
+heap byte bufb[682];
+byte* cur = bufa;           // the picture being drawn
+byte* shown = bufb;         // what the terminal shows now
+
+int  sx[48];                // star positions: x and y across, z ahead
+int  sy[48];
+int  sz[48];
+
+dword seed = 1701;
+byte colour = 0;            // the foreground the terminal is set to (0: unknown)
+byte at_r = 255;            // where the cursor is in the viewscreen (255: elsewhere)
+byte at_c = 0;
+
+proc word rnd(word n) {
+    seed = seed * 1103515245 + 12345;
+    return word(seed >> 16) % n;
+}
+
+// Foreground colour on the default background.
+proc fg(byte c) {
+    if (c != colour) {
+        out "\e[0;38;5;";
+        print c;
+        out 'm';
+        colour = c;
+    }
+}
+
+// Black text on a coloured background (LCARS blocks, pixels).
+proc bg(byte c) {
+    out "\e[0;30;48;5;";
+    print c;
+    out 'm';
+    colour = 0;
+}
+
+proc plain() { out "\e[0m"; colour = 0; }
+
+proc goto_rc(byte r, byte c) {
+    out "\e[";
+    print r;
+    out ';';
+    print c;
+    out 'H';
+}
+
+proc rep(byte ch, byte n) {
+    byte i;
+    for (i = 0; i < n; i++) { out ch; }
+}
+
+// A block of colour with text in it, as LCARS draws its labels.
+proc block(byte r, byte c, byte col, string text) {
+    goto_rc(r, c);
+    bg(col);
+    print text;
+}
+
+// ---- the stars -------------------------------------------------------------------------
+proc spawn(byte k, int z) {
+    sx[k] = int(rnd(2001)) - 1000;
+    sy[k] = int(rnd(1001)) - 500;
+    sz[k] = z;
+}
+
+proc plot(int x, int y, byte c) {
+    if (x >= 0 && x < VW && y >= 0 && y < VH) { cur[word(y) * VW + word(x)] = c; }
+}
+
+proc byte slope_char(int dx, int dy) {
+    int ax = dx;
+    if (ax < 0) { ax = -ax; }
+    int ay = dy;
+    if (ay < 0) { ay = -ay; }
+    if (ay * 2 < ax) { return '-'; }
+    if (ax * 2 < ay) { return '|'; }
+    if ((dx < 0) == (dy < 0)) { return '\\'; }
+    return '/';
+}
+
+// Bresenham's line, all octants.
+proc line(int x0, int y0, int x1, int y1, byte c) {
+    int dx = x1 - x0;
+    if (dx < 0) { dx = -dx; }
+    int dy = y1 - y0;
+    if (dy > 0) { dy = -dy; }
+    int stepx = 1;
+    if (x0 > x1) { stepx = -1; }
+    int stepy = 1;
+    if (y0 > y1) { stepy = -1; }
+    int err = dx + dy;
+    while (1) {
+        plot(x0, y0, c);
+        if (x0 == x1 && y0 == y1) { break; }
+        int e2 = err * 2;
+        if (e2 >= dy) { err += dy; x0 += stepx; }
+        if (e2 <= dx) { err += dx; y0 += stepy; }
+    }
+}
+
+// Move every star closer by speed and draw it into cur.
+proc fly(int speed) {
+    byte k;
+    for (k = 0; k < STARS; k++) {
+        int z = sz[k] - speed;
+        if (z < 1) { spawn(k, int(700 + rnd(300))); z = sz[k]; }
+        sz[k] = z;
+        int hx = CX + sx[k] * FX / z;
+        int hy = CY + sy[k] * FY / z;
+        if (hx < 0 || hx >= VW || hy < 0 || hy >= VH) {
+            spawn(k, int(700 + rnd(300)));        // gone past the edge of the screen
+        } else {
+            // the tail is where the star was three frames ago
+            int tz = z + speed * 3;
+            int tx = CX + sx[k] * FX / tz;
+            int ty = CY + sy[k] * FY / tz;
+            if (tx != hx || ty != hy) { line(tx, ty, hx, hy, slope_char(hx - tx, hy - ty)); }
+            byte head = '.';
+            if (z < 150) { head = '*'; } else if (z < 400) { head = '+'; }
+            plot(hx, hy, head);
+        }
+    }
+}
+
+// The colour each character of the picture is shown in.
+proc byte colour_of(byte ch) {
+    if (ch == '.') { return 242; }     // far stars: grey
+    if (ch == '+') { return 252; }     // nearer: light grey
+    if (ch == '*') { return 231; }     // close: white
+    return 153;                         // warp streaks: pale blue
+}
+
+// Send only the characters that differ from what is on the screen.
+proc flush() {
+    byte r;
+    for (r = 0; r < VH; r++) {
+        byte c;
+        for (c = 0; c < VW; c++) {
+            word i = word(r) * VW + c;
+            byte ch = cur[i];
+            if (ch != shown[i]) {
+                if (r != at_r || c != at_c) { goto_rc(ROW0 + r, COL0 + c); }
+                if (ch == ' ') { if (colour == 0) { fg(242); } } else { fg(colour_of(ch)); }
+                out ch;
+                at_r = r;
+                at_c = c + 1;
+            }
+        }
+    }
+    byte* t = shown;          // cur is now on the screen; reuse the other buffer
+    shown = cur;
+    cur = t;
+    word j;
+    for (j = 0; j < VW * VH; j++) { cur[j] = ' '; }
+}
+
+// ---- the captain -----------------------------------------------------------------------
+// One pixel per character cell: s skin, S shadow, h hair, e eye, m mouth,
+// k black uniform, r red uniform, g combadge, c the command chair, . nothing.
+proc byte pixel_colour(byte p) {
+    if (p == 's') { return 180; }
+    if (p == 'S') { return 137; }
+    if (p == 'h') { return 250; }
+    if (p == 'e') { return 236; }
+    if (p == 'm') { return 131; }
+    if (p == 'k') { return 238; }       // the black of the uniform, lifted off the black screen
+    if (p == 'r') { return 160; }
+    if (p == 'g') { return 220; }
+    return 59;                          // c
+}
+
+proc pixels(byte r, string map) {
+    goto_rc(r, 1);
+    word i = 0;
+    while (map[i]) {
+        byte p = map[i];
+        if (p == '.') { plain(); } else { bg(pixel_colour(p)); }
+        out ' ';
+        i++;
+    }
+    plain();
+}
+
+// The captain in profile, facing the screen; pointing makes him give the order.
+proc captain(byte pointing) {
+    pixels(15, "cc.....ssssss.......");
+    pixels(16, "cc...ssssssssss.....");
+    pixels(17, "cc..ssssssssssSS....");
+    pixels(18, "cc.hhsSSssssseSs....");
+    pixels(19, "cc.hhsSSsssssssss...");
+    pixels(20, "cc..hhsssssssmss....");
+    pixels(21, "cc....sssssssss.....");
+    pixels(22, "cc.......ssss.......");
+    if (pointing) {
+        pixels(23, "cckkkkkkkkkkkkkkrrss");
+    } else {
+        pixels(23, "cckkkkkkkkkkkkkkk...");
+    }
+    pixels(24, "ckkrrrrgrrrrrrrrrk..");
+}
+
+// A speech bubble to the captain's right, or nothing.
+proc say(string text) {
+    fg(231);
+    goto_rc(16, 20);
+    if (text[0]) {
+        out " .";  rep('-', 13); out '.';
+        goto_rc(17, 20);
+        out "< ";
+        word n = 0;
+        while (text[n]) { out text[n]; n++; }
+        rep(' ', byte(13 - n));
+        out '|';
+        goto_rc(18, 20);
+        out " '"; rep('-', 13); out '\'';
+    } else {
+        rep(' ', 16);
+        goto_rc(17, 20); rep(' ', 16);
+        goto_rc(18, 20); rep(' ', 16);
+    }
+    at_r = 255;
+}
+
+// ---- the bridge ------------------------------------------------------------------------
+proc console(byte c, string name, string reading) {
+    fg(FRAME);
+    goto_rc(16, c); out ' '; rep('_', 19); out ' ';
+    goto_rc(19, c); out '\\'; rep('_', 19); out '/';
+    fg(246);
+    goto_rc(20, c); out "       .-----.       ";
+    goto_rc(21, c); out "       |     |       ";
+    goto_rc(18, c);
+    bg(235);
+    out "\e[38;5;223m ";
+    print name, reading;
+    plain();
+}
+
+proc draw_bridge() {
+    out "\e[2J\e[?25l";                       // clear, hide the cursor
+    // top LCARS bar
+    block(1, 1, ORANGE, "  U.S.S. ENTERPRISE    NCC-1701-D           ");
+    block(1, 47, LILAC, "  STARDATE                        ");
+    // the viewscreen frame
+    plain();
+    fg(FRAME);
+    goto_rc(2, 9);  out '.';  rep('-', VW); out '.';
+    byte r;
+    for (r = 3; r < 14; r++) { goto_rc(r, 9); out '|'; goto_rc(r, 72); out '|'; }
+    goto_rc(14, 9); out '\''; rep('-', VW); out '\'';
+    // LCARS columns either side
+    block(2, 1, ORANGE, "     02");
+    block(3, 1, ORANGE, "    447");
+    block(5, 1, PEACH,  "   1701");
+    block(6, 1, PEACH,  "       ");
+    block(8, 1, LILAC,  "  03-15");
+    block(9, 1, LILAC,  "       ");
+    block(10, 1, LILAC, "       ");
+    block(12, 1, BLUE,  "  88-02");
+    block(13, 1, BLUE,  "       ");
+    block(2, 74, PURPLE, "  LCARS");
+    block(3, 74, PURPLE, "       ");
+    block(5, 74, ORANGE, "  41-07");
+    block(7, 74, BLUE,   "     12");
+    block(8, 74, BLUE,   "       ");
+    block(9, 74, BLUE,   "       ");
+    block(11, 74, PEACH, "  23-56");
+    block(12, 74, PEACH, "       ");
+    block(13, 74, PEACH, "       ");
+    plain();
+    // Ops and Conn, and the status bar under them
+    console(36, "OPS  ", "HDG 047 MK 12  ");
+    console(59, "CONN ", "               ");
+    block(23, 36, BLUE, "                                            ");
+    plain();
+    captain(0);
+    at_r = 255;
+}
+
+// LCARS blocks and console buttons that change now and then.
+proc blink() {
+    byte k;
+    for (k = 0; k < 2; k++) {
+        byte c = 37 + k * 23;               // the button strips on Ops and Conn
+        byte i;
+        for (i = 0; i < 5; i++) {
+            byte pick = byte(rnd(5));
+            byte col = ORANGE;
+            if (pick == 1) { col = PEACH; } else if (pick == 2) { col = LILAC; } else if (pick == 3) { col = BLUE; } else if (pick == 4) { col = 236; }
+            goto_rc(17, c + i * 4);
+            bg(col);
+            print " ", rnd(90) + 10, " ";
+        }
+    }
+    goto_rc(6, 1);
+    bg(PEACH);
+    print "   ", rnd(9000) + 1000;
+    goto_rc(8, 74);
+    bg(BLUE);
+    print "   ", rnd(9000) + 1000;
+    plain();
+    at_r = 255;
+}
+
+// Stardate, warp gauge and the status bar.
+proc readouts(dword stardate, int speed, string status) {
+    goto_rc(1, 58);
+    bg(LILAC);
+    print stardate / 10, ".", stardate % 10;
+    goto_rc(18, 66);
+    bg(235);
+    out "\e[38;5;117m";
+    byte bar = byte(speed * 13 / WARP);
+    rep('=', bar);
+    rep(' ', 13 - bar);
+    goto_rc(23, 38);
+    bg(BLUE);
+    print status;
+    plain();
+    at_r = 255;
+}
+
+proc wait_ms(byte ms) {
+    pulse TICK_LATCH;
+    byte t0 = TICKS0;
+    byte gone = 0;
+    while (gone < ms) {
+        pulse TICK_LATCH;
+        gone = TICKS0 - t0;
+    }
+}
+
+// ---- run -------------------------------------------------------------------------------
+byte k;
+for (k = 0; k < STARS; k++) { spawn(k, int(1 + rnd(ZFAR))); }
+draw_bridge();
+dword stardate = 411537;
+word t = 0;
+while (1) {
+    // the voyage: impulse, engage, warp, drop out, and again
+    int speed = IMPULSE;
+    string status = "FULL IMPULSE        ";
+    if (t >= 90 && t < 150) {
+        speed = IMPULSE + int(t - 90) * (WARP - IMPULSE) / 60;
+        status = "ENGAGING WARP DRIVE ";
+    } else if (t >= 150 && t < 330) {
+        speed = WARP;
+        status = "WARP FACTOR 5       ";
+    } else if (t >= 330 && t < 370) {
+        speed = WARP - int(t - 330) * (WARP - IMPULSE) / 40;
+        status = "DROPPING TO IMPULSE ";
+    }
+    // the captain's orders
+    if (t == 75)  { captain(1); say("Engage."); }
+    if (t == 120) { captain(0); say(""); }
+    if (t == 320) { say("Make it so."); }
+    if (t == 350) { say(""); }
+
+    fly(speed);
+    flush();
+    if (t % 8 == 0) { blink(); }
+    readouts(stardate, speed, status);
+    stardate++;
+    t++;
+    if (t == 400) { t = 0; }
+    wait_ms(DELAY_MS);
+}
