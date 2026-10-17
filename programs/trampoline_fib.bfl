@@ -1,0 +1,46 @@
+// Recursion on a machine with no call instruction: a trampoline.
+//
+// fib(n) { if (n < 2) return n; a = fib(n - 1); return a + fib(n - 2); }
+//
+// written the way a compiler would have to emit it.  The function body is
+// cut at every call into numbered segments; a state cell says which segment
+// runs next; one loop dispatches on it.  The current activation's locals
+// (n, a, ret) live in fixed cells; a call saves them to an explicit stack
+// array and a return restores them.  Only the save and restore walk the
+// array, so each local access inside a segment is as cheap as usual.
+//
+// States: 0 entry, 1 after fib(n-1), 2 after fib(n-2), 3 return, 9 finished.
+
+const FRAME = 3;
+byte st[96];                 // 32 frames of n, a, ret
+byte sp = 0;
+byte state = 0;
+byte n = 12;                 // the argument
+byte a = 0;
+byte ret = 9;                // where the outermost call returns to
+byte retval = 0;
+byte calls = 0;
+
+while (state != 9) {
+    if (state == 0) {                        // fib entry
+        calls++;
+        if (n < 2) {
+            retval = n; state = 3;
+        } else {                             // a = fib(n - 1)
+            st[sp] = n; st[sp + 1] = a; st[sp + 2] = ret; sp += FRAME;
+            n = n - 1; ret = 1; state = 0;
+        }
+    } else if (state == 1) {                 // back from fib(n - 1)
+        a = retval;                          // then call fib(n - 2)
+        st[sp] = n; st[sp + 1] = a; st[sp + 2] = ret; sp += FRAME;
+        n = n - 2; ret = 2; state = 0;
+    } else if (state == 2) {                 // back from fib(n - 2)
+        retval = a + retval; state = 3;
+    } else if (state == 3) {                 // return to the caller's segment
+        state = ret;
+        if (state != 9) {
+            sp -= FRAME; n = st[sp]; a = st[sp + 1]; ret = st[sp + 2];
+        }
+    }
+}
+print "fib(12) = ", retval, " after ", calls, " calls\n";
