@@ -1,0 +1,25 @@
+// Framebuffer demo in BFL: a colour gradient, then a moving diagonal line.
+// FB_PLOT advances the cursor and wraps to the next row, so a full-screen
+// fill is just 8192 plots.
+
+byte x;
+byte y;
+FB_X = 0;
+FB_Y = 0;
+for (y = 0; y < 64; y++) {
+    for (x = 0; x < 128; x++) {
+        // RRRGGGBB: red from x, green from y, blue from the sum
+        FB_COLOR = (x >> 4) * 32 + (y >> 3) * 4 + ((x + y) >> 6);
+        pulse FB_PLOT;
+    }
+}
+
+// a white diagonal
+byte i;
+for (i = 0; i < 64; i++) {
+    FB_X = i * 2;
+    FB_Y = i;
+    FB_COLOR = 0xFF;
+    pulse FB_PLOT;
+}
+out "Gradient drawn.\n";

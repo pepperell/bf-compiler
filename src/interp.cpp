@@ -53,6 +53,8 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
             else if (c->dbg == 2) reason = 6;
             else if (executed > 0) {
                 if (c->dbg == 1) reason = 1;
+                else if (c->dbg == 3 && c->stmt_mark && c->stmt_mark[pc] &&
+                         !(code[pc].src >= c->skip_lo && code[pc].src < c->skip_hi)) reason = 1;
                 else if (c->bp && c->bp[pc]) reason = 2;
                 else if (pc == c->temp_bp) reason = 3;
             }

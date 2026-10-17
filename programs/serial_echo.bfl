@@ -1,0 +1,26 @@
+// Serial echo in BFL.  Keys typed into the terminal go out on the serial
+// port; bytes received from the port are printed.  With Devices > Serial port
+// set to Loopback everything typed comes straight back.
+
+SER_BAUD = 7;                           // 115200
+SER_CTRL += 1;                          // open the port
+out "Serial echo. Type; received bytes are printed. Press Esc to stop.\n";
+byte running = 1;
+while (running) {
+    if (KEY_STATUS) {
+        pulse KEY_STATUS;               // pop the key into KEY_DATA
+        byte c = KEY_DATA;
+        if (c == 27) {
+            running = 0;
+        } else {
+            SER_DATA = c;
+            pulse SER_TX;
+        }
+    }
+    while (SER_STATUS) {
+        pulse SER_STATUS;               // pop the received byte into SER_DATA
+        out SER_DATA;
+    }
+}
+SER_CTRL -= 1;                          // close
+out "\nBye.\n";

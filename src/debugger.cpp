@@ -19,6 +19,7 @@ struct Debugger::Impl {
     std::function<void(Event)> on_event;
     Ctx ctx{};
     std::vector<uint8_t> bp;
+    std::vector<uint8_t> marks;
     std::vector<int64_t> watches;
     std::atomic<int32_t> pc{0};
     std::atomic<bool> running{false}, finished{false};
@@ -26,7 +27,7 @@ struct Debugger::Impl {
     RunResult result{Status::Running, "", 0.0, 0};
     double elapsed = 0;
 
-    enum Cmd { None, Step, Cont, Quit };
+    enum Cmd { None, Step, StepStmt, Cont, Quit };
     std::mutex mu;
     std::condition_variable cv;
     Cmd cmd = None;
@@ -48,6 +49,7 @@ struct Debugger::Impl {
         ctx.bp = bp.data();
         ctx.temp_bp = -1;
         ctx.watch_hit = -1;
+        ctx.skip_lo = ctx.skip_hi = -1;
         m.protect_ram(true);
         m.ctx_ = &ctx;
         m.running_ = true;
@@ -74,7 +76,7 @@ struct Debugger::Impl {
             }
             if (c == Quit) break;
             if (finished) continue;
-            ctx.dbg = (c == Step) ? 1 : 0;
+            ctx.dbg = (c == Step) ? 1 : (c == StepStmt) ? 3 : 0;
             ctx.watch_hit = -1;
             ctx.pause_reason = 0;
             ctx.status = (int32_t)Status::Running;
@@ -84,6 +86,7 @@ struct Debugger::Impl {
             elapsed += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             pc = at;
             ctx.temp_bp = -1;
+            ctx.skip_lo = ctx.skip_hi = -1;
             running = false;
             if (ctx.status == (int32_t)Status::Paused) {
                 last = Break{(Reason)ctx.pause_reason, ctx.pause_reason == (int)Reason::Watch ? ctx.watch_hit : -1};
@@ -116,6 +119,16 @@ void Debugger::set_watch(int64_t cell, bool on) {
 void Debugger::clear_watches() { impl_->watches.clear(); impl_->sync_watches(); }
 void Debugger::set_watch_device_window(bool on) { impl_->ctx.watch_mmio = on ? 1 : 0; }
 void Debugger::step()  { if (!impl_->running && !impl_->finished) impl_->post(Impl::Step); }
+void Debugger::set_statement_marks(const std::vector<uint8_t>& marks) {
+    impl_->marks = marks;
+    impl_->marks.resize(impl_->prog.code.size(), 0);
+    impl_->ctx.stmt_mark = impl_->marks.data();
+}
+void Debugger::step_statement(int32_t skip_lo, int32_t skip_hi) {
+    if (impl_->running || impl_->finished) return;
+    impl_->ctx.skip_lo = skip_lo; impl_->ctx.skip_hi = skip_hi;
+    impl_->post(Impl::StepStmt);
+}
 void Debugger::run_to(int32_t pc) { if (!impl_->running && !impl_->finished) { impl_->ctx.temp_bp = pc; impl_->post(Impl::Cont); } }
 void Debugger::cont()  { if (!impl_->running && !impl_->finished) impl_->post(Impl::Cont); }
 void Debugger::pause() { impl_->ctx.dbg = 2; }

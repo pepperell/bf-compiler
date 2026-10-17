@@ -1,0 +1,31 @@
+// LED chaser in BFL: one lamp runs from right to left and back, four passes,
+// paced with the millisecond counter, then the program halts.
+// Compare programs/leds.b, the same idea written in brainfuck by hand.
+
+proc wait_ms(byte ms) {
+    pulse TICK_LATCH;
+    byte start = TICKS0;
+    byte elapsed = 0;
+    while (elapsed < ms) {
+        pulse TICK_LATCH;
+        elapsed = TICKS0 - start;       // byte subtraction handles the wrap
+    }
+}
+
+byte led = 1;
+byte dir = 0;                           // 0: towards bit 7, 1: back towards bit 0
+byte passes = 0;
+
+while (passes < 4) {
+    LEDS = led;
+    NUMBER0 = led;
+    wait_ms(60);
+    if (dir == 0) {
+        if (led == 128) { dir = 1; } else { led = led << 1; }
+    } else {
+        if (led == 1) { dir = 0; passes++; } else { led = led >> 1; }
+    }
+}
+LEDS = 0;
+NUMBER0 = 0;
+halt;

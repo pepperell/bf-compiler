@@ -40,9 +40,12 @@ KEYS
   Ctrl+L      clear the terminal
   Ctrl+G      jump to the memory viewer's address box
   Ctrl+F      show or hide the framebuffer window
+  Ctrl+B      show the brainfuck generated from a BFL program
   F1          this help
 
-Dropping a .b file onto the window loads and runs it.  Drag the bar between
+Dropping a .b or .bfl file onto the window loads and runs it.  A .bfl file
+is written in BFL, a small language that compiles to brainfuck (see the
+"BFL language" topic).  Drag the bar between
 the editor and the terminal to resize them.
 
 HOW A RUN WORKS
@@ -229,6 +232,8 @@ const wchar_t* CLI_TEXT = LR"(COMMAND LINE: bf.exe
   --ram N          RAM cells (default 1048576)
   --mmio N         device window cells (default 256, 0 disables devices)
   --serial PORT    attach the serial device to COMn, or 'loopback'
+  --emit FILE      compile a .bfl file to brainfuck in FILE (and FILE.map)
+  --lang           treat the input as BFL whatever its name
   --quiet-devices  do not report LED / number display changes on stderr
 
 Exit code 0 when the program ends or halts, 3 on stop, fault or error.
@@ -241,6 +246,92 @@ TESTS AND BUILD
                        the unoptimised JIT and compares with a reference
                        interpreter; also checks README.md against bf --regs)";
 
+
+const wchar_t* LANGUAGE_TEXT = LR"(BFL - A LOW-LEVEL LANGUAGE THAT COMPILES TO BRAINFUCK
+
+Files ending in .bfl are compiled to brainfuck before they run (Run > Source
+is BFL turns this on for other names).  Ctrl+B shows the generated brainfuck;
+File > Export writes it to a .b file.  The debugger steps by statement: F11
+steps into a procedure call, F10 steps over it, F9 sets a breakpoint on the
+statement at the caret, and the watch list is filled with the program's
+global variables.  The full specification is docs/LANG.md in the repository.
+
+The compiler always knows where the pointer is: every variable has a fixed
+cell (from 0x100 upward), procedures are inlined at each call, and registers
+are addressed by name.  There is no stack and no recursion.
+
+TYPES AND DECLARATIONS
+  byte x;  byte y = 7;        one cell, 0..255, wraps.  Zero unless initialised
+  word w = 1000;              two cells (low, high), 0..65535, wraps
+  byte buf[16];               array of bytes; index may be a variable
+  const MAX = 10;             compile-time constant, no cell
+Variables declared inside { } exist until the closing brace and are cleared
+there.  Names are case-sensitive and may not be register names.
+
+STATEMENTS
+  x = e;   x += e;  x -= e;  x *= e;  x /= e;  x %= e;
+  x <<= e;  x >>= e;  x &= e;  x |= e;  x ^= e;   x++;  x--;
+  if (c) { ... } else if (c) { ... } else { ... }
+  while (c) { ... }          for (i = 0; i < 10; i++) { ... }
+  break;  continue;
+  out e;  out "text\n", x;   write bytes to the terminal ('.')
+  print e, " ", w;           write numbers in decimal (strings as text)
+  x = in;                    read one byte (','), unchanged at end of input
+  w = input;                 read a decimal number up to the first non-digit
+  LEDS = x;   x = LEDS;      registers by name (see Memory map)
+  pulse TICK_LATCH;          write 1 to a register once (triggers)
+  halt;                      write HALT
+  asm { <<+>> }              raw brainfuck; must leave the pointer where it was
+  proc name(byte a, ref word w, ref byte buf[]) { ... }    name(1, w, buf);
+
+EXPRESSIONS
+  Operators, loosest first:  ||  &&  |  ^  &  == !=  < <= > >=  << >>  + -  * / %
+  Unary: - ! ~ and the casts byte(e), word(e).  Numbers: 10, 0x1F, 0b101, 'A'.
+  Everything is unsigned.  An expression is a word if any operand is a word
+  (or a constant above 255), otherwise a byte; byte + byte wraps at 256,
+  so use word(a) + b for a 16-bit sum.  Comparisons and ! && || give 0 or 1.
+  Division by zero gives 0, the remainder gives the dividend.
+  && and || only evaluate the right side when needed.
+
+REGISTERS
+  Latch registers (LEDS, KEY_DATA, TICKS0..3, NUMBER0/1, RANDOM, SER_DATA,
+  SER_BAUD, FB_X, FB_Y, FB_COLOR) read and write like variables.
+  Status registers (KEY_STATUS, SER_STATUS, SER_CTRL) are read only by
+  testing - if (KEY_STATUS), while (SER_STATUS), x = !SER_STATUS - which
+  never writes them; they count as 1 when non-zero.  Write them with pulse
+  or with += 1 / -= 1 (SER_CTRL += 1 opens the port, -= 1 closes it).
+  Write-only registers (CONOUT, HALT, TICK_LATCH, ROLL, SER_TX, FB_PLOT,
+  FB_FILL, FB_READ) accept only pulse; every write a brainfuck program can
+  make is an increment, so they always receive 1.
+
+  Typical keyboard and serial loops:
+      while (KEY_STATUS) { pulse KEY_STATUS; c = KEY_DATA; ... }
+      SER_DATA = c; pulse SER_TX;
+      while (SER_STATUS) { pulse SER_STATUS; out SER_DATA; }
+
+COSTS
+  Generated code is much longer than hand-written brainfuck, but the
+  optimiser recovers most of the speed: + - and constant * become single IR
+  instructions.  Comparisons, / %, shifts and bit operations are loops of a
+  few hundred commands; word arithmetic is 5-20 times a byte's.  Array
+  access with a variable index walks the array (3 cells per element).
+  Compile-time constants cost nothing: the compiler tracks cell values in
+  straight-line code and emits only the difference.
+
+REGISTER KINDS (from registers.h)
+)";
+
+std::string register_kinds() {
+    std::string s;
+    char line[128];
+    for (const bf::RegisterInfo& r : bf::register_map()) {
+        const char* k = r.kind == bf::REG_LATCH ? "latch" : r.kind == bf::REG_STATUS ? "status (test only; pulse / += 1 / -= 1)" : "write-only (pulse)";
+        snprintf(line, sizeof line, "  %-11s %s\n", r.name, k);
+        s += line;
+    }
+    return s;
+}
+
 std::vector<Entry> build() {
     std::vector<Entry> t(TOPIC_COUNT);
     t[START]        = {L"Getting started", crlf(START_TEXT)};
@@ -250,6 +341,7 @@ std::vector<Entry> build() {
     t[DEBUGGER]     = {L"Debugger", crlf(DEBUGGER_TEXT)};
     t[TERMINAL]     = {L"Terminal", crlf(TERMINAL_TEXT)};
     t[COMMAND_LINE] = {L"Command line", crlf(CLI_TEXT)};
+    t[LANGUAGE]     = {L"BFL language", crlf(std::wstring(LANGUAGE_TEXT) + widen(register_kinds()))};
     return t;
 }
 

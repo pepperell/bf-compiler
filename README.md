@@ -9,7 +9,9 @@ build.bat debug                unoptimised build with symbols
 python tests\test.py           correctness suite (JIT, interpreter, unoptimised, Python reference)
 
 out\bf.exe [options] prog.b    console runner   (bf --help for options)
-out\bfui.exe [prog.b]          Windows UI
+out\bf.exe prog.bfl            compile a BFL program to brainfuck and run it
+out\bfui.exe [prog.b|prog.bfl] Windows UI
+python tests\test_lang.py      BFL compiler suite (arithmetic grids, devices, golden files)
 ```
 
 The UI has a device panel (lamps, number display), a source editor, a VT100 terminal and a
@@ -49,6 +51,39 @@ moves into the device cells.
 Debug sessions run on the interpreter with one IR instruction per source command, so
 they are much slower than a normal run; use them for logic, not for timing.
 The API behind this is `bf::Debugger` in `src/bf.h`.
+
+## BFL: a language that compiles to brainfuck
+
+Writing device drivers by counting `<` is tedious, so there is a small unsigned
+low-level language, BFL (`docs/LANG.md`, Help > BFL language). A `.bfl` file is
+compiled to brainfuck by `src/lang/` inside `bf.exe` and `bfui.exe`, then run like
+any other program. The compiler always knows where the pointer is: every variable
+has a fixed cell, procedures are inlined, and registers are addressed by name from
+`src/registers.h`, which also says how each one may be touched (latch, status,
+write-only).
+
+```
+proc wait_ms(byte ms) {
+    pulse TICK_LATCH;
+    byte start = TICKS0;
+    byte elapsed = 0;
+    while (elapsed < ms) { pulse TICK_LATCH; elapsed = TICKS0 - start; }
+}
+byte led = 1;
+while (led) { LEDS = led; wait_ms(60); led = led << 1; }
+halt;
+```
+
+Bytes and 16-bit words, arrays with variable index, `if`/`while`/`for`/`break`,
+the usual operators, `out`/`print`/`in`/`input`, `pulse` for trigger registers,
+`asm { }` for raw brainfuck. `bf --emit prog.b prog.bfl` writes the generated
+code (with a `# L12: source` comment before each statement) and a statement map.
+In the UI, Ctrl+B shows the generated brainfuck and the debugger works on the
+source: F11 steps a statement (into calls), F10 steps over, F9 breakpoints by
+line, and the watch list is filled with the program's variables by name.
+`programs/leds.bfl`, `serial_echo.bfl`, `fb.bfl` and `primes.bfl` are examples;
+`tests/golden/` holds their generated code, and `tests\test_lang.py` fails if it
+changes (run it with `--update-golden` after a deliberate codegen change).
 
 ## Speed
 
@@ -124,6 +159,8 @@ src/jit.cpp     x64 code generator
 src/interp.cpp  IR interpreter: reference executor and the JIT's slow path
 src/machine.cpp tape, device bus, run loop, stop and fault handling
 src/devices.h   the standard devices above
+src/registers.h the register table: memory map, access, kind (single source of truth)
+src/lang/       the BFL compiler: parse.cpp (lexer, parser), codegen.cpp (brainfuck emitter)
 src/cli.cpp     bf.exe
 src/ui.cpp      bfui.exe
 ```

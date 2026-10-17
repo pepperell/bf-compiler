@@ -1,0 +1,22 @@
+// Prints the primes below 200 using trial division, and shows the latest
+// one on the number display.  A good program to step through in the
+// debugger: the watch list shows n, d and count by name.
+
+byte n = 2;
+byte count = 0;
+while (n < 200) {
+    byte d = 2;
+    byte prime = 1;
+    while (d * d <= n) {
+        if (n % d == 0) { prime = 0; break; }
+        d++;
+    }
+    if (prime) {
+        print n, " ";
+        NUMBER0 = n;
+        count++;
+    }
+    n++;
+}
+out "\n";
+print count, " primes\n";

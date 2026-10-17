@@ -19,6 +19,7 @@
 #include "devices.h"
 #include "hw.h"
 #include "help.h"
+#include "lang/lang.h"
 #include "terminal.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -53,7 +54,8 @@ enum : int {
     ID_MEM_FOCUS, ID_BAUD0, ID_BAUD1, ID_BAUD2, ID_BAUD3, ID_BAUD4,
     ID_TB_SPEED, ID_TB_INTERP,
     ID_WATCHLIST, ID_WATCH_ADD, ID_WATCH_PTR, ID_WATCH_REMOVE, ID_WATCH_DEV,
-    ID_VIEW_FB, ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400,  // ID_SER_COM_BASE + n = COMn
+    ID_VIEW_FB, ID_LANG, ID_VIEW_GEN, ID_EXPORT_BF, ID_GENEDIT,
+    ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400,  // ID_SER_COM_BASE + n = COMn
     ID_HELP_BASE = 700                                             // ID_HELP_BASE + (int)help::Topic
 };
 enum : UINT { WM_APP_FBSHOW = WM_APP + 10 };
@@ -126,6 +128,13 @@ struct App {
     std::unique_ptr<Debugger> dbg;
     std::set<int32_t> bps;                   // source offsets with a breakpoint
     std::unordered_multimap<int32_t, int32_t> pc_of_src;
+    // BFL (the compiled language, src/lang): the editor holds .bfl source, which
+    // is compiled to brainfuck first; the statement map drives the debugger.
+    bool lang = false;
+    bfl::Result lr;
+    HWND genwnd = nullptr, genedit = nullptr;     // "Generated brainfuck" window
+    std::vector<std::pair<int32_t, int32_t>> src_pc;   // (source offset, pc) of the debug program, sorted
+    std::set<int64_t> auto_watch;                 // watch rows added from the symbol table
 } app;
 
 int px(int v) { return MulDiv(v, (int)app.dpi, 96); }
@@ -165,8 +174,28 @@ std::string latin1(const std::wstring& w) {
     return s;
 }
 bool is_cmd(wchar_t c) { return c == '+' || c == '-' || c == '<' || c == '>' || c == '.' || c == ',' || c == '[' || c == ']'; }
+// In BFL mode a breakpoint sits on the first non-blank character of a line.
+bool is_bp_char(wchar_t c) { return app.lang ? !(c == L' ' || c == L'\t' || c == L'\r') : is_cmd(c); }
+bool is_bfl_path(const std::wstring& p) { size_t n = p.size(); return n > 4 && _wcsicmp(p.c_str() + n - 4, L".bfl") == 0; }
+// 1-based line/column -> character offset in CR-separated editor text.
+int32_t offset_of(const std::wstring& text, int line, int col) {
+    int l = 1; int32_t i = 0;
+    while (l < line && i < (int32_t)text.size()) { if (text[i] == L'\r') l++; i++; }
+    return std::min(i + std::max(col, 1) - 1, (int32_t)text.size());
+}
+int32_t line_end(const std::wstring& text, int32_t pos) { while (pos < (int32_t)text.size() && text[pos] != L'\r') pos++; return pos; }
+int32_t line_start(const std::wstring& text, int32_t pos) { while (pos > 0 && text[pos - 1] != L'\r') pos--; return pos; }
+int line_of_offset(const std::wstring& text, int32_t pos) { int l = 1; for (int32_t i = 0; i < pos && i < (int32_t)text.size(); i++) if (text[i] == L'\r') l++; return l; }
 
 void set_status(const std::wstring& s) { SendMessageW(app.status, SB_SETTEXTW, 0, (LPARAM)s.c_str()); }
+void update_title();
+void set_lang(bool on) {
+    app.lang = on;
+    CheckMenuItem(app.menu, ID_LANG, on ? MF_CHECKED : MF_UNCHECKED);
+    EnableMenuItem(app.menu, ID_VIEW_GEN, on ? MF_ENABLED : MF_GRAYED);
+    EnableMenuItem(app.menu, ID_EXPORT_BF, on ? MF_ENABLED : MF_GRAYED);
+    update_title();
+}
 
 void set_baud_index(int i) {
     app.con.baud = BAUDS[i];
@@ -258,6 +287,32 @@ void watches_to_session() {
     for (int i = 0; i < watch_count(); i++) if (watch_checked(i)) app.dbg->set_watch(watch_addr(i), true);
     app.dbg->set_watch_device_window(watch_dev_checked());
 }
+void watch_add_named(int64_t a, const std::wstring& label) {
+    if (a < 0 || (uint64_t)a >= app.machine->tape_size() || watch_find(a) >= 0) return;
+    LVITEMW it{}; it.mask = LVIF_TEXT | LVIF_PARAM; it.iItem = watch_count(); it.pszText = (LPWSTR)label.c_str(); it.lParam = (LPARAM)a;
+    SendMessageW(app.watchlist, LVM_INSERTITEMW, 0, (LPARAM)&it);
+}
+// Replace the rows that came from the BFL symbol table with the current globals.
+void auto_watches() {
+    for (int i = watch_count() - 1; i >= 0; i--) if (app.auto_watch.count(watch_addr(i))) SendMessageW(app.watchlist, LVM_DELETEITEM, i, 0);
+    app.auto_watch.clear();
+    wchar_t buf[96];
+    for (const bfl::Symbol& v : app.lr.symbols) {
+        if (!v.scope.empty()) continue;
+        std::wstring name = widen(v.name);
+        if (v.kind == 'b') { swprintf(buf, 96, L"%s  %llX", name.c_str(), (long long)v.cell); watch_add_named(v.cell, buf); app.auto_watch.insert(v.cell); }
+        else if (v.kind == 'w') {
+            swprintf(buf, 96, L"%s lo  %llX", name.c_str(), (long long)v.cell); watch_add_named(v.cell, buf); app.auto_watch.insert(v.cell);
+            swprintf(buf, 96, L"%s hi  %llX", name.c_str(), (long long)v.cell + 1); watch_add_named(v.cell + 1, buf); app.auto_watch.insert(v.cell + 1);
+        } else {
+            for (int k = 0; k < v.count && k < 16; k++) {
+                int64_t c = bfl::array_cell(v.cell, k);
+                swprintf(buf, 96, L"%s[%d]  %llX", name.c_str(), k, (long long)c); watch_add_named(c, buf); app.auto_watch.insert(c);
+            }
+        }
+    }
+    refresh_watches();
+}
 
 void refresh_memory() {
     refresh_watches();
@@ -334,7 +389,7 @@ void collect_bps(const std::wstring& text, int32_t a, int32_t b, std::set<int32_
     SendMessageW(app.editor, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
     if (cf.dwMask & CFM_BACKCOLOR) {                     // uniform over the range
         if (!(cf.dwEffects & CFE_AUTOBACKCOLOR) && cf.crBackColor == BP_COLOUR)
-            for (int32_t i = a; i < b; i++) if (is_cmd(text[i])) out.insert(i);
+            for (int32_t i = a; i < b; i++) if (is_bp_char(text[i])) out.insert(i);
         return;
     }
     int32_t mid = a + (b - a) / 2;
@@ -353,17 +408,57 @@ void sync_bps_from_editor(const std::wstring& text) {
     app.suppress_change--;
 }
 
+// ---- statement map helpers (BFL mode) ----------------------------------------------------------
+// First pc whose source offset lies in [lo, hi), or -1.
+int32_t first_pc_in(int32_t lo, int32_t hi) {
+    auto it = std::lower_bound(app.src_pc.begin(), app.src_pc.end(), std::make_pair(lo, INT32_MIN));
+    if (it == app.src_pc.end() || it->first >= hi) return -1;
+    return it->second;
+}
+// Innermost statement whose generated range contains the brainfuck offset.
+int stmt_at(int32_t src) {
+    int best = -1;
+    for (size_t i = 0; i < app.lr.stmts.size(); i++) {
+        const bfl::StmtRange& r = app.lr.stmts[i];
+        if (src >= r.start && src < r.end && (best < 0 || r.depth > app.lr.stmts[best].depth)) best = (int)i;
+    }
+    return best;
+}
+// Statements starting on a source line, outermost first.
+std::vector<int> stmts_on_line(int line) {
+    std::vector<int> v;
+    for (size_t i = 0; i < app.lr.stmts.size(); i++) if (app.lr.stmts[i].line == line) v.push_back((int)i);
+    std::sort(v.begin(), v.end(), [](int a, int b) { return app.lr.stmts[a].depth < app.lr.stmts[b].depth; });
+    return v;
+}
+// The debug-program pcs a breakpoint at editor position pos stands for.
+std::vector<int32_t> pcs_for_bp(int32_t pos, const std::wstring& text) {
+    std::vector<int32_t> v;
+    if (!app.lang) { auto r = app.pc_of_src.equal_range(pos); for (auto it = r.first; it != r.second; ++it) v.push_back(it->second); return v; }
+    for (int i : stmts_on_line(line_of_offset(text, pos))) {
+        int32_t pc = first_pc_in(app.lr.stmts[i].start, app.lr.stmts[i].end);
+        if (pc >= 0) v.push_back(pc);
+    }
+    return v;
+}
+void select_stmt(int i, const std::wstring& text) {
+    const bfl::StmtRange& r = app.lr.stmts[i];
+    int32_t a = offset_of(text, r.line, r.col);
+    editor_select(a, line_end(text, a), true);
+}
+
 void toggle_bp_at_caret() {
     std::wstring text = editor_text();
     CHARRANGE cr; editor_get_sel(cr);
     int32_t pos = cr.cpMin;
-    // the command at the caret, else the next one on the same line
-    while (pos < (int32_t)text.size() && !is_cmd(text[pos]) && text[pos] != L'\r') pos++;
-    if (pos >= (int32_t)text.size() || !is_cmd(text[pos])) { set_status(L"No command at or after the caret on this line."); return; }
+    if (app.lang) pos = line_start(text, pos);
+    // the command at the caret, else the next one on the same line (BFL: the first non-blank character of the line)
+    while (pos < (int32_t)text.size() && !is_bp_char(text[pos]) && text[pos] != L'\r') pos++;
+    if (pos >= (int32_t)text.size() || !is_bp_char(text[pos])) { set_status(app.lang ? L"Empty line." : L"No command at or after the caret on this line."); return; }
     bool on = !app.bps.count(pos);
     if (on) app.bps.insert(pos); else app.bps.erase(pos);
     mark_bp(pos, on);
-    if (app.dbg) { auto r = app.pc_of_src.equal_range(pos); for (auto it = r.first; it != r.second; ++it) app.dbg->set_breakpoint(it->second, on); }
+    if (app.dbg) for (int32_t pc : pcs_for_bp(pos, text)) app.dbg->set_breakpoint(pc, on);
     wchar_t buf[96]; swprintf(buf, 96, L"Breakpoint %s at offset %d (%zu total).", on ? L"set" : L"cleared", pos, app.bps.size());
     set_status(buf);
 }
@@ -376,10 +471,43 @@ void clear_all_bps() {
 
 void update_title() {
     std::wstring name = app.path.empty() ? L"untitled" : app.path.substr(app.path.find_last_of(L"\\/") + 1);
-    SetWindowTextW(app.wnd, (name + (app.modified ? L" *" : L"") + L" - Brainfuck Machine").c_str());
+    SetWindowTextW(app.wnd, (name + (app.modified ? L" *" : L"") + (app.lang ? L"  [BFL]" : L"") + L" - Brainfuck Machine").c_str());
 }
 
 void append_output(const std::string& bytes) { term::feed(app.console, bytes.data(), bytes.size()); }
+
+void gen_update() {
+    if (!app.genedit) return;
+    std::wstring w; w.reserve(app.lr.bf.size() + 256);
+    for (char c : app.lr.bf) { if (c == '\n') w += L"\r\n"; else w += (wchar_t)(unsigned char)c; }
+    SetWindowTextW(app.genedit, w.c_str());
+}
+
+// Compile the editor contents: BFL -> brainfuck -> IR, or brainfuck -> IR.
+bool compile_editor(bool optimise) {
+    std::wstring text = editor_text();
+    std::string s = latin1(text);
+    if (app.lang) {
+        for (char& c : s) if (c == '\r') c = '\n';
+        app.lr = bfl::compile(s, app.machine->mmio_size());
+        if (!app.lr.ok()) {
+            const bfl::Error& e = app.lr.errors[0];
+            wchar_t buf[512];
+            swprintf(buf, 512, L"BFL error, line %d col %d: %s", e.line, e.col, widen(e.msg).c_str());
+            set_status(buf);
+            int32_t p = offset_of(text, e.line, e.col);
+            editor_select(p, line_end(text, p), true);
+            SetFocus(app.editor);
+            gen_update();
+            return false;
+        }
+        gen_update();
+        s = app.lr.bf;
+    }
+    app.prog = compile(s, optimise);
+    if (!app.prog.error.empty()) { set_status(L"Compile error: " + widen(app.prog.error)); return false; }
+    return true;
+}
 
 // ---- files --------------------------------------------------------------------------
 bool load_file(const std::wstring& path) {
@@ -399,11 +527,11 @@ bool load_file(const std::wstring& path) {
     app.bps.clear();
     app.path = path;
     app.modified = false;
-    update_title();
-    app.prog = compile(latin1(editor_text()), true);
-    if (!app.prog.error.empty()) { set_status(L"Compile error: " + widen(app.prog.error)); return false; }
+    set_lang(is_bfl_path(path));
+    if (!compile_editor(true)) return false;
     wchar_t buf[256];
-    swprintf(buf, 256, L"Loaded: %zu commands, %zu IR instructions. F5 runs, Ctrl+F5 debugs.", app.prog.raw_ops, app.prog.code.size());
+    if (app.lang) swprintf(buf, 256, L"Loaded BFL: %zu bytes of brainfuck (%lld cells), %zu IR instructions. F5 runs, Ctrl+F5 debugs, Ctrl+B shows the brainfuck.", app.lr.bf.size(), (long long)app.lr.cells_used, app.prog.code.size());
+    else swprintf(buf, 256, L"Loaded: %zu commands, %zu IR instructions. F5 runs, Ctrl+F5 debugs.", app.prog.raw_ops, app.prog.code.size());
     set_status(buf);
     return true;
 }
@@ -415,13 +543,14 @@ bool save_file(bool ask) {
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof ofn;
         ofn.hwndOwner = app.wnd;
-        ofn.lpstrFilter = L"Brainfuck programs (*.b;*.bf)\0*.b;*.bf\0All files\0*.*\0";
+        ofn.lpstrFilter = L"Programs (*.b;*.bf;*.bfl)\0*.b;*.bf;*.bfl\0Brainfuck (*.b;*.bf)\0*.b;*.bf\0BFL source (*.bfl)\0*.bfl\0All files\0*.*\0";
         ofn.lpstrFile = file;
         ofn.nMaxFile = MAX_PATH;
-        ofn.lpstrDefExt = L"b";
+        ofn.lpstrDefExt = app.lang ? L"bfl" : L"b";
         ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
         if (!GetSaveFileNameW(&ofn)) return false;
         app.path = file;
+        set_lang(is_bfl_path(app.path));
     }
     std::wstring w = editor_text();
     std::string lf; lf.reserve(w.size());
@@ -444,19 +573,39 @@ void open_dialog() {
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof ofn;
     ofn.hwndOwner = app.wnd;
-    ofn.lpstrFilter = L"Brainfuck programs (*.b;*.bf)\0*.b;*.bf\0All files\0*.*\0";
+    ofn.lpstrFilter = L"Programs (*.b;*.bf;*.bfl)\0*.b;*.bf;*.bfl\0Brainfuck (*.b;*.bf)\0*.b;*.bf\0BFL source (*.bfl)\0*.bfl\0All files\0*.*\0";
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
     if (GetOpenFileNameW(&ofn)) load_file(file);
 }
 
+// Write the brainfuck generated from the BFL source to a .b file.
+void export_bf() {
+    if (!app.lang) { set_status(L"The editor holds brainfuck already; use Save."); return; }
+    if (!compile_editor(true)) return;
+    wchar_t file[MAX_PATH] = L"";
+    if (!app.path.empty()) { std::wstring n = app.path.substr(0, app.path.size() - 4) + L".b"; wcsncpy(file, n.c_str(), MAX_PATH - 1); }
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner = app.wnd;
+    ofn.lpstrFilter = L"Brainfuck (*.b)\0*.b\0All files\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"b";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+    if (!GetSaveFileNameW(&ofn)) return;
+    std::ofstream f(file, std::ios::binary);
+    if (!f) { MessageBoxW(app.wnd, L"Cannot write file.", L"bf", MB_ICONERROR); return; }
+    f.write(app.lr.bf.data(), (std::streamsize)app.lr.bf.size());
+    set_status(std::wstring(L"Exported ") + file);
+}
+
 // ---- running (JIT) ------------------------------------------------------------------
 void start_run() {
     if (app.mode != Mode::Idle) return;
     if (app.worker.joinable()) app.worker.join();
-    app.prog = compile(latin1(editor_text()), true);
-    if (!app.prog.error.empty()) { set_status(L"Compile error: " + widen(app.prog.error)); return; }
+    if (!compile_editor(true)) return;
     term::clear(app.console);
     app.dev.reset();
     app.fb.clear();
@@ -494,9 +643,17 @@ void finish_run() {
 void show_paused() {
     int32_t pc = app.dbg->pc();
     const Instr& x = app.prog.code[pc];
-    editor_select(x.src, x.src + (x.op == END ? 0 : 1), true);
-    int line = (int)SendMessageW(app.editor, EM_EXLINEFROMCHAR, 0, x.src);
-    int col = x.src - (int)SendMessageW(app.editor, EM_LINEINDEX, line, 0);
+    int line, col;
+    if (app.lang) {
+        std::wstring text = editor_text();
+        int stmt = x.op == END ? -1 : stmt_at(x.src);
+        if (stmt >= 0) { select_stmt(stmt, text); line = app.lr.stmts[stmt].line - 1; col = app.lr.stmts[stmt].col - 1; }
+        else { editor_select(0, 0, false); line = col = -1; }
+    } else {
+        editor_select(x.src, x.src + (x.op == END ? 0 : 1), true);
+        line = (int)SendMessageW(app.editor, EM_EXLINEFROMCHAR, 0, x.src);
+        col = x.src - (int)SendMessageW(app.editor, EM_LINEINDEX, line, 0);
+    }
     int64_t p = app.dbg->ptr();
     uint8_t v = app.machine->bus_read(p);
     Debugger::Break br = app.dbg->last_break();
@@ -511,6 +668,7 @@ void show_paused() {
     }
     wchar_t buf[320];
     if (x.op == END) swprintf(buf, 320, L"%s - at end of program.  cell 0x%llX = %u", why, (long long)p, v);
+    else if (line < 0) swprintf(buf, 320, L"%s - between statements (brainfuck offset %d, IR %d)   cell 0x%llX = %u (0x%02X)", why, x.src, pc, (long long)p, v, v);
     else swprintf(buf, 320, L"%s - line %d col %d (IR %d)   cell 0x%llX = %u (0x%02X)", why, line + 1, col + 1, pc, (long long)p, v, v);
     set_status(buf);
     mem_show_ptr();
@@ -520,11 +678,16 @@ void start_debug() {
     if (app.mode != Mode::Idle) return;
     if (app.worker.joinable()) app.worker.join();
     std::wstring text = editor_text();
-    app.prog = compile(latin1(text), false);
-    if (!app.prog.error.empty()) { set_status(L"Compile error: " + widen(app.prog.error)); return; }
+    if (!compile_editor(false)) return;
     sync_bps_from_editor(text);
     app.pc_of_src.clear();
-    for (size_t i = 0; i < app.prog.code.size(); i++) app.pc_of_src.emplace(app.prog.code[i].src, (int32_t)i);
+    app.src_pc.clear();
+    for (size_t i = 0; i < app.prog.code.size(); i++) {
+        app.pc_of_src.emplace(app.prog.code[i].src, (int32_t)i);
+        app.src_pc.emplace_back(app.prog.code[i].src, (int32_t)i);
+    }
+    std::sort(app.src_pc.begin(), app.src_pc.end());
+    if (app.lang) auto_watches();
     term::clear(app.console);
     app.dev.reset();
     app.fb.clear();
@@ -533,7 +696,13 @@ void start_debug() {
     app.dbg = std::make_unique<Debugger>(*app.machine, app.prog, [](Debugger::Event e) {
         PostMessageW(app.wnd, WM_APP_DEBUG, (WPARAM)e, 0);
     });
-    for (int32_t s : app.bps) { auto r = app.pc_of_src.equal_range(s); for (auto it = r.first; it != r.second; ++it) app.dbg->set_breakpoint(it->second, true); }
+    for (int32_t s : app.bps) for (int32_t pc : pcs_for_bp(s, text)) app.dbg->set_breakpoint(pc, true);
+    if (app.lang) {
+        std::vector<uint8_t> marks(app.prog.code.size(), 0);
+        for (const bfl::StmtRange& r : app.lr.stmts) { int32_t pc = first_pc_in(r.start, r.end); if (pc >= 0) marks[pc] = 1; }
+        if (!marks.empty()) marks.back() = 1;          // END
+        app.dbg->set_statement_marks(marks);
+    }
     watches_to_session();
     set_mode(Mode::DebugPaused);
     notify_device();
@@ -558,7 +727,11 @@ void debug_event(Debugger::Event e) {
     refresh_memory();
 }
 
-void debug_step()  { if (app.mode == Mode::DebugPaused) { set_mode(Mode::DebugRunning); app.dbg->step(); } }
+void debug_step()  {
+    if (app.mode != Mode::DebugPaused) return;
+    set_mode(Mode::DebugRunning);
+    if (app.lang) app.dbg->step_statement(); else app.dbg->step();
+}
 void debug_cont()  { if (app.mode == Mode::DebugPaused) { set_mode(Mode::DebugRunning); set_status(L"Running (debugger)..."); app.dbg->cont(); } }
 void debug_pause() { if (app.mode == Mode::DebugRunning) app.dbg->pause(); }
 
@@ -566,6 +739,12 @@ void debug_pause() { if (app.mode == Mode::DebugRunning) app.dbg->pause(); }
 void debug_step_over() {
     if (app.mode != Mode::DebugPaused) return;
     const Instr& x = app.prog.code[app.dbg->pc()];
+    if (app.lang) {
+        int s = x.op == END ? -1 : stmt_at(x.src);
+        set_mode(Mode::DebugRunning);
+        if (s >= 0) app.dbg->step_statement(app.lr.stmts[s].start, app.lr.stmts[s].end); else app.dbg->step_statement();
+        return;
+    }
     if (x.op != JZ) { debug_step(); return; }
     set_mode(Mode::DebugRunning);
     set_status(L"Running to the end of the loop...");
@@ -577,6 +756,14 @@ void debug_run_to_cursor() {
     std::wstring text = editor_text();
     CHARRANGE cr; editor_get_sel(cr);
     int32_t pos = cr.cpMin;
+    if (app.lang) {
+        std::vector<int32_t> pcs = pcs_for_bp(pos, text);
+        if (pcs.empty()) { set_status(L"No statement starts on this line."); return; }
+        set_mode(Mode::DebugRunning);
+        set_status(L"Running to the caret...");
+        app.dbg->run_to(pcs.front());
+        return;
+    }
     while (pos < (int32_t)text.size() && !is_cmd(text[pos])) pos++;
     auto r = app.pc_of_src.equal_range(pos);
     if (r.first == r.second) { set_status(L"No command at or after the caret."); return; }
@@ -638,6 +825,36 @@ void fb_create(HINSTANCE inst) {
 void fb_show(bool show) {
     ShowWindow(app.fbwnd, show ? SW_SHOWNOACTIVATE : SW_HIDE);
     CheckMenuItem(app.menu, ID_VIEW_FB, show ? MF_CHECKED : MF_UNCHECKED);
+}
+
+// ---- generated brainfuck window (BFL mode) ------------------------------------------------------
+LRESULT CALLBACK gen_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_SIZE: if (app.genedit) MoveWindow(app.genedit, 0, 0, LOWORD(l), HIWORD(l), TRUE); return 0;
+    case WM_SETFOCUS: SetFocus(app.genedit); return 0;
+    case WM_CLOSE: ShowWindow(h, SW_HIDE); CheckMenuItem(app.menu, ID_VIEW_GEN, MF_UNCHECKED); return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+void gen_create(HINSTANCE inst) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = gen_proc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"BfGenerated";
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassW(&wc);
+    app.genwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Generated brainfuck", WS_OVERLAPPEDWINDOW,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, px(700), px(600), app.wnd, nullptr, inst, nullptr);
+    app.genedit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOHSCROLL | ES_READONLY,
+                                  0, 0, 10, 10, app.genwnd, (HMENU)(INT_PTR)ID_GENEDIT, inst, nullptr);
+    SendMessageW(app.genedit, WM_SETFONT, (WPARAM)app.mono, TRUE);
+    SendMessageW(app.genedit, EM_SETLIMITTEXT, 0, 0);
+}
+void gen_show(bool show) {
+    if (show && app.lang) compile_editor(true);
+    ShowWindow(app.genwnd, show ? SW_SHOWNOACTIVATE : SW_HIDE);
+    CheckMenuItem(app.menu, ID_VIEW_GEN, show ? MF_CHECKED : MF_UNCHECKED);
 }
 
 // ---- serial port selection ------------------------------------------------------------------
@@ -772,11 +989,15 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(file, MF_STRING, ID_RELOAD, L"&Reload from disk\tCtrl+R");
         AppendMenuW(file, MF_STRING, ID_SAVE, L"&Save\tCtrl+S");
         AppendMenuW(file, MF_STRING, ID_SAVEAS, L"Save &As...");
+        AppendMenuW(file, MF_STRING, ID_EXPORT_BF, L"&Export generated brainfuck...");
         AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file, MF_STRING, ID_EXIT, L"E&xit");
         AppendMenuW(run, MF_STRING, ID_RUN, L"&Run editor contents\tF5");
         AppendMenuW(run, MF_STRING | MF_GRAYED, ID_STOP, L"&Stop\tShift+F5");
         AppendMenuW(run, MF_STRING, ID_CLEAR, L"&Clear terminal\tCtrl+L");
+        AppendMenuW(run, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(run, MF_STRING, ID_LANG, L"Source is &BFL (compile to brainfuck first)");
+        AppendMenuW(run, MF_STRING, ID_VIEW_GEN, L"Show &generated brainfuck\tCtrl+B");
         AppendMenuW(run, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(run, MF_STRING, ID_INTERP, L"Use &interpreter instead of JIT");
         HMENU baud = CreatePopupMenu();
@@ -805,6 +1026,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::DEBUGGER, L"De&bugger");
         AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::TERMINAL, L"&Terminal");
         AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::COMMAND_LINE, L"Command &line");
+        AppendMenuW(help, MF_STRING, ID_HELP_BASE + (int)help::LANGUAGE, L"BFL &language");
         HMENU devices = CreatePopupMenu(), serial = CreatePopupMenu();
         AppendMenuW(serial, MF_STRING | MF_CHECKED, ID_SER_NONE, L"&None");
         AppendMenuW(serial, MF_STRING, ID_SER_LOOP, L"&Loopback (TX wired to RX)");
@@ -875,7 +1097,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         app.watch_dev = make(L"BUTTON", L"Break on entering device window", BS_AUTOCHECKBOX, ID_WATCH_DEV, app.ui_font);
 
         app.status = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, h, nullptr, nullptr, nullptr);
-        set_status(L"Type a program, open one (Ctrl+O) or drop a .b file onto the window. F5 runs, Ctrl+F5 debugs.");
+        set_status(L"Type a program, open one (Ctrl+O) or drop a .b / .bfl file onto the window. F5 runs, Ctrl+F5 debugs.");
         DragAcceptFiles(h, TRUE);
         update_title();
         set_mode(Mode::Idle);
@@ -938,6 +1160,9 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         if (id == ID_VIEW_FB) { fb_show(!IsWindowVisible(app.fbwnd)); return 0; }
+        if (id == ID_VIEW_GEN) { gen_show(!IsWindowVisible(app.genwnd)); return 0; }
+        if (id == ID_LANG) { if (app.mode == Mode::Idle) set_lang(!app.lang); return 0; }
+        if (id == ID_EXPORT_BF) { export_bf(); return 0; }
         if (id == ID_SER_NONE) { serial_select(""); return 0; }
         if (id == ID_SER_LOOP) { serial_select("loopback"); return 0; }
         if (id > ID_SER_COM_BASE && id <= ID_SER_COM_BASE + 255) { serial_select("COM" + std::to_string(id - ID_SER_COM_BASE)); return 0; }
@@ -1048,7 +1273,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
     app.fb.on_first_plot = [] { PostMessageW(app.wnd, WM_APP_FBSHOW, 0, 0); };
 
     ACCEL acc[] = {
-        {FVIRTKEY | FCONTROL, 'F', ID_VIEW_FB}, {FVIRTKEY, VK_F1, ID_HELP_BASE + (int)help::START},
+        {FVIRTKEY | FCONTROL, 'F', ID_VIEW_FB}, {FVIRTKEY | FCONTROL, 'B', ID_VIEW_GEN}, {FVIRTKEY, VK_F1, ID_HELP_BASE + (int)help::START},
         {FVIRTKEY, VK_F5, ID_RUN}, {FVIRTKEY | FSHIFT, VK_F5, ID_STOP}, {FVIRTKEY | FCONTROL, VK_F5, ID_DEBUG},
         {FVIRTKEY, VK_F11, ID_STEP}, {FVIRTKEY, VK_F10, ID_STEP_OVER}, {FVIRTKEY | FCONTROL, VK_F10, ID_RUN_TO_CURSOR},
         {FVIRTKEY, VK_F6, ID_PAUSE}, {FVIRTKEY, VK_F9, ID_TOGGLE_BP},
@@ -1069,6 +1294,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
     app.con.hwnd = h;
     ShowWindow(h, SW_SHOW);
     fb_create(inst);
+    gen_create(inst);
+    set_lang(false);
 
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(cmdline, &argc);

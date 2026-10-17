@@ -37,12 +37,14 @@ struct Ctx {
     volatile int32_t halt_req;
     // debugger (interpreter only)
     const uint8_t* bp;            // per-pc breakpoint flags, or nullptr
-    volatile int32_t dbg;         // 0 run, 1 step (one instruction), 2 pause now
+    volatile int32_t dbg;         // 0 run, 1 step (one instruction), 2 pause now, 3 step to a statement mark
     int32_t        temp_bp;       // one-shot breakpoint pc (run to cursor / step over), -1 none
     const int64_t* watch;         // cells that pause the program after being written
     int32_t        watch_n;
     volatile int32_t watch_mmio;  // pause when the pointer enters the device window
     int64_t        watch_hit;     // address written since the last resume, -1 none
+    const uint8_t* stmt_mark;     // per-pc: 1 where a source statement starts (dbg == 3 pauses there)
+    int32_t        skip_lo, skip_hi;   // source range [lo, hi) whose marks are ignored while dbg == 3
     int32_t        pause_reason;  // bf::Debugger::Reason
     uintptr_t      fault_addr;
     uintptr_t      fault_ptr;

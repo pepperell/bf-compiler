@@ -165,6 +165,12 @@ public:
     void clear_watches();
     void set_watch_device_window(bool on);     // pause when the pointer enters the device window
     void step();            // execute one instruction, then Paused
+    // Statement-level stepping for compiled languages: marks[pc] != 0 where a
+    // source statement starts.  step_statement runs until the next marked
+    // instruction whose source offset is outside [skip_lo, skip_hi) - pass the
+    // current statement's range to step over it, or -1, -1 to step into.
+    void set_statement_marks(const std::vector<uint8_t>& marks);
+    void step_statement(int32_t skip_lo = -1, int32_t skip_hi = -1);
     void run_to(int32_t pc);// continue until pc is reached (or any other pause cause)
     void cont();            // run until a breakpoint, pause(), stop() or the end
     void pause();           // from any thread while running

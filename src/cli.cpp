@@ -3,6 +3,7 @@
 #include "devices.h"
 #include "hw.h"
 #include "registers.h"
+#include "lang/lang.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <conio.h>
@@ -77,7 +78,8 @@ void usage() {
 int main(int argc, char** argv) {
     bool use_jit = true, optimise = true, dump = false, show_time = false, quiet = false;
     Machine::Config cfg;
-    std::string src, path, serial_port;
+    std::string src, path, serial_port, emit_path;
+    bool lang = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto need = [&](const char* what) -> const char* { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", what); exit(2); } return argv[++i]; };
@@ -96,6 +98,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "-e") src = need("-e");
         else if (a == "--serial") serial_port = need("--serial");
+        else if (a == "--emit") emit_path = need("--emit");
+        else if (a == "--lang") lang = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 2; }
         else path = a;
@@ -105,6 +109,22 @@ int main(int argc, char** argv) {
         std::ifstream f(path, std::ios::binary);
         if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); return 2; }
         std::stringstream ss; ss << f.rdbuf(); src = ss.str();
+        if (path.size() > 4 && path.compare(path.size() - 4, 4, ".bfl") == 0) lang = true;
+    }
+    if (lang) {
+        bfl::Result lr = bfl::compile(src, cfg.mmio_size);
+        if (!lr.ok()) {
+            for (const bfl::Error& e : lr.errors) fprintf(stderr, "%s:%d:%d: %s\n", path.empty() ? "<code>" : path.c_str(), e.line, e.col, e.msg.c_str());
+            return 1;
+        }
+        if (!emit_path.empty()) {
+            std::ofstream o(emit_path, std::ios::binary), m(emit_path + ".map", std::ios::binary);
+            if (!o || !m) { fprintf(stderr, "cannot write %s\n", emit_path.c_str()); return 2; }
+            o << lr.bf; m << bfl::describe(lr);
+            fprintf(stderr, "%zu bytes of brainfuck, %lld cells\n", lr.bf.size(), (long long)lr.cells_used);
+            return 0;
+        }
+        src = lr.bf;
     }
 
     Program prog = compile(src, optimise);

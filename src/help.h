@@ -8,7 +8,7 @@
 
 namespace help {
 
-enum Topic { START = 0, SYMBOLS, MEMORY_MAP, DEVICES, DEBUGGER, TERMINAL, COMMAND_LINE, TOPIC_COUNT };
+enum Topic { START = 0, SYMBOLS, MEMORY_MAP, DEVICES, DEBUGGER, TERMINAL, COMMAND_LINE, LANGUAGE, TOPIC_COUNT };
 
 struct Entry { const wchar_t* title; std::wstring text; };
 const std::vector<Entry>& topics();          // built once; the memory map comes from registers.h

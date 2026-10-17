@@ -13,7 +13,7 @@ if "%1"=="debug" ( set CXX=%CXX% /Od /Zi /DDEBUG ) else ( set CXX=%CXX% /O2 /Oi 
 set LNK=/link /OPT:REF /OPT:ICF
 if not "%1"=="debug" set LNK=%LNK% /LTCG
 
-set CORE=src\ir.cpp src\jit.cpp src\interp.cpp src\machine.cpp src\debugger.cpp
+set CORE=src\ir.cpp src\jit.cpp src\interp.cpp src\machine.cpp src\debugger.cpp src\lang\parse.cpp src\lang\codegen.cpp
 
 cl %CXX% %CORE% src\cli.cpp /Fe:out\bf.exe %LNK% /SUBSYSTEM:CONSOLE
 if errorlevel 1 exit /b 1
