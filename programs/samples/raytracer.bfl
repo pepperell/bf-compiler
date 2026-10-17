@@ -55,6 +55,16 @@ long shin[4];  long shout[4];                   // shadow band per sphere: inner
 byte bayer[16];
 
 // ---- per frame ---------------------------------------------------------------------------
+long sc[4];                                     // per sphere: c = (|O - C|^2 - r^2) >> 8
+long socdu[4]; long socdv[4]; long socd0[4];    // (O - C) . du, . dv, . d0  (Q20)
+byte bvis[4]; byte bx0[4]; byte bx1[4]; byte by0[4]; byte by1[4];   // screen boxes
+long brow[4];                                   // (O - C) . d at the start of the row
+long lsx[2];  long lsy[2];  byte lvis[2];       // where the lamps appear this frame
+
+// Scalars last.  Brainfuck reaches a cell by stepping the pointer one cell at a
+// time, and temporaries live just above the last global, so the variables that
+// arithmetic works on are declared after the arrays: every operation then
+// travels a few cells instead of hundreds.
 long ox;  long oy;  long oz;                    // camera position, Q8
 long fx;  long fy;  long fz;                    // forward, Q12
 long rx;  long rz;                              // right (its y is 0), Q12
@@ -62,14 +72,11 @@ long ux;  long uy;  long uz;                    // up, Q12
 long dux; long duz;                             // ray step per pixel along a row
 long dvx; long dvy; long dvz;                   // ray step per row
 long d0x; long d0y; long d0z;                   // ray through the top left pixel
-long sc[4];                                     // per sphere: c = (|O - C|^2 - r^2) >> 8
-long socdu[4]; long socdv[4]; long socd0[4];    // (O - C) . du, . dv, . d0  (Q20)
-byte bvis[4]; byte bx0[4]; byte bx1[4]; byte by0[4]; byte by1[4];   // screen boxes
-long brow[4];                                   // (O - C) . d at the start of the row
 
 // results passed between procedures
 int  cr;  int cg;  int cb;                      // the colour being worked out
 long nx;  long ny; long nz;                     // the normal at the last sphere hit, Q12
+
 
 // ---- maths --------------------------------------------------------------------------------
 // Sine of whole degrees times 1024 (Bhaskara I's formula, error under 0.2%).
@@ -91,15 +98,14 @@ proc long isqrt(long v) {
     while ((bit >> 8) > v) { bit = bit >> 8; root = root >> 4; }
     while (bit > v) { bit = bit >> 2; root = root >> 1; }
     long g = root + (root >> 1);          // root <= sqrt(v) < 2 root
-    g = (g + v / g) >> 1;
-    g = (g + v / g) >> 1;
-    g = (g + v / g) >> 1;
+    byte step;
+    for (step = 0; step < 3; step++) { g = (g + v / g) >> 1; }     // one division in the code, not three
     return g;
 }
 
-proc dword millis() {
+proc word millis() {                  // 16 bits: differences are right for anything under 65 s
     pulse TICK_LATCH;
-    return (dword(TICKS3) << 24) | (dword(TICKS2) << 16) | (dword(TICKS1) << 8) | dword(TICKS0);
+    return word(TICKS1) * 256 + TICKS0;
 }
 
 // ---- colours ------------------------------------------------------------------------------
@@ -235,17 +241,6 @@ proc reflection(byte skip, long px, long py, long pz, long qx, long qy, long qz,
 }
 
 // ---- setting up ---------------------------------------------------------------------------
-proc sphere(byte s, long x, long y, long z, long r, long kn, int red, int green, int blue, int refl) {
-    scx[s] = x; scy[s] = y; scz[s] = z;
-    srad[s] = r; srr[s] = r * r; skn[s] = kn;
-    scr[s] = red; scg[s] = green; scb[s] = blue; sref[s] = refl;
-}
-
-proc lamp(byte l, long x, long y, long z, int red, int green, int blue) {
-    lpx[l] = x; lpy[l] = y; lpz[l] = z;
-    lcr[l] = red; lcg[l] = green; lcb[l] = blue;
-}
-
 // Directions from each sphere to each lamp, and each sphere's shadow band.
 proc prepare_lights() {
     byte s;
@@ -420,7 +415,6 @@ proc glow(long x, long y, byte colour) {
 }
 
 // Where each lamp appears on the screen this frame (lvis 0 when it is out of view).
-long lsx[2];  long lsy[2];  byte lvis[2];
 proc locate_lamps() {
     byte l;
     for (l = 0; l < 2; l++) {
@@ -566,18 +560,25 @@ for (b0 = 0; b0 < 16; b0++) {
     bayer[b0] = v;
 }
 
-//      sphere  x      y     z     r     normal scale  colour          reflectivity
-sphere(0,       0,     256, -102,  256,  4096,         200, 200, 210,  100);    // chrome
-sphere(1,       410,   154,  230,  154,  6809,         220,  40,  40,   50);    // red
-sphere(2,      -384,   179,  256,  179,  5858,         230, 170,  50,   64);    // gold
-sphere(3,       256,   115, -563,  115,  9118,          60, 100, 230,   56);    // blue
-//    lamp  x     y     z      colour
-lamp(0,    -563,  717,  512,   255, 220, 170);    // warm, front left, 2.8 units up
-lamp(1,     666,  614, -460,   140, 170, 255);    // cool, back right, 2.4 units up
+// The scene.  Constant indices make each of these a direct cell write; passing
+// the index to a helper procedure would make it a runtime index, which walks the
+// array (tens of thousands of commands for each long element written).
+scx[0] = 0;     scy[0] = 256;  scz[0] = -102;  srad[0] = 256;  skn[0] = 4096;    // chrome
+scr[0] = 200;   scg[0] = 200;  scb[0] = 210;   sref[0] = 100;
+scx[1] = 410;   scy[1] = 154;  scz[1] = 230;   srad[1] = 154;  skn[1] = 6809;    // red
+scr[1] = 220;   scg[1] = 40;   scb[1] = 40;    sref[1] = 50;
+scx[2] = -384;  scy[2] = 179;  scz[2] = 256;   srad[2] = 179;  skn[2] = 5858;    // gold
+scr[2] = 230;   scg[2] = 170;  scb[2] = 50;    sref[2] = 64;
+scx[3] = 256;   scy[3] = 115;  scz[3] = -563;  srad[3] = 115;  skn[3] = 9118;    // blue
+scr[3] = 60;    scg[3] = 100;  scb[3] = 230;   sref[3] = 56;
+srr[0] = 65536; srr[1] = 23716; srr[2] = 32041; srr[3] = 13225;                  // radius squared, Q16
+// lamps: warm at front left, 2.8 units up; cool at back right, 2.4 units up
+lpx[0] = -563;  lpy[0] = 717;  lpz[0] = 512;   lcr[0] = 255; lcg[0] = 220; lcb[0] = 170;
+lpx[1] = 666;   lpy[1] = 614;  lpz[1] = -460;  lcr[1] = 140; lcg[1] = 170; lcb[1] = 255;
 
 print "BFL raytracer: ", NS, " reflective spheres, 2 lamps, a checkerboard floor.\n";
 print "Working out the floor's light map (shown from above)...\n";
-dword t0 = millis();
+word t0 = millis();
 prepare_lights();
 build_light_map();
 print "light map: ", millis() - t0, " ms\n";
