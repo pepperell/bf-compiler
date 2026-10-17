@@ -25,7 +25,11 @@ show/hide, and a scrollback for plain output. It starts 25 rows tall so classic 
 programs such as `hanoi.b` draw correctly. Keys typed into it feed `,` and the keyboard
 registers; arrows and function keys arrive as VT sequences. Run > Terminal speed paces
 output like a serial line (115200 down to 2400 baud) so animations that finish in
-milliseconds at full speed become visible.
+milliseconds at full speed become visible. Newline mode (on by default; Run menu or
+the "LF = new line" toolbar box) makes LF also return to column 1, as a Unix
+terminal driver does, so programs that end lines with LF alone print correctly.
+Turn it off for strict VT100 behaviour; programs can also set it with `ESC[20h` /
+`ESC[20l`.
 
 The memory viewer shows a hex dump of any tape region (type a hex address and press Enter,
 or use the Start / Dev / Ptr buttons), refreshes live while the program runs, marks

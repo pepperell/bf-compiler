@@ -10,7 +10,7 @@ and the unoptimised path and compares the output with a reference interpreter.
 | File | Author | Notes |
 |------|--------|-------|
 | `mandelbrot.b` | Erik Bosman | ASCII Mandelbrot set; the main speed benchmark |
-| `hanoi.b` | not recorded in the file | Towers of Hanoi drawn with VT100 cursor control (80x24 terminal) |
+| `hanoi.b` | Clifford Wolf, <http://www.clifford.at/bfcpu/> (credited in its output) | Towers of Hanoi animated with VT100 cursor control; needs a terminal about 120 columns wide for the third peg |
 
 ## `cristofani/`
 

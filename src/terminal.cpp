@@ -32,6 +32,7 @@ struct Term {
     int   saved_cx = 0, saved_cy = 0;
     Cell  saved_attr;
     bool  cursor_visible = true, host_cursor = true;
+    bool  lnm = true, host_lnm = true;         // newline mode: LF also does CR
     enum State { GROUND, ESC, CSI, OSC, CHARSET } st = GROUND;
     std::string params;
     bool  priv = false;
@@ -47,6 +48,7 @@ struct Term {
         top = 0; bot = rows - 1;
         cur = Cell(); saved_attr = Cell(); saved_cx = saved_cy = 0;
         cursor_visible = true;
+        lnm = host_lnm;
         st = GROUND; params.clear(); priv = false;
         view = 0;
     }
@@ -178,6 +180,7 @@ struct Term {
         }
         case 'h': case 'l':
             if (priv && param(0, 0) == 25) cursor_visible = (final == 'h');
+            if (!priv && param(0, 0) == 20) lnm = (final == 'h');        // LNM
             break;
         case 'n':
             if (param(0, 0) == 6) { char buf[32]; snprintf(buf, sizeof buf, "\x1b[%d;%dR", cy + 1, cx + 1); respond(buf); }
@@ -211,7 +214,10 @@ struct Term {
             case 0x07: break;
             case 0x08: if (cx > 0) cx--; wrap_pending = false; break;
             case 0x09: cx = std::min((cx / 8 + 1) * 8, cols - 1); wrap_pending = false; break;
-            case 0x0A: case 0x0B: case 0x0C: linefeed(); break;
+            case 0x0A: case 0x0B: case 0x0C:
+                linefeed();
+                if (lnm) { cx = 0; wrap_pending = false; }
+                break;
             case 0x0D: cx = 0; wrap_pending = false; break;
             default: if (b >= 0x20) put((wchar_t)b); break;
             }
@@ -345,6 +351,7 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         auto* cfg = (const Config*)cs->lpCreateParams;
         t->font = cfg->font;
         t->on_key = cfg->on_key;
+        t->host_lnm = t->lnm = cfg->newline_mode;
         SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)t);
         HDC dc = GetDC(h);
         SelectObject(dc, t->font);
@@ -414,6 +421,8 @@ void feed(HWND h, const char* bytes, size_t n) {
 
 void clear(HWND h) { if (Term* t = get(h)) { auto k = t->on_key; t->reset_all(); t->on_key = k; t->update_scrollbar(); InvalidateRect(h, nullptr, FALSE); } }
 void set_cursor_visible(HWND h, bool v) { if (Term* t = get(h)) { t->host_cursor = v; InvalidateRect(h, nullptr, FALSE); } }
+void set_newline_mode(HWND h, bool on) { if (Term* t = get(h)) { t->host_lnm = t->lnm = on; } }
+bool newline_mode(HWND h) { Term* t = get(h); return t ? t->host_lnm : true; }
 void get_size(HWND h, int& cols, int& rows) { Term* t = get(h); cols = t ? t->cols : 0; rows = t ? t->rows : 0; }
 void get_cell_size(HWND h, int& cw, int& ch) { Term* t = get(h); cw = t ? t->cw : 8; ch = t ? t->chh : 16; }
 

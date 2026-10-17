@@ -55,6 +55,7 @@ enum : int {
     ID_TB_SPEED, ID_TB_INTERP,
     ID_WATCHLIST, ID_WATCH_ADD, ID_WATCH_PTR, ID_WATCH_REMOVE, ID_WATCH_DEV,
     ID_VIEW_FB, ID_LANG, ID_VIEW_GEN, ID_EXPORT_BF, ID_GENEDIT, ID_GEN_ANNOTATED, ID_GEN_COMPACT, ID_GEN_COPY, ID_GEN_INFO,
+    ID_NEWLINE, ID_TB_NEWLINE,
     ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400,  // ID_SER_COM_BASE + n = COMn
     ID_HELP_BASE = 700                                             // ID_HELP_BASE + (int)help::Topic
 };
@@ -96,7 +97,7 @@ struct App {
     HWND  wnd = nullptr, editor = nullptr, console = nullptr, status = nullptr;
     HWND  memview = nullptr, mem_addr = nullptr, mem_auto = nullptr;
     HWND  mem_buttons[6] = {};
-    HWND  tb_buttons[10] = {}, tb_speed = nullptr, tb_interp = nullptr;
+    HWND  tb_buttons[10] = {}, tb_speed = nullptr, tb_interp = nullptr, tb_newline = nullptr;
     HWND  watchlist = nullptr, watch_add = nullptr, watch_ptr = nullptr, watch_remove = nullptr, watch_dev = nullptr;
     HFONT mono = nullptr, ui_font = nullptr, big = nullptr, memfont = nullptr;
     HMENU menu = nullptr;
@@ -203,6 +204,12 @@ void set_baud_index(int i) {
     app.con.baud = BAUDS[i];
     CheckMenuRadioItem(app.menu, ID_BAUD0, ID_BAUD4, ID_BAUD0 + i, MF_BYCOMMAND);
     SendMessageW(app.tb_speed, CB_SETCURSEL, i, 0);
+}
+// Terminal newline mode: LF also returns the cursor to column 1 (Unix-style output).
+void set_newline(bool on) {
+    term::set_newline_mode(app.console, on);
+    CheckMenuItem(app.menu, ID_NEWLINE, on ? MF_CHECKED : MF_UNCHECKED);
+    if (app.tb_newline) SendMessageW(app.tb_newline, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 void set_interp(bool on) {
     app.use_interp = on;
@@ -1004,6 +1011,8 @@ void layout() {
     for (int i = 0; i < TB_COUNT; i++) { MoveWindow(app.tb_buttons[i], tx, ty, px(tbw[i]), tbh, TRUE); tx += px(tbw[i]) + px(4); }
     tx += px(6);
     MoveWindow(app.tb_speed, tx, ty, px(140), tbh * 8, TRUE);
+    tx += px(148);
+    MoveWindow(app.tb_newline, tx, ty, px(130), tbh, TRUE);
     body_top += tbh + px(10);
     body_h -= tbh + px(10);
 
@@ -1072,6 +1081,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(baud, MF_STRING, ID_BAUD3, L"&9600 baud");
         AppendMenuW(baud, MF_STRING, ID_BAUD4, L"&2400 baud");
         AppendMenuW(run, MF_POPUP, (UINT_PTR)baud, L"&Terminal speed");
+        AppendMenuW(run, MF_STRING | MF_CHECKED, ID_NEWLINE, L"Terminal &newline mode (LF also returns to column 1)");
         AppendMenuW(debug, MF_STRING, ID_DEBUG, L"Start &debugging\tCtrl+F5");
         AppendMenuW(debug, MF_STRING | MF_GRAYED, ID_STEP, L"Step &into\tF11");
         AppendMenuW(debug, MF_STRING | MF_GRAYED, ID_STEP_OVER, L"Step &over loop\tF10");
@@ -1143,6 +1153,8 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         for (const wchar_t* s : {L"Terminal: unlimited", L"115200 baud", L"38400 baud", L"9600 baud", L"2400 baud"})
             SendMessageW(app.tb_speed, CB_ADDSTRING, 0, (LPARAM)s);
         SendMessageW(app.tb_speed, CB_SETCURSEL, 0, 0);
+        app.tb_newline = make(L"BUTTON", L"LF = new line", BS_AUTOCHECKBOX, ID_TB_NEWLINE, app.ui_font);
+        SendMessageW(app.tb_newline, BM_SETCHECK, BST_CHECKED, 0);
 
         app.watchlist = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                                         0, 0, 10, 10, h, (HMENU)(INT_PTR)ID_WATCHLIST, nullptr, nullptr);
@@ -1264,6 +1276,10 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (code == CBN_SELCHANGE) { set_baud_index((int)SendMessageW(app.tb_speed, CB_GETCURSEL, 0, 0)); SetFocus(app.editor); }
             break;
         case ID_INTERP:    set_interp(!app.use_interp); break;
+        case ID_NEWLINE:   set_newline(!term::newline_mode(app.console)); break;
+        case ID_TB_NEWLINE:
+            if (code == BN_CLICKED) { set_newline(SendMessageW(app.tb_newline, BM_GETCHECK, 0, 0) == BST_CHECKED); SetFocus(app.editor); }
+            break;
         case ID_TB_INTERP: if (code == BN_CLICKED) set_interp(SendMessageW(app.tb_interp, BM_GETCHECK, 0, 0) == BST_CHECKED); break;
         case ID_MEM_GO: {
             std::wstring t = window_text(app.mem_addr);

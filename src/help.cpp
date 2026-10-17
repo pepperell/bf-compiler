@@ -216,7 +216,16 @@ wheel, Shift+PgUp / PgDn).  It starts 25 rows tall so classic 80 x 24
 programs such as programs\thirdparty\hanoi.b draw correctly.
 
 Run > Terminal speed (also the toolbar box) paces output like a serial line.
-Programs that finish in milliseconds at full speed become watchable at 9600.)";
+Programs that finish in milliseconds at full speed become watchable at 9600.
+
+NEWLINE MODE
+Programs written for Unix end lines with LF only and rely on the terminal
+driver to add the carriage return.  With newline mode on (the default; Run >
+Terminal newline mode, or the "LF = new line" box on the toolbar) LF, VT and
+FF also return the cursor to column 1.  Turn it off for strict VT100
+behaviour, where LF only moves down and a program must send CR LF.  A program
+can switch the mode itself with ESC [ 20 h (on) and ESC [ 20 l (off); clearing
+the terminal or ESC c restores the setting chosen in the UI.)";
 
 const wchar_t* CLI_TEXT = LR"(COMMAND LINE: bf.exe
 
