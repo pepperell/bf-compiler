@@ -28,6 +28,7 @@ struct Sym {
     const Type* type = nullptr;      // Var: value type (Array for arrays); Const: value type
     int64_t     cval = 0;
     bool        in_heap = false;     // heap array
+    int64_t     addr = 0;            // heap array: address of element 0
     bool        param = false, ref = false, global = false;
     int         item = -1;           // top-level position of a global
     bool        used = false, quiet = false;
@@ -70,6 +71,14 @@ struct Sema {
         if (R.errors.size() >= 20) throw Abort{};
     }
     void warning(Pos p, const std::string& m) { if (warn && !in_prelude) R.warnings.push_back(Diag{p, m}); }
+    void need_heap() { if (!in_prelude) R.uses_heap = true; }
+    std::map<std::string, int64_t> strings;     // literal -> heap address
+    int64_t heap_alloc(int64_t bytes, Pos p) {   // static heap space for arrays and literals
+        int64_t a = R.heap_static_end;
+        if (a + bytes > 65535) { error(p, "the static heap data does not fit in 64 KB"); return 7; }
+        R.heap_static_end = (int)(a + bytes);
+        return a;
+    }
 
     const bf::RegisterInfo* find_reg(const std::string& n) const {
         for (const bf::RegisterInfo& r : bf::register_map()) if (n == r.name) return &r;
@@ -264,10 +273,20 @@ struct Sema {
             e.is_const = true; e.cval = e.value;
             return t;
         }
-        case Expr::Str:
-            if (!F.heap) { error(e.pos, "a string can only appear in an out statement"); return T.error(); }
-            R.uses_heap = true;
+        case Expr::Str: {
+            if (!F.alloc) { error(e.pos, "a string can only appear in an out statement"); return T.error(); }
+            need_heap();
+            auto it = strings.find(e.text);
+            int64_t a;
+            if (it != strings.end()) a = it->second;
+            else {
+                a = heap_alloc((int64_t)e.text.size() + 1, e.pos);
+                strings[e.text] = a;
+                R.heap_init.emplace_back(a, e.text + std::string(1, '\0'));
+            }
+            e.is_const = true; e.cval = a;
             return T.ptr(T.u8());
+        }
         case Expr::Null:
             if (!F.heap) { error(e.pos, "'null' is not available yet"); return T.error(); }
             e.is_const = true; e.cval = 0;
@@ -282,8 +301,8 @@ struct Sema {
             return const_type(t->size);
         }
         case Expr::New: {
-            if (!F.heap) { error(e.pos, "'new' is not available yet"); return T.error(); }
-            R.uses_heap = true;
+            if (!F.alloc) { error(e.pos, "'new' is not available yet"); return T.error(); }
+            need_heap();
             const Type* t = resolve(e.ts);
             if (e.b) { const Type* n = expr(*e.b); if (!n->is_int() && !n->is_error()) error(e.b->pos, "the element count must be an integer"); else if (e.b->type->size > 2) warning(e.b->pos, "element count is truncated to 'word'"); }
             if (t->is_error()) return t;
@@ -296,7 +315,7 @@ struct Sema {
                 use(s);
                 if (s->k == Sym::Const) { e.is_const = true; e.cval = s->cval; return s->type; }
                 if (s->type->kind == TK::Array) {
-                    if (s->in_heap) return T.ptr(s->type->elem);         // a heap array decays to a pointer
+                    if (s->in_heap) { e.is_const = true; e.cval = s->addr; return T.ptr(s->type->elem); }   // a constant pointer
                     error(e.pos, "array '" + e.text + "' needs an index"); return T.error();
                 }
                 return s->type;
@@ -317,7 +336,7 @@ struct Sema {
             const Type* t = expr(*e.a);
             if (t->is_error()) return t;
             if (!t->is_ptr()) { error(e.pos, "'*' needs a pointer, not '" + t->name + "'"); return T.error(); }
-            R.uses_heap = true;
+            need_heap();
             return t->elem;
         }
         case Expr::AddrOf: {
@@ -421,7 +440,7 @@ struct Sema {
             if (s->k == Sym::Var && s->type->kind == TK::Array) {
                 elem = s->type->elem;
                 base.type = s->in_heap ? T.ptr(elem) : s->type;
-                if (s->in_heap) R.uses_heap = true;
+                if (s->in_heap) { need_heap(); base.is_const = true; base.cval = s->addr; }
                 const Type* it = expr(*e.b);
                 if (!it->is_int() && !it->is_error()) error(e.b->pos, "an index must be an integer");
                 if (e.b->is_const && (e.b->cval < 0 || e.b->cval >= s->type->count))
@@ -430,7 +449,7 @@ struct Sema {
             }
             if (s->k == Sym::Var && s->type->is_ptr()) {
                 base.type = s->type;
-                R.uses_heap = true;
+                need_heap();
                 const Type* it = expr(*e.b);
                 if (!it->is_int() && !it->is_error()) error(e.b->pos, "an index must be an integer");
                 return s->type->elem;
@@ -443,7 +462,7 @@ struct Sema {
         const Type* it = expr(*e.b);
         if (bt->is_error()) return bt;
         if (!it->is_int() && !it->is_error()) error(e.b->pos, "an index must be an integer");
-        if (bt->is_ptr()) { R.uses_heap = true; return bt->elem; }
+        if (bt->is_ptr()) { need_heap(); return bt->elem; }
         if (bt->kind == TK::Array) {
             if (e.b->is_const && (e.b->cval < 0 || e.b->cval >= bt->count))
                 error(e.b->pos, "index " + std::to_string(e.b->cval) + " is outside the array of " + std::to_string(bt->count));
@@ -469,7 +488,7 @@ struct Sema {
         if (e.arrow) {
             if (!bt->is_ptr() || bt->elem->kind != TK::Struct) { error(e.pos, "'->' needs a pointer to a struct, not '" + bt->name + "'"); return T.error(); }
             st = bt->elem;
-            R.uses_heap = true;
+            need_heap();
         } else if (bt->kind != TK::Struct) {
             if (bt->is_ptr() && bt->elem->kind == TK::Struct) error(e.pos, "'" + bt->name + "' is a pointer: use '->'");
             else error(e.pos, "'.' needs a struct, not '" + bt->name + "'");
@@ -483,8 +502,8 @@ struct Sema {
     // Check a call; returns the result type (void when none).
     const Type* call(const std::string& name, std::vector<ExprP>& args, Pos p, bool as_value) {
         if (name == "alloc" || name == "free") {
-            if (!F.heap) { error(p, "'" + name + "' is not available yet"); }
-            R.uses_heap = true;
+            if (!F.alloc && !in_prelude) { error(p, "'" + name + "' is not available yet"); }
+            need_heap();
         }
         auto it = procs.find(name);
         if (it == procs.end()) {
@@ -622,14 +641,17 @@ struct Sema {
         case Stmt::Decl: {
             decl_type(s);
             const Type* t = s.vtype;
+            int64_t haddr = 0;
             if (s.in_heap) {
                 if (!F.heap) error(s.pos, "heap variables are not available yet");
                 if (!top_level()) error(s.pos, "heap arrays must be declared at the top level");
                 if (!s.count_e) error(s.pos, "'heap' declares an array: give it a length");
-                R.uses_heap = true;
+                need_heap();
+                if (!t->is_error() && s.count > 0) haddr = heap_alloc((int64_t)t->size * s.count, s.pos);
+                s.cval = haddr;
             }
             if (s.count_e) {
-                if (!t->is_error() && t != T.u8() && !F.structs) error(s.pos, std::string(t->is_int() ? "word" : t->name.c_str()) + " arrays are not supported; use two byte arrays");
+                if (!t->is_error() && t != T.u8() && !F.structs && !s.in_heap) error(s.pos, std::string(t->is_int() ? "word" : t->name.c_str()) + " arrays are not supported; use two byte arrays");
                 if (!t->is_error() && t->kind == TK::Void) error(s.pos, "an array needs an element type");
             }
             if (s.e) {
@@ -640,6 +662,7 @@ struct Sema {
             if (!sym) return;
             sym->type = s.count_e && !t->is_error() ? T.array(t, std::max(s.count, 1)) : t;
             sym->in_heap = s.in_heap;
+            sym->addr = haddr;
             if (sym->global) sym->used = sym->used || sym->quiet;
             return;
         }
@@ -864,6 +887,9 @@ struct Sema {
             if (s.kind == Stmt::Struct) continue;     // done above
             stmt(s);
         }
+        if (R.uses_heap && R.heap_static_end > R.heap_size)
+            error(Pos{}, "heap arrays and string literals need " + std::to_string(R.heap_static_end) + " bytes of heap but the heap has " +
+                         std::to_string(R.heap_size) + "; declare a larger one with 'heap N;'");
         // unused globals
         for (auto& kv : scopes.front()) {
             Sym* g = kv.second;

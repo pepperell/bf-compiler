@@ -52,6 +52,46 @@ loop body's locals start at zero on every iteration. Top-level variables keep
 their cells for the whole program. Arrays cannot be initialised in the
 declaration and `word` arrays are not supported (use two byte arrays).
 
+## Pointers and the heap
+
+Variables live in cells and have no address. The **heap** is a separate memory
+of up to 64 KB, addressed by 16-bit pointers, where data can be reached through
+an address computed at run time:
+
+```
+heap 16384;                  // heap size in bytes (top level; default 8192)
+heap byte buf[100];          // a static array in the heap
+heap int scores[50];         // heap arrays may hold any type
+byte* p = &buf[10];          // the address of a heap element
+*p = 'x';                    // write through a pointer
+p[3] = p[2] + 1;             // index from a pointer
+p++;  p += 4;                // pointer arithmetic is scaled by the element size
+int* q = scores;             // a heap array's name is a constant pointer
+word n = q - scores;         // a pointer difference counts elements
+word* w = (word*)p;          // casts between pointer types, and to and from integers
+if (p != null) { ... }       // null is address 0
+```
+
+Rules:
+
+- A pointer is two bytes. `T*` points to a `T`; `byte*` (also written `string`)
+  converts to and from any other pointer type silently, other pointer
+  conversions give a warning, and integers need a cast (except the constant 0).
+- `&` takes the address of anything in the heap: an element of a heap array, a
+  location reached through a pointer, a field of a struct in the heap. Variables
+  held in cells have no address.
+- Address 0 is null and addresses 1 to 6 hold the allocator's bookkeeping;
+  static data starts at 7. Accessing a null or out-of-range address is not
+  checked unless the program is compiled with `--check-heap` (bf.exe) or Run >
+  Check heap accesses (UI), which print `heap access out of range` and halt.
+- Cost: an access through a runtime address walks the heap (docs/HEAP.md). With
+  the default heap a byte access takes about 2 µs on the JIT and compiles to
+  about 1.6 KB of brainfuck at each place it appears. An access whose address is
+  known at compile time (a heap array with a constant index, `*p` after `p` was
+  set to a constant) is a direct cell access with no walk.
+- Each byte of a multi-byte value is a separate access, so reading a `long`
+  through a pointer costs four walks.
+
 ## Statements
 
 ```
@@ -290,9 +330,8 @@ These are the building blocks; knowing them helps read the output and write
 
 ## Limits and non-features
 
-- No function values, no signed numbers, no `word` arrays, no array bounds
-  checks for runtime indices (a constant index is checked), no stack overflow
-  check for recursion.
+- No function values, no array bounds checks for runtime indices into cell
+  arrays (a constant index is checked), no garbage collection.
 - `asm` blocks are not analysed: they must leave the pointer where it was, and
   the compiler forgets every known cell value after one.
 - The compiler stops at the first error and reports `line:col: message`.

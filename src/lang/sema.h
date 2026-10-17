@@ -15,7 +15,8 @@ struct Diag {
 // Language features switched on so far (the roadmap phases).
 struct Features {
     bool wide_ints = true;      // sbyte, int, dword, long
-    bool heap = true;           // pointers, heap arrays, new, strings as values
+    bool heap = true;           // pointers, heap arrays, &, *
+    bool alloc = true;          // new, alloc, free, string literals as values
     bool structs = true;
 };
 

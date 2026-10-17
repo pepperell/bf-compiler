@@ -77,6 +77,8 @@ void usage() {
         "  --lang          treat the input as BFL whatever its name\n"
         "  --emit FILE     write the brainfuck produced from a .bfl file to FILE (and FILE.map), then exit\n"
         "  --warn          report BFL warnings (unused variables, truncation, unreachable code)\n"
+        "  --check-heap    BFL: halt with a message on a null or out-of-range heap access\n"
+        "  --check-stack   BFL: halt with a message when the recursion stack overflows\n"
         "  --interp        run the IR interpreter instead of the x64 JIT\n"
         "  --no-opt        disable IR optimisation\n"
         "  --dump          print the IR and exit\n"
@@ -96,7 +98,7 @@ int main(int argc, char** argv) {
     bool use_jit = true, optimise = true, dump = false, show_time = false, quiet = false;
     Machine::Config cfg;
     std::string src, path, serial_port, emit_path;
-    bool lang = false, warn = false;
+    bool lang = false, warn = false, check_heap = false, check_stack = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto need = [&](const char* what) -> const char* { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", what); exit(2); } return argv[++i]; };
@@ -118,6 +120,8 @@ int main(int argc, char** argv) {
         else if (a == "--emit") emit_path = need("--emit");
         else if (a == "--lang") lang = true;
         else if (a == "--warn") warn = true;
+        else if (a == "--check-heap") check_heap = true;
+        else if (a == "--check-stack") check_stack = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 2; }
         else path = a;
@@ -132,6 +136,8 @@ int main(int argc, char** argv) {
     if (lang) {
         bfl::Options lo;
         lo.warnings = warn;
+        lo.check_heap = check_heap;
+        lo.check_stack = check_stack;
         lo.file_name = path.empty() ? "<code>" : path;
         bfl::Result lr = bfl::compile(src, cfg.mmio_size, lo);
         for (const bfl::Error& e : lr.warnings) fprintf(stderr, "%s\n", bfl::format_error(lr, e, "warning").c_str());

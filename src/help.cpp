@@ -327,6 +327,16 @@ EXPRESSIONS
   Numbers with an L suffix (5L) are long.
   && and || only evaluate the right side when needed.
 
+POINTERS AND THE HEAP
+  heap 16384;                 heap size in bytes (default 8192, at most 65535)
+  heap byte buf[100];         a static array in the heap
+  byte* p = &buf[10];         an address; *p, p[3], p + 1, p++ (scaled by size)
+  word* w = (word*)p;         pointer casts; null is address 0
+  Variables live in cells and have no address; only heap data does.  An
+  access through a runtime address walks the heap: about 2 us and 1.6 KB of
+  brainfuck per access site.  bf --check-heap halts on a null or
+  out-of-range access with a message.
+
 REGISTERS
   Latch registers (LEDS, KEY_DATA, TICKS0..3, NUMBER0/1, RANDOM, SER_DATA,
   SER_BAUD, FB_X, FB_Y, FB_COLOR) read and write like variables.

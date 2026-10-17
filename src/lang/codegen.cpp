@@ -93,6 +93,9 @@ proc __print_dword(dword v) {
 proc __print_long(long v) {
     if (v < 0) { out '-'; __print_dword(dword(-v)); } else { __print_dword(dword(v)); }
 }
+proc __print_str(byte* s) {
+    while (*s) { out *s; s++; }
+}
 proc __read_word(ref word w) {
     w = 0;
     byte c = in;
@@ -254,8 +257,9 @@ struct Gen {
     static bool reg_readable(const bf::RegisterInfo& r) { return r.kind != bf::REG_TRIGGER; }
 
     // ---- emission primitives ------------------------------------------------------------
+    bool dry = false;               // measuring pass: the heap position is a placeholder, so no long moves are written
     bool trackable(int64_t c) const { return c >= ram && c < heap_lo; }
-    void rep(char c, int64_t n) { if (n > 0) out.append((size_t)n, c); }
+    void rep(char c, int64_t n) { if (n > 0 && !dry) out.append((size_t)n, c); }
     void go(int64_t c) { if (c > cur) rep('>', c - cur); else rep('<', cur - c); cur = c; }
     void open(int64_t c) { go(c); out += '['; loops.push_back(c); known.clear(); }
     void close() {
@@ -2543,7 +2547,8 @@ struct Gen {
 static Features current_features() {
     Features f;
     f.wide_ints = true;
-    f.heap = false;
+    f.heap = true;
+    f.alloc = false;
     f.structs = false;
     return f;
 }
@@ -2577,9 +2582,9 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
 
     // One pass without a heap, or two: the first finds how many cells the
     // variables need, the second places the heap just above them.
-    auto generate = [&](int64_t heap_lo) -> std::unique_ptr<Gen> {
+    auto generate = [&](int64_t heap_lo, bool dry) -> std::unique_ptr<Gen> {
         auto g = std::make_unique<Gen>(source, ram_start);
-        g->T = &types; g->opt = opt; g->sr = &sr;
+        g->T = &types; g->opt = opt; g->sr = &sr; g->dry = dry;
         g->prelude = std::move(prelude);
         if (heap_lo != INT64_MAX) {
             g->heap_lo = heap_lo;
@@ -2596,17 +2601,17 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
     };
     std::unique_ptr<Gen> g;
     if (sr.uses_heap) {
-        auto g1 = generate((int64_t)ram_start + ((int64_t)1 << 30));
+        auto g1 = generate((int64_t)ram_start + ((int64_t)1 << 30), true);
         if (!g1->res.errors.empty()) g = std::move(g1);
         else {
             int64_t lo = g1->high + 16;
-            g = generate(lo);
+            g = generate(lo, false);
             if (g->res.errors.empty() && g->high != g1->high) g->res.errors.push_back(Error{0, 0, "internal compiler error: heap placement changed the layout", 0});
             g->res.cells_used = g->high - (int64_t)ram_start + 16 + (int64_t)HK * (HOP + sr.heap_size);
             g->res.heap_cell = g->heap_elem0;
             g->res.heap_size = sr.heap_size;
         }
-    } else g = generate(INT64_MAX);
+    } else g = generate(INT64_MAX, false);
     Result outr = std::move(g->res);
     outr.files = res.files;
     outr.warnings = res.warnings;

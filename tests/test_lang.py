@@ -73,6 +73,10 @@ DIAGS = [
     ("warn-off-by-default", "byte unused = 2;", [], (), 0),
     ("warn-mixed-sign", "int a = 1; word b = 2; print a < b;",
      ["1:30: warning: comparing or combining signed 'int' with unsigned 'word' treats both as unsigned"], ["--warn"], 0),
+    ("err-addr-of-cell", "byte x; byte* p = &x;", ["1:19: '&' needs something in the heap; variables held in cells have no address"], (), 1),
+    ("err-deref-int", "byte x; out *x;", ["1:13: '*' needs a pointer, not 'byte'"], (), 1),
+    ("err-heap-too-small", "heap 100; heap byte b[200];", ["1:1: heap arrays and string literals need 207 bytes of heap but the heap has 100; declare a larger one with 'heap N;'"], (), 1),
+    ("err-pointer-int-assign", "heap byte b[2]; byte* p = 5;", ["1:27: cannot convert 'byte' to 'byte*' without a cast"], (), 1),
     ("err-int-range", "int a = 40000; sbyte s = 300;",
      ["1:9: value 40000 does not fit an int", "1:26: value 300 does not fit a sbyte"], (), 1),
     ("diag-global-after-call", "f(); byte g = 0; proc f() { g++; }",
@@ -247,6 +251,23 @@ def case(name, src, expected, stdin=b"", extra=()):
 
 
 case("hello", 'out "Hello\\n";', b"Hello\n")
+# ---- heap and pointers (phase 3) ----
+case("heap-array", "heap byte b[20]; byte i; for (i = 0; i < 20; i++) { b[i] = 'a' + i; } out b[0], b[5], b[19]; i = 7; out b[i], b[i + 3];", b"afthk")
+case("heap-wide-array", "heap long big[8]; heap int n[5]; byte i; for (i = 0; i < 8; i++) { big[i] = long(i) * -100000; } for (i = 0; i < 5; i++) { n[i] = int(i) - 2; } print big[7], \" \", big[3] + n[0], \" \", n[4];",
+     b"-700000 -300002 2")
+case("pointer-basics", "heap byte b[10]; byte* p = &b[3]; *p = 'X'; p[1] = 'Y'; *(p + 2) = 'Z'; out b[3], b[4], b[5], *p, p[2]; p++; out *p; p -= 1; out *p;", b"XYZXZYX")
+case("pointer-scaling", "heap int n[6]; int* q = n; byte i; for (i = 0; i < 6; i++) { *q = int(i) * 11; q++; } q = n + 2; print *q, \" \", q[3], \" \", q - n, \" \", *(n + 5);",
+     b"22 55 2 55")
+case("pointer-cast-word", "heap byte b[4]; b[0] = 0x34; b[1] = 0x12; word* w = (word*)b; print *w; *w = 0xABCD; print \" \", b[0], \" \", b[1];", b"4660 205 171")
+case("pointer-null", "heap byte b[2]; byte* p = null; if (!p) { out 'n'; } p = b; if (p) { out 'p'; } if (p != null) { out 'q'; } if (p == b) { out 'r'; }", b"npqr")
+case("pointer-params", "heap byte b[8]; proc fill(byte* d, byte n, byte v) { byte i; for (i = 0; i < n; i++) { d[i] = v + i; } } proc byte* at(byte* d, byte i) { return d + i; } fill(b, 8, 'a'); out *at(b, 6), b[0], b[7];",
+     b"gah")
+case("linked-list", "heap byte pool[30]; byte* head = null; byte i; for (i = 0; i < 5; i++) { byte* n = &pool[i * 3]; *n = 'a' + i; *(word*)(n + 1) = word(head); head = n; } byte* p = head; while (p) { out *p; p = (byte*)*(word*)(p + 1); }",
+     b"edcba")
+case("pointer-alias", "heap byte b[3]; byte* p = &b[1]; byte* q = b + 1; *p = 5; *q += 3; print b[1], \" \", *p;", b"8 8")
+case("heap-top", "heap 40000; heap byte big[30000]; big[29999] = 77; big[0] = 1; word i = 29999; print big[i], \" \", big[0];", b"77 1")
+case("heap-runtime-index-wide", "heap word w[300]; word i; for (i = 0; i < 300; i += 37) { w[i] = i * 3; } print w[296], \" \", w[37];", b"888 111")
+case("heap-check-null", "byte* p = null; out 'a'; out *p; out 'b';", b"a\nheap access out of range\n", b"", ["--check-heap"])
 # ---- integer types (phase 2) ----
 case("int-print", "int a = -32768; int b = 32767; sbyte c = -128; long d = -2147483648; dword e = 4294967295; print a, \" \", b, \" \", c, \" \", d, \" \", e;",
      b"-32768 32767 -128 -2147483648 4294967295")
