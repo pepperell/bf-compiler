@@ -310,10 +310,13 @@ PROCEDURES AND RECURSION
   calls a rec proc is compiled the same way.  Locals of a rec proc live in
   fixed cells and appear in the watch list as fib.n; __sp is the stack
   pointer.  F10 on a recursive call runs until the stack is back at the
-  current depth.  Rules: no arrays inside a rec proc (declare them at the
-  top level), ref parameters are copied in and back out, and variables of
-  code that calls a rec proc need unique names.  A call costs roughly 1000
-  commands plus 70 per cell saved.
+  current depth.  Local arrays of a rec proc live in the heap, a fresh
+  zeroed copy per call; array parameters are passed as pointers (the
+  argument must be in the heap).  ref parameters are copied in and back
+  out, and variables of code that calls a rec proc need unique names.
+  stack N; sets the save stack (default 128 cells, up to 32768; above 256
+  it is slower).  bf --check-stack halts on overflow with a message.  A
+  call costs roughly 1000 commands plus 70 per cell saved.
 
 EXPRESSIONS
   Operators, loosest first:  ||  &&  |  ^  &  == !=  < <= > >=  << >>  + -  * / %

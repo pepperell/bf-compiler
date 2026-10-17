@@ -67,6 +67,8 @@ struct Var {
     bool is_const = false;       // constants and heap arrays (cval = address)
     int64_t cval = 0;
     bool owned = true;           // false: ref alias, not cleared at scope exit
+    bool arr_ptr = false;        // an array in the heap reached through the pointer in this variable's cells
+    int arr_off = -1;            // arr_ptr locals of a recursive procedure: offset in its heap frame
     int size() const { return type ? std::max(type->size, 1) : 1; }
     bool cell_array() const { return count >= 0 && !is_const; }
 };
@@ -81,7 +83,7 @@ struct ProcInfo {
 
 // ---- trampoline structures -------------------------------------------------------------
 struct Action {
-    enum Kind { Plain, SetState, IfGoto, Call, Ret, Pop, Clear };
+    enum Kind { Plain, SetState, IfGoto, Call, Ret, Pop, Clear, FrameEnter };
     Kind kind;
     const Stmt* s = nullptr;        // Plain: statement to generate (original or synthetic)
     const Stmt* src = nullptr;      // statement for the map
@@ -108,6 +110,7 @@ struct TProc {
     std::vector<Var> frame;         // params, hoisted locals, hidden temporaries (saved on call unless main)
     std::vector<Var> consts;
     int hidden_n = 0;
+    int heap_frame = 0;             // bytes of local arrays taken from the top of the heap on entry
     bool is_main() const { return decl == nullptr; }
     int save_count() const {        // cells pushed on a call (not for main)
         if (is_main()) return 0;
@@ -127,12 +130,13 @@ struct LV {
     int64_t cidx = -1;                      // Elem: constant index
     int boff = 0;                           // Elem: byte offset within the element
     const Expr* ptr = nullptr;              // Heap: pointer-valued expression (null: none)
+    int64_t ptr_cell = -1;                  // Heap: or the cells of a pointer variable
     int64_t base = 0;                       // Heap: constant address part (includes constant offsets)
     const Expr* hidx = nullptr;             // Heap: runtime index, scaled by esize
     int esize = 1;
     const bf::RegisterInfo* reg = nullptr;  // Reg
     int size() const { return std::max(type->size, 1); }
-    bool const_addr() const { return kind == Heap && !ptr && !hidx; }
+    bool const_addr() const { return kind == Heap && !ptr && ptr_cell < 0 && !hidx; }
 };
 
 struct Gen {
@@ -180,7 +184,9 @@ struct Gen {
     std::vector<StmtP> synth;
     std::vector<ExprP> synth_exprs;
     TProc* cur_tp = nullptr;        // generating a trampolined body
-    int64_t state_cell = -1, alive_cell = -1, sp_cell = -1, stack_base = -1;
+    int64_t state_cell = -1, alive_cell = -1, sp_cell = -1, stack_e0 = -1, stack_base = -1;
+    int state_n = 1;                // bytes of the state cell (2 above 254 blocks)
+    int sp_n = 1;                   // bytes of the stack pointer: a byte-indexed cell array up to 256, a 16-bit walking region above
     int stack_size = 128;
 
     Gen(const std::vector<std::string>& t, int64_t ram_start) : texts(t), ram(ram_start), out(res.bf), cur(ram_start), next_free(ram_start), high(ram_start) {
@@ -361,9 +367,10 @@ struct Gen {
     }
     // Walk to the byte at the address held in addr (2 cells, consumed) and read it (dst += value)
     // or write val (consumed) into it.
-    void heap_walk(int64_t addr, int64_t val, int64_t dst, bool write) {
-        if (opt.check_heap) heap_check(addr);
-        int64_t e0 = heap_elem0;
+    void heap_walk(int64_t addr, int64_t val, int64_t dst, bool write) { walk(heap_elem0, addr, val, dst, write, opt.check_heap); }
+    // The same walk over any region laid out like the heap (e0 = cell of element 0).
+    void walk(int64_t e0, int64_t addr, int64_t val, int64_t dst, bool write, bool check) {
+        if (check) heap_check(addr);
         move(addr + 1, {{e0 + HH, 1}});
         move(addr, {{e0 + HL, 1}});
         if (write) move(val, {{e0 + HV, 1}});
@@ -927,6 +934,11 @@ struct Gen {
             const Expr& base = *t.a;
             if (base.kind == Expr::Name) {
                 Var* v = find_var(base.text);
+                if (v && v->arr_ptr) {
+                    lv.kind = LV::Heap; lv.ptr_cell = v->cell; lv.esize = std::max(t.type->size, 1);
+                    if (auto i = fold(*t.b)) lv.base = *i * lv.esize; else lv.hidx = t.b.get();
+                    return lv;
+                }
                 if (v && v->cell_array()) {
                     lv.kind = LV::Elem; lv.arr = v;
                     if (auto i = fold(*t.b)) {
@@ -996,7 +1008,8 @@ struct Gen {
     int64_t elem_cell(const LV& lv, int k) const { return array_cell(plane(*lv.arr, lv.boff + k), (int)lv.cidx); }
     // Heap address of a location into dst (2 cells, known zero).
     void eval_address(const LV& lv, int64_t dst) {
-        if (lv.ptr) eval_into(*lv.ptr, dst, T->u16());
+        if (lv.ptr_cell >= 0) copyN(lv.ptr_cell, dst, 2);
+        else if (lv.ptr) eval_into(*lv.ptr, dst, T->u16());
         if (lv.hidx) {
             int64_t t = tmp2();
             eval_into(*lv.hidx, t, T->u16());
@@ -1950,6 +1963,12 @@ struct Gen {
             if (prm.ref) {
                 if (prm.array) {
                     Var* sv = a.kind == Expr::Name ? find_var(a.text) : nullptr;
+                    if (sv && sv->arr_ptr) { v = *sv; v.owned = false; bound.push_back(v); continue; }
+                    if (sv && sv->is_const && sv->count >= 0) {           // a heap array: bind a pointer to it
+                        v.type = T->ptr(prm.type); v.arr_ptr = true; v.cell = alloc(2); setN(v.cell, 2, sv->cval);
+                        bound.push_back(v);
+                        continue;
+                    }
                     if (!sv || !sv->cell_array()) fail(a.pos, "'" + prm.name + "' needs a " + prm.type->name + " array");
                     v = *sv; v.owned = false;
                     bound.push_back(v);
@@ -2124,7 +2143,7 @@ struct Gen {
         if (args.size() != decl.params.size()) fail(pos, "'" + callee->name + "' takes " + std::to_string(decl.params.size()) + " argument(s), " + std::to_string(args.size()) + " given");
         std::vector<std::pair<const Expr*, int>> copy_out;
         for (size_t i = 0; i < args.size(); i++) {
-            if (!decl.params[i].ref) continue;
+            if (!decl.params[i].ref || decl.params[i].array) continue;
             ExprP keep = clone(*args[i]);
             copy_out.emplace_back(keep.get(), (int)i);
             synth_exprs.push_back(std::move(keep));
@@ -2165,7 +2184,13 @@ struct Gen {
         case Stmt::Decl: {
             Var v; v.name = s.name; v.type = s.vtype; v.count = s.count;
             if (s.in_heap) { v.is_const = true; v.cval = s.cval; v.owned = false; p->consts.push_back(v); return; }
-            if (s.count >= 0 && !p->is_main()) fail(s.pos, "arrays cannot be local to a rec proc; declare '" + s.name + "' at the top level");
+            if (s.count >= 0 && !p->is_main()) {
+                // a local array of a recursive procedure lives in its heap frame
+                Var a; a.name = s.name; a.type = T->ptr(s.vtype); a.arr_ptr = true; a.arr_off = p->heap_frame;
+                p->heap_frame += std::max(s.vtype->size, 1) * s.count;
+                frame_add(p, a, s.pos);
+                return;
+            }
             frame_add(p, v, s.pos);
             if (s.count >= 0) return;                      // global array: zero from the start
             if (!s.e) { Action& a = act(L, Action::Clear, &s); a.result = s.name; return; }
@@ -2265,13 +2290,17 @@ struct Gen {
         p->entry = L.block;
         if (p->decl) {
             for (const Param& prm : p->decl->params) {
-                if (prm.array) fail(prm.pos, "rec procs cannot take array parameters; use a top-level array");
                 Var v; v.name = prm.name; v.type = prm.type;
+                if (prm.array) { v.type = T->ptr(prm.type); v.arr_ptr = true; }   // passed as a pointer
                 frame_add(p, v, prm.pos);
             }
         }
         lower_stmts(body, L);
         act(L, Action::Ret, nullptr);      // implicit return at the end
+        if (p->heap_frame > 0) {
+            Action fe; fe.kind = Action::FrameEnter;
+            B(p->entry).acts.insert(B(p->entry).acts.begin(), std::move(fe));
+        }
     }
 
     // ---- trampoline: generation ------------------------------------------------------------------------------
@@ -2281,12 +2310,120 @@ struct Gen {
         for (const Var& v : p->consts) scopes.back().vars[v.name] = v;
         for (const Var& v : p->frame) { scopes.back().vars[v.name] = v; scopes.back().order.push_back(v.name); }
     }
-    void set_state_cell(int v) { set(state_cell, v); }
+    void set_state_cell(int v) { setN(state_cell, state_n, v); }
 
-    // idx = sp + off into a temporary
+    // The save stack.  Up to 256 cells it is a cell array indexed by a byte stack
+    // pointer (the array idiom); above that a walking region in cells (the heap
+    // layout of docs/HEAP.md) indexed by a 16-bit stack pointer.
+    void stack_addr(int off, int64_t a) {                 // a (2 cells, zero) = sp + off
+        copy(sp_cell, a);
+        if (sp_n == 2) copy(sp_cell + 1, a + 1);
+        addN_const(a, 2, off);
+    }
     int64_t stack_index(int off) { int64_t i = tmp(); copy(sp_cell, i); add(i, off); return i; }
-    void stack_store(int off, int64_t cell) { int64_t i = stack_index(off); int64_t v = tmp(); copy(cell, v); array_write(stack_base, i, v); drop(v); drop(i); }
-    void stack_load(int off, int64_t cell) { int64_t i = stack_index(off); clear(cell); array_read(stack_base, i, cell); drop(i); }
+    void stack_store(int off, int64_t cell) {
+        if (sp_n == 1) { int64_t i = stack_index(off); int64_t v = tmp(); copy(cell, v); array_write(stack_base, i, v); drop(v); drop(i); return; }
+        int64_t a = tmp2(); stack_addr(off, a);
+        int64_t v = tmp(); copy(cell, v);
+        walk(stack_e0, a, v, -1, true, false);
+        drop(v); drop(a, 2);
+    }
+    void stack_load(int off, int64_t cell) {
+        if (sp_n == 1) { int64_t i = stack_index(off); clear(cell); array_read(stack_base, i, cell); drop(i); return; }
+        int64_t a = tmp2(); stack_addr(off, a);
+        clear(cell);
+        walk(stack_e0, a, -1, cell, false, false);
+        drop(a, 2);
+    }
+    // Store or load a run of cells at sp+off, sp+off+1, ...: the 16-bit address is
+    // computed once and stepped.
+    void stack_run(int off, const std::vector<int64_t>& cells, bool store) {
+        if (sp_n == 1) { for (size_t k = 0; k < cells.size(); k++) { if (store) stack_store(off + (int)k, cells[k]); else stack_load(off + (int)k, cells[k]); } return; }
+        if (cells.empty()) return;
+        int64_t a = tmp2(); stack_addr(off, a);
+        for (size_t k = 0; k < cells.size(); k++) {
+            int64_t c = tmp2(); copyN(a, c, 2);
+            if (store) { int64_t v = tmp(); copy(cells[k], v); walk(stack_e0, c, v, -1, true, false); drop(v); }
+            else { clear(cells[k]); walk(stack_e0, c, -1, cells[k], false, false); }
+            drop(c, 2);
+            if (k + 1 < cells.size()) incN(a, 2);
+        }
+        release2(a);
+    }
+    std::vector<int64_t> frame_cells(const TProc* p) const {
+        std::vector<int64_t> v;
+        if (!p->is_main()) for (const Var& x : p->frame) for (int k = 0; k < x.size(); k++) v.push_back(x.cell + k);
+        return v;
+    }
+    // --check-stack: halt with a message when `need` more cells do not fit
+    void stack_check(int need) {
+        if (!opt.check_stack) return;
+        int64_t a = tmp2(); stack_addr(need, a);
+        int64_t lim = tmp2(); setN(lim, 2, stack_size + 1);
+        int64_t lt = tmp(); ltN_cells(a, lim, 2, lt, 1);
+        int64_t ge = tmp(); not8(lt, ge, 1);
+        if_nonzero(ge, [&] { halt_with("\nrecursion stack overflow\n"); });
+        release(ge); release(lt); release2(lim); release2(a);
+    }
+    void halt_with(const std::string& msg) {
+        int64_t t = tmp();
+        for (unsigned char ch : msg) { set(t, ch); go(t); out += '.'; }
+        release(t);
+        pulse_reg("HALT");
+    }
+    // a 16-bit word at a constant heap address, through a 2-cell temporary
+    void heap_word_read(int64_t addr, int64_t t) { copy(heap_cell(addr, HD), t); copy(heap_cell(addr + 1, HD), t + 1); }
+    void heap_word_write(int64_t addr, int64_t t) {
+        for (int k = 0; k < 2; k++) { int64_t c = heap_cell(addr + k, HD); clear(c); move(t + k, {{c, 1}}); }
+    }
+
+    // On entry to a procedure with local arrays: take their space from the top of
+    // the heap (the allocator's end-of-heap word goes down), point the array
+    // variables at it and zero it.
+    void frame_enter(TProc* p) {
+        int64_t e = tmp2();
+        heap_word_read(5, e);
+        addN_const(e, 2, -(int64_t)p->heap_frame);
+        if (opt.check_stack) {
+            int64_t brk = tmp2(); heap_word_read(1, brk);
+            int64_t lt = tmp(); ltN_cells(e, brk, 2, lt, 1);
+            if_nonzero(lt, [&] { halt_with("\nrecursion stack overflow: no heap left for local arrays\n"); });
+            release(lt); release2(brk);
+        }
+        for (const Var& v : p->frame) {
+            if (!v.arr_ptr || v.arr_off < 0) continue;
+            clearN(v.cell, 2);
+            copyN(e, v.cell, 2);
+            addN_const(v.cell, 2, v.arr_off);
+        }
+        // zero the block
+        int64_t a = tmp2(); copyN(e, a, 2);
+        int64_t cnt = tmp2(); setN(cnt, 2, p->heap_frame);
+        int64_t f = tmp(); nonzeroN(cnt, f, 2);
+        open(f);
+        {
+            clear(f);
+            int64_t c = tmp2(); copyN(a, c, 2);
+            int64_t z = tmp();
+            walk(heap_elem0, c, z, -1, true, false);
+            drop(z); drop(c, 2);
+            incN(a, 2);
+            decN(cnt, 2);
+            nonzeroN(cnt, f, 2);
+        }
+        close();
+        release(f); release2(cnt); release2(a);
+        heap_word_write(5, e);
+        drop(e, 2);
+    }
+    void frame_leave(TProc* p) {
+        if (p->heap_frame <= 0) return;
+        int64_t e = tmp2();
+        heap_word_read(5, e);
+        addN_const(e, 2, p->heap_frame);
+        heap_word_write(5, e);
+        drop(e, 2);
+    }
 
     void gen_tramp_return(const Expr* value, Pos pos) {
         TProc* p = cur_tp;
@@ -2294,11 +2431,24 @@ struct Gen {
         if (!p->ret && value) fail(pos, p->is_main() ? "the main program returns nothing" : "'" + p->name + "' returns nothing");
         if (value) store_result(*value, p->retval, p->ret);
         if (p->is_main()) set_state_cell(0);
-        else { int64_t i = stack_index(-1); clear(state_cell); array_read(stack_base, i, state_cell); drop(i); }
+        else {
+            frame_leave(p);
+            std::vector<int64_t> st;
+            for (int k = 0; k < state_n; k++) st.push_back(state_cell + k);
+            stack_run(-state_n, st, false);
+        }
         size_t b = ctxs.size();
         while (b-- > 0) if (ctxs[b].kind == ExitCtx::Block) break;
         if (b == (size_t)-1) internal("return outside a block");
         unwind_to(b);
+    }
+
+    // the pointer an array argument of a recursive procedure stands for
+    void array_arg_pointer(const Expr& a, int64_t t, const std::string& pname) {
+        Var* sv = a.kind == Expr::Name ? find_var(a.text) : nullptr;
+        if (sv && sv->arr_ptr) { copyN(sv->cell, t, 2); return; }
+        if (sv && sv->is_const && sv->count >= 0) { setN(t, 2, sv->cval); return; }
+        fail(a.pos, "'" + pname + "' needs a heap array: arrays held in cells have no address (declare it with 'heap')");
     }
 
     void gen_action(Action& a, LBlock& blk) {
@@ -2308,6 +2458,9 @@ struct Gen {
             return;
         case Action::SetState:
             set_state_cell(a.a);
+            return;
+        case Action::FrameEnter:
+            frame_enter(blk.owner);
             return;
         case Action::Clear: {
             Var* v = find_var(a.result);
@@ -2336,17 +2489,29 @@ struct Gen {
             std::vector<int64_t> vals;
             for (size_t i = 0; i < a.args.size(); i++) {
                 const Param& prm = decl.params[i];
-                int n = std::max(prm.type->size, 1);
+                const Var& pv = callee->frame[i];
+                int n = pv.size();
                 int64_t t = tmpN(n);
-                if (prm.ref) read_lv(lvalue(*a.args[i]), t); else eval_into(*a.args[i], t, prm.type);
+                if (prm.array) array_arg_pointer(*a.args[i], t, prm.name);
+                else if (prm.ref) read_lv(lvalue(*a.args[i]), t);
+                else eval_into(*a.args[i], t, prm.type);
                 vals.push_back(t);
             }
             // save the caller's frame and the resume state
             TProc* me = blk.owner;
-            int off = 0;
-            if (!me->is_main()) for (const Var& v : me->frame) for (int k = 0; k < v.size(); k++) stack_store(off++, v.cell + k);
-            { int64_t r = tmp(); set(r, a.a); int64_t i = stack_index(off); array_write(stack_base, i, r); drop(i); drop(r); }
-            add(sp_cell, off + 1);
+            std::vector<int64_t> cells = frame_cells(me);
+            int off = (int)cells.size();
+            stack_check(off + state_n);
+            if (sp_n == 1 && state_n == 1) {
+                stack_run(0, cells, true);
+                int64_t r = tmp(); set(r, a.a); int64_t i = stack_index(off); array_write(stack_base, i, r); drop(i); drop(r);
+            } else {
+                int64_t r = tmpN(state_n); setN(r, state_n, a.a);
+                for (int k = 0; k < state_n; k++) cells.push_back(r + k);
+                stack_run(0, cells, true);
+                releaseN(r, state_n);
+            }
+            addN_const(sp_cell, sp_n, off + state_n);
             // load the callee's parameters
             for (size_t i = 0; i < vals.size(); i++) {
                 const Var& prm = callee->frame[i];
@@ -2371,9 +2536,8 @@ struct Gen {
                 saved.push_back(t);
             }
             int n = me->save_count();
-            add(sp_cell, -(n + 1));
-            int off = 0;
-            if (!me->is_main()) for (const Var& v : me->frame) for (int k = 0; k < v.size(); k++) stack_load(off++, v.cell + k);
+            addN_const(sp_cell, sp_n, -(n + state_n));
+            stack_run(0, frame_cells(me), false);
             for (size_t i = a.copy_out.size(); i-- > 0;) {
                 LV lv = lvalue(*a.copy_out[i].first);
                 const Var& prm = a.callee->frame[(size_t)a.copy_out[i].second];
@@ -2433,19 +2597,41 @@ struct Gen {
         cur_proc.clear();
     }
 
-    // Dispatch by countdown: level k runs block k when cnt (= state - k) is 0, else
-    // decrements and tries the next level.  About ten commands per level passed.
-    void gen_dispatch(int64_t cnt, size_t k) {
-        if (k > blocks.size()) return;
+    // Dispatch by countdown over blocks first..last: level `id` runs that block when
+    // cnt (= state - id) is 0, else decrements and tries the next.  About ten
+    // commands per level passed.
+    void gen_dispatch(int64_t cnt, int id, int last) {
+        if (id > last) return;
         int64_t f = tmp(); set(f, 1);
         open(cnt);
         {
             clear(f);
             add(cnt, -1);
-            gen_dispatch(cnt, k + 1);
+            gen_dispatch(cnt, id + 1, last);
         }
         close();
-        if_nonzero(f, [&] { gen_block(blocks[k - 1]); });
+        if_nonzero(f, [&] { gen_block(blocks[(size_t)id - 1]); });
+        release(f);
+    }
+    // 16-bit state: choose the group of 256 by the high byte, then the block by the low byte.
+    void gen_dispatch16(int64_t h, int g, int groups) {
+        if (g >= groups) return;
+        int64_t f = tmp(); set(f, 1);
+        open(h);
+        {
+            clear(f);
+            add(h, -1);
+            gen_dispatch16(h, g + 1, groups);
+        }
+        close();
+        if_nonzero(f, [&] {
+            int first = std::max(1, g * 256), last = std::min((int)blocks.size(), g * 256 + 255);
+            int64_t cnt = tmp();
+            copy(state_cell, cnt);
+            add(cnt, -(first - g * 256));
+            gen_dispatch(cnt, first, last);
+            release(cnt);
+        });
         release(f);
     }
 
@@ -2461,14 +2647,18 @@ struct Gen {
         if (sr && sr->stack_size > 0) stack_size = sr->stack_size;
         lower_proc(tprocs[0].get(), prog.items);               // main first: its consts are visible to the others
         for (size_t i = 1; i < tprocs.size(); i++) lower_proc(tprocs[i].get(), tprocs[i]->decl->body);
-        if (blocks.size() > 254) fail(Pos{}, "too many trampoline blocks (" + std::to_string(blocks.size()) + "); the state cell holds 254");
-        if (stack_size > 256) fail(Pos{}, "the recursion stack holds at most 256 cells");
+        state_n = blocks.size() > 254 ? 2 : 1;
+        if (blocks.size() > 65000) fail(Pos{}, "too many trampoline blocks (" + std::to_string(blocks.size()) + ")");
 
-        stack_base = alloc((int)array_cells(stack_size));     // lowest: variables and temporaries stay close together above it
-        state_cell = alloc(1); alive_cell = alloc(1); sp_cell = alloc(1);
-        res.symbols.push_back(Symbol{"__state", state_cell, 1, 'b', 1, "", 1, false});
-        res.symbols.push_back(Symbol{"__sp", sp_cell, 1, 'b', 1, "", 1, false});
+        sp_n = stack_size > 256 ? 2 : 1;
+        if (sp_n == 1) stack_base = alloc((int)array_cells(stack_size));   // the save stack, lowest so variables stay close together
+        else stack_e0 = alloc((int)((int64_t)HK * (HOP + stack_size))) + (int64_t)HK * HOP;
+        state_cell = alloc(state_n); alive_cell = alloc(1); sp_cell = alloc(sp_n);
+        int64_t run_cell = state_n == 2 ? alloc(1) : -1;
+        res.symbols.push_back(Symbol{"__state", state_cell, state_n, state_n == 1 ? 'b' : 'w', 1, "", state_n, false});
+        res.symbols.push_back(Symbol{"__sp", sp_cell, sp_n, sp_n == 1 ? 'b' : 'w', 1, "", sp_n, false});
         res.sp_cell = sp_cell;
+        res.sp_bytes = sp_n;
         for (auto& tp : tprocs) {
             for (Var& v : tp->frame) {
                 int cells = v.count >= 0 ? (int)array_total(v) : v.size();
@@ -2482,15 +2672,29 @@ struct Gen {
         push_frame_scope(tprocs[0].get());
         scopes.back().top = true;
         set_state_cell(tprocs[0]->entry);
-        open(state_cell);
-        {
-            int64_t cnt = tmp();
-            copy(state_cell, cnt);
-            add(cnt, -1);
-            gen_dispatch(cnt, 1);
-            release(cnt);
+        if (state_n == 1) {
+            open(state_cell);
+            {
+                int64_t cnt = tmp();
+                copy(state_cell, cnt);
+                add(cnt, -1);
+                gen_dispatch(cnt, 1, (int)blocks.size());
+                release(cnt);
+            }
+            close();
+        } else {
+            set(run_cell, 1);
+            open(run_cell);
+            {
+                clear(run_cell);
+                int64_t h = tmp();
+                copy(state_cell + 1, h);
+                gen_dispatch16(h, 0, (int)blocks.size() / 256 + 1);
+                release(h);
+                nonzeroN(state_cell, run_cell, 2);
+            }
+            close();
         }
-        close();
         pop_scope();
     }
 

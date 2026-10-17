@@ -57,7 +57,7 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
                     bool inside = code[pc].src >= c->skip_lo && code[pc].src < c->skip_hi;
                     if (!inside) c->skip_left = 1;
                     if (c->stmt_mark && c->stmt_mark[pc] && (!inside || c->skip_left) &&
-                        (c->cond_cell < 0 || c->tape[c->cond_cell] == (uint8_t)c->cond_val)) reason = 1;
+                        (c->cond_cell < 0 || (int32_t)(c->tape[c->cond_cell] | (c->cond_bytes > 1 ? c->tape[c->cond_cell + 1] << 8 : 0)) == c->cond_val)) reason = 1;
                 }
                 if (!reason && c->bp && c->bp[pc]) reason = 2;
                 else if (!reason && pc == c->temp_bp) reason = 3;

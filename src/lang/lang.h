@@ -56,6 +56,7 @@ struct Result {
     std::vector<std::string> files;      // file names by index (0 = the main file)
     int64_t                 cells_used = 0;
     int64_t                 sp_cell = -1;    // trampoline stack pointer cell, -1 if no rec procs are used
+    int                     sp_bytes = 1;    // 1, or 2 for a stack of more than 256 cells
     int64_t                 heap_cell = -1;  // cell of heap byte 0's data, -1 without a heap (5 cells per byte)
     int                     heap_size = 0;   // bytes
     bool ok() const { return errors.empty(); }

@@ -796,8 +796,9 @@ void debug_step_over() {
         set_mode(Mode::DebugRunning);
         // with recursion, "over" also waits for the stack pointer to return to its current value
         int64_t sp = app.lr.sp_cell;
-        int spv = sp >= 0 ? app.machine->bus_read(sp) : 0;
-        if (s >= 0) app.dbg->step_statement(app.lr.stmts[s].start, app.lr.stmts[s].end, sp, spv); else app.dbg->step_statement(-1, -1, sp, spv);
+        int spb = app.lr.sp_bytes;
+        int spv = sp >= 0 ? app.machine->bus_read(sp) | (spb > 1 ? app.machine->bus_read(sp + 1) << 8 : 0) : 0;
+        if (s >= 0) app.dbg->step_statement(app.lr.stmts[s].start, app.lr.stmts[s].end, sp, spv, spb); else app.dbg->step_statement(-1, -1, sp, spv, spb);
         return;
     }
     if (x.op != JZ) { debug_step(); return; }

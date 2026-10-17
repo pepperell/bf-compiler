@@ -46,8 +46,9 @@ struct Ctx {
     const uint8_t* stmt_mark;     // per-pc: 1 where a source statement starts (dbg == 3 pauses there)
     int32_t        skip_lo, skip_hi;   // source range [lo, hi) whose marks are ignored while dbg == 3 ...
     int32_t        skip_left;     // ... until the program has executed something outside it (then re-entry counts)
-    int64_t        cond_cell;     // dbg == 3: pause only while tape[cond_cell] == cond_val (-1: always)
+    int64_t        cond_cell;     // dbg == 3: pause only while the 16-bit word at cond_cell == cond_val (-1: always)
     int32_t        cond_val;
+    int32_t        cond_bytes;    // 1 or 2
     int32_t        pause_reason;  // bf::Debugger::Reason
     uintptr_t      fault_addr;
     uintptr_t      fault_ptr;

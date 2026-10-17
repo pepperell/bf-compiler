@@ -203,8 +203,9 @@ the procedure uses, directly or through procedures it calls.
 procedure without a result type uses plain `return;`, and a procedure that
 reaches its closing brace returns 0. A call with a result can be used as an
 expression; a call statement discards the result. Parameters are passed by value
-unless marked `ref`; a `ref` argument must be a variable of the same type, and
-an array parameter (`ref byte name[]`) must be a byte array.
+unless marked `ref`; a `ref` argument must be a variable (or any other
+assignable location, such as `p->x`) of the same type, and an array parameter
+(`ref byte name[]`) must be an array of that element type.
 
 A plain `proc` is **inlined** at every call: its body is copied into the caller
 with its own locals, so it cannot call itself. A `rec proc` may call itself and
@@ -215,15 +216,25 @@ other `rec proc`s freely; it is compiled as a **trampoline** (docs/TRAMPOLINE.md
   that calls a `rec proc`, and the main program when it does, is compiled the
   same way (the compiler promotes them automatically).
 - The current activation's parameters and locals live in fixed cells, so the
-  watch list shows them by name (`fib.n`). A call saves them to a stack array
+  watch list shows them by name (`fib.n`). A call saves them to the save stack
   with the state to resume and a return restores them. `stack N;` at the top
-  level sets the array size in cells (default 128, at most 256); each call uses
-  one cell per parameter and local plus one. Overflow is not checked.
-- Restrictions: a `rec proc` cannot own arrays (declare them at the top level)
-  and cannot take array parameters; its `ref` parameters are copied in at the
-  call and copied back when it returns; variables declared in code that calls a
-  `rec proc` must have names unique within that procedure; the right operand of
-  `&&` / `||` containing such a call is always evaluated.
+  level sets its size in cells (default 128, at most 32768); each call uses one
+  cell per byte of parameters and locals, plus one (two above 254 blocks). Up
+  to 256 cells the stack is a fast byte-indexed array; above that it uses the
+  heap's walking layout with a 16-bit stack pointer, which costs more per call.
+  Overflow is not checked unless the program is compiled with `--check-stack`
+  (bf.exe) or Run > Check recursion stack (UI), which print
+  `recursion stack overflow` and halt.
+- Local arrays of a `rec proc` live in the heap: each call takes their space
+  from the top of the heap (the allocator's end-of-heap word moves down), zeroes
+  it, and gives it back on return. Array parameters (`ref byte a[]`) are passed
+  as pointers, so the argument must be a heap array or another such parameter
+  or local; an array held in cells has no address.
+- `ref` parameters are copied in at the call and copied back when it returns,
+  which works for any assignable argument, including heap locations.
+- Variables declared in code that calls a `rec proc` must have names unique
+  within that procedure; the right operand of `&&` / `||` containing such a
+  call is always evaluated.
 - Cost: a call is about 1 000 commands plus 70 per cell saved and restored;
   see docs/TRAMPOLINE.md for measurements.
 

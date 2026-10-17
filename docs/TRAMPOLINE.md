@@ -7,7 +7,24 @@ plus the main program; `ref` parameters are copy-in / copy-out; the stack array
 sits just above the device window so variables and temporaries stay adjacent;
 the debugger's step-over waits for the stack pointer to return to its value at
 the call. Measured on `programs/hanoi.bfl` and `programs/quicksort.bfl`:
-quicksort of 16 bytes compiles to 110 000 commands and runs in 6 ms on the JIT.
+quicksort of 16 bytes compiles to 110 000 commands and runs in 8 ms on the JIT.
+
+Phase 7 of docs/ROADMAP.md extended this:
+
+- **Save stack.** Up to 256 cells it stays the byte-indexed cell array. Above
+  that it is a region in cells with the heap's walking layout and a 16-bit stack
+  pointer; the address of a frame is computed once per call and stepped. The
+  plan's idea of keeping saved frames in the heap itself was measured and
+  dropped: every call would cost about a hundred times more. fib(20) runs in
+  74 ms on the byte stack and 122 ms on the 16-bit one.
+- **Local arrays** of trampolined procedures take their space from the top of the
+  heap at entry (the allocator's end-of-heap word is the frame pointer), are
+  zeroed, and are released on every return path. **Array parameters** are
+  pointers.
+- **More than 254 blocks** switches to a 16-bit state: the dispatcher picks the
+  group of 256 by the high byte, then the block by the low byte.
+- `--check-stack` adds an overflow check before every push (and before taking
+  heap space for local arrays).
 
 BFL inlines every procedure because brainfuck has no jump to an address, and
 because the compiler addresses every variable as a fixed cell. This note works

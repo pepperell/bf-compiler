@@ -126,10 +126,10 @@ void Debugger::set_statement_marks(const std::vector<uint8_t>& marks) {
     impl_->marks.resize(impl_->prog.code.size(), 0);
     impl_->ctx.stmt_mark = impl_->marks.data();
 }
-void Debugger::step_statement(int32_t skip_lo, int32_t skip_hi, int64_t cond_cell, int cond_val) {
+void Debugger::step_statement(int32_t skip_lo, int32_t skip_hi, int64_t cond_cell, int cond_val, int cond_bytes) {
     if (impl_->running || impl_->finished) return;
     impl_->ctx.skip_lo = skip_lo; impl_->ctx.skip_hi = skip_hi; impl_->ctx.skip_left = 0;
-    impl_->ctx.cond_cell = cond_cell; impl_->ctx.cond_val = cond_val;
+    impl_->ctx.cond_cell = cond_cell; impl_->ctx.cond_val = cond_val; impl_->ctx.cond_bytes = cond_bytes;
     impl_->post(Impl::StepStmt);
 }
 void Debugger::run_to(int32_t pc) { if (!impl_->running && !impl_->finished) { impl_->ctx.temp_bp = pc; impl_->post(Impl::Cont); } }

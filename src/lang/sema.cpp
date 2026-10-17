@@ -42,6 +42,7 @@ struct ProcSig {
     std::vector<std::string> callees;
     std::set<Sym*> globals;          // globals read or written directly
     std::vector<std::pair<std::string, Pos>> locals;   // every local declared (for the trampoline name rule)
+    bool has_array_local = false;
 };
 
 struct CallSite { std::string callee; Pos pos; int item; };
@@ -626,7 +627,7 @@ struct Sema {
             if (!s.count_e->is_const) { error(s.count_e->pos, std::string("the ") + kw + " size must be a constant"); return; }
             int64_t v = s.count_e->cval;
             if (s.kind == Stmt::Stack) {
-                if (v < 4 || v > 4096) { error(s.count_e->pos, "stack size must be 4..4096 cells"); return; }
+                if (v < 4 || v > 32768) { error(s.count_e->pos, "stack size must be 4..32768 cells"); return; }
                 R.stack_size = (int)v;
             } else {
                 if (!F.heap) { error(s.pos, "the heap is not available yet"); return; }
@@ -666,6 +667,7 @@ struct Sema {
                 const Type* it = expr(*s.e);
                 if (!it->is_error() && !t->is_error()) assignable(*s.e, t, s.e->pos);
             }
+            if (cur && s.count_e) cur->has_array_local = true;
             Sym* sym = declare(s.name, s.pos, Sym::Var);
             if (!sym) return;
             sym->type = s.count_e && !t->is_error() ? T.array(t, std::max(s.count, 1)) : t;
@@ -973,9 +975,8 @@ struct Sema {
             else seen[l.first] = l.second;
         }
         if (!proc) return;
-        for (const Param& prm : proc->params) {
-            if (prm.array) error(prm.pos, "rec procs cannot take array parameters; use a top-level array");
-        }
+        for (const Param& prm : proc->params) if (prm.array) R.uses_heap = true;      // arrays are passed as heap pointers
+        if (procs[proc->name].has_array_local) R.uses_heap = true;                   // local arrays live in the heap
     }
 };
 
