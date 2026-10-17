@@ -5,8 +5,8 @@ pointers and the heap, strings, imports, and recursion. Run one with
 `bf programs\samples\NAME.bfl`, or open it in `bfui` and press F5 (Ctrl+F5 to
 debug it statement by statement). `tests\test_lang.py` runs every sample and
 compares its output with `tests\samples\NAME.out`; `cube.bfl`,
-`starfield.bfl` and `raytracer.bfl` run until stopped, so they are only
-compiled there.
+`starfield.bfl`, `raytracer.bfl` and `raytracer_text.bfl` run until stopped,
+so they are only compiled there.
 
 | File | What it does | Features it shows |
 |------|--------------|-------------------|
@@ -21,6 +21,7 @@ compiled there.
 | `cube.bfl` | A revolving 3D wireframe cube, every frame computed live | Integer trigonometry (Bhaskara's sine), perspective, Bresenham lines, a heap frame buffer, colour escapes |
 | `starfield.bfl` | The Enterprise-D's main viewscreen: stars at impulse, then streaking at warp, with LCARS panels, Ops and Conn, and the captain giving the order | A 3D starfield with perspective, double-buffered output that sends only changed characters, 256-colour backgrounds, a pixel-map picture |
 | `raytracer.bfl` | Four reflective spheres on a checkerboard, two coloured lamps with soft shadows, the camera circling the scene on the framebuffer (about 2.3 s a frame) | Fixed-point ray tracing with incremental primary rays, screen-box culling, a precomputed floor light map in the heap, one reflection bounce, Blinn highlights, ordered dithering to RRRGGGBB |
+| `raytracer_text.bfl` | The same scene drawn as coloured text in any terminal (`bf` in Windows Terminal, xterm, the UI): 79 x 22 cells, about a second a frame | Brightness to a character ramp, colour to the nearest of 256 ANSI colours, a camera with tall cells |
 | `life.bfl` | Conway's Game of Life, animated in the terminal | Swapping heap grids through pointers, ANSI escapes, the `TICKS` clock |
 
 Things to try in the UI:

@@ -163,6 +163,11 @@ int main(int argc, char** argv) {
 
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stdin), _O_BINARY);
+    {   // let a Windows console interpret VT100 / ANSI escape sequences in the program's output
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        if (GetConsoleMode(h, &mode)) SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
     StdioConsole con;
     Machine m(cfg);
     m.set_console(&con);

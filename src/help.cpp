@@ -277,7 +277,10 @@ const wchar_t* CLI_TEXT = LR"(COMMAND LINE: bf.exe
 
 Exit code 0 when the program ends or halts, 3 on stop, fault or error.
 Ctrl+C stops a running program.  LED and number display changes are printed
-to stderr unless --quiet-devices is given.
+to stderr unless --quiet-devices is given.  In a Windows console, VT100 /
+ANSI escape sequences in the program's output (colours, cursor movement) are
+interpreted, so terminal demos such as programs\samples\raytracer_text.bfl
+animate in place.
 
 TESTS AND BUILD
   build.bat            release build to out\
