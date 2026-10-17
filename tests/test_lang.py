@@ -317,6 +317,9 @@ case("struct-nested", "struct Point { int x; int y; } struct Rect { Point a; Poi
      b"1102 9 9")
 case("struct-array-cells", "struct Point { int x; int y; } Point pts[5]; byte i; for (i = 0; i < 5; i++) { pts[i].x = int(i) * 10; pts[i].y = -int(i); } int sx = 0; int sy = 0; for (i = 0; i < 5; i++) { sx += pts[i].x; sy += pts[i].y; } print sx, \" \", sy, \" \", pts[3].x;",
      b"100 -10 30")
+case("array-wide-elements", "long a[6]; word w[5]; byte i; for (i = 0; i < 6; i++) { a[i] = long(i) * 1000003 - 7; } for (i = 0; i < 5; i++) { w[i] = word(i) * 4099; }"
+     " long s = 0; for (i = 0; i < 6; i++) { s += a[5 - i] ^ long(i); } print s, \" \", w[4], \" \", a[2], \" \", w[i - 3];",
+     b"14999996 16396 1999999 12297")
 case("struct-params-return", "struct Point { int x; int y; } proc Point mk(int x, int y) { Point p; p.x = x; p.y = y; return p; } proc int dot(Point a, Point b) { return a.x * b.x + a.y * b.y; } Point u = mk(3, -4); print dot(u, mk(2, 5)), \" \", mk(7, 8).y, \" \", u.y;",
      b"-14 8 -4")
 case("struct-ref-param", "struct Point { int x; int y; } proc shift(ref Point p, int dx) { p.x += dx; p.y -= dx; } Point a; a.x = 1; a.y = 1; shift(a, 5); shift(a, 2); print a.x, \" \", a.y;", b"8 -6")

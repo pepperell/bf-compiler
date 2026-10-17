@@ -16,9 +16,9 @@
 // N-byte routines.  The known-value map tracks cells holding compile-time
 // constants in straight-line code so that constants are emitted as short deltas.
 //
-// Storage: variables in cells; arrays in cells use the walking layout of three
-// cells per byte (docs/LANG.md), one such array ("plane") per byte of the
-// element; the heap uses the walking layout of docs/HEAP.md.
+// Storage: variables in cells; arrays in cells use a walking layout with one
+// group of 1 + 2s cells per element of s bytes (docs/LANG.md), so one walk
+// reaches all of an element; the heap uses the walking layout of docs/HEAP.md.
 //
 // Procedures are inlined.  Recursion ("rec proc") uses a trampoline: the
 // bodies of recursive procedures, of everything that calls them, and of the
@@ -329,26 +329,64 @@ struct Gen {
     }
 
     // ---- arrays in cells (see docs/LANG.md for the layout) ------------------------------------
-    void array_read(int64_t base, int64_t idx, int64_t dst) {     // idx consumed; dst += a[idx]
-        int64_t C0 = base + 3, V0 = base + 4;
+    // Element k of an array of s-byte elements is the group (C, V0..Vs-1, D0..Ds-1) at
+    // base + K*(k+1), K = 1 + 2s; the group at base is a zero header.  One walk reaches
+    // an element whatever its size, carrying every byte of it.
+    struct Walk {                       // brainfuck text with pointer moves merged
+        std::string s;
+        int64_t pend = 0;
+        void mv(int64_t d) { pend += d; }
+        void put(const char* t) { s += rel(pend); pend = 0; s += t; }
+        std::string done() { s += rel(pend); pend = 0; return s; }
+    };
+    static int64_t stride(int s) { return 1 + 2 * (int64_t)s; }
+    // dst+k += byte b+k of element idx, k < n; idx consumed
+    void elem_read(int64_t base, int s, int b, int n, int64_t idx, int64_t dst) {
+        int64_t K = stride(s), C0 = base + K;
         move(idx, {{C0, 1}});
         go(C0);
-        out += "[-[->>>+<<<]+>>>]" ">>[-<+<+>>]<<[->>+<<]" "<<<[->>>>[-<<<+>>>]<<<<<<<]";
+        Walk w;
+        w.put("[-[-"); w.mv(K); w.put("+"); w.mv(-K); w.put("]+"); w.mv(K); w.put("]");
+        for (int k = 0; k < n; k++) {                // at the element: D -> V and C, then C -> D
+            int64_t d = 1 + s + b + k, v = 1 + b + k;
+            w.mv(d); w.put("[-"); w.mv(v - d); w.put("+"); w.mv(-v); w.put("+"); w.mv(d); w.put("]"); w.mv(-d);
+            w.put("[-"); w.mv(d); w.put("+"); w.mv(-d); w.put("]");
+        }
+        w.mv(-K); w.put("[-");                      // back over the markers, carrying the V cells down
+        for (int k = 0; k < n; k++) {
+            int64_t v = 1 + b + k;
+            w.mv(K + v); w.put("[-"); w.mv(-K); w.put("+"); w.mv(K); w.put("]"); w.mv(-(K + v));
+        }
+        w.mv(-K); w.put("]");
+        out += w.done();
         cur = base; known.clear();
-        move(V0, {{dst, 1}});
+        for (int k = 0; k < n; k++) move(C0 + 1 + b + k, {{dst + k, 1}});
     }
-    void array_write(int64_t base, int64_t idx, int64_t val) {    // idx and val consumed
-        int64_t C0 = base + 3, V0 = base + 4;
+    // byte b+k of element idx = val+k, k < n; idx and val consumed
+    void elem_write(int64_t base, int s, int b, int n, int64_t idx, int64_t val) {
+        int64_t K = stride(s), C0 = base + K;
         move(idx, {{C0, 1}});
-        move(val, {{V0, 1}});
+        for (int k = 0; k < n; k++) move(val + k, {{C0 + 1 + b + k, 1}});
         go(C0);
-        out += "[-[->>>+<<<]+>[->>>+<<<]>>]" ">>[-]<[->+<]<" "<<<[-<<<]";
+        Walk w;
+        w.put("[-[-"); w.mv(K); w.put("+"); w.mv(-K); w.put("]+");
+        for (int k = 0; k < n; k++) {               // carry the value forward
+            int64_t v = 1 + b + k;
+            w.mv(v); w.put("[-"); w.mv(K); w.put("+"); w.mv(-K); w.put("]"); w.mv(-v);
+        }
+        w.mv(K); w.put("]");
+        for (int k = 0; k < n; k++) {               // at the element: D = V
+            int64_t d = 1 + s + b + k, v = 1 + b + k;
+            w.mv(d); w.put("[-]"); w.mv(v - d); w.put("[-"); w.mv(d - v); w.put("+"); w.mv(v - d); w.put("]"); w.mv(-v);
+        }
+        w.mv(-K); w.put("[-"); w.mv(-K); w.put("]");  // back, clearing the markers
+        out += w.done();
         cur = base; known.clear();
     }
-    static int64_t array_cells(int count) { return 3 * ((int64_t)count + 1); }
-    // Cells of a whole array variable: one byte array per byte of the element.
-    static int64_t array_total(const Var& v) { return array_cells(v.count) * v.size(); }
-    static int64_t plane(const Var& v, int byte) { return v.cell + array_cells(v.count) * byte; }
+    void array_read(int64_t base, int64_t idx, int64_t dst) { elem_read(base, 1, 0, 1, idx, dst); }     // byte arrays
+    void array_write(int64_t base, int64_t idx, int64_t val) { elem_write(base, 1, 0, 1, idx, val); }
+    static int64_t array_cells(int count, int s = 1) { return stride(s) * ((int64_t)count + 1); }
+    static int64_t array_total(const Var& v) { return array_cells(v.count, v.size()); }
 
     // ---- the heap (docs/HEAP.md) --------------------------------------------------------------
     int64_t heap_cell(int64_t addr, int field) const { return heap_elem0 + HK * addr + field; }
@@ -827,7 +865,7 @@ struct Gen {
             for (size_t i = s.order.size(); i-- > 0;) {
                 const Var& v = s.vars[s.order[i]];
                 if (!v.owned || v.is_const) continue;
-                if (v.count >= 0) { for (int b = 0; b < v.size(); b++) for (int k = 0; k < v.count; k++) clear(array_cell(plane(v, b), k)); }
+                if (v.count >= 0) { for (int b = 0; b < v.size(); b++) for (int k = 0; k < v.count; k++) clear(array_cell(v.cell, k, b, v.size())); }
                 else clearN(v.cell, v.size());
             }
             next_free = s.mark;
@@ -845,7 +883,7 @@ struct Gen {
         if (!mapping() || !t) return;
         int es = std::max(t->size, 1);
         if (count >= 0) {
-            res.symbols.push_back(Symbol{name, cell, (int)(array_cells(count) * es), 'a', count, scope, es, t->is_signed});
+            res.symbols.push_back(Symbol{name, cell, (int)array_cells(count, es), 'a', count, scope, es, t->is_signed});
             return;
         }
         if (t->kind == TK::Struct) {
@@ -1059,7 +1097,7 @@ struct Gen {
         }
         return true;
     }
-    int64_t elem_cell(const LV& lv, int k) const { return array_cell(plane(*lv.arr, lv.boff + k), (int)lv.cidx); }
+    int64_t elem_cell(const LV& lv, int k) const { return array_cell(lv.arr->cell, (int)lv.cidx, lv.boff + k, lv.arr->size()); }
     // Heap address of a location into dst (2 cells, known zero).
     void eval_address(const LV& lv, int64_t dst) {
         if (lv.ptr_cell >= 0) copyN(lv.ptr_cell, dst, 2);
@@ -1087,9 +1125,8 @@ struct Gen {
             if (!lv.index) { for (int k = 0; k < n; k++) copy(elem_cell(lv, k), dst + k); return; }
             int64_t i = tmp();
             eval8(*lv.index, i);
-            if (n == 1) { array_read(plane(v, lv.boff), i, dst); drop(i); return; }
-            for (int k = 0; k < n; k++) { int64_t c = tmp(); copy(i, c); array_read(plane(v, lv.boff + k), c, dst + k); drop(c); }
-            release(i);
+            elem_read(v.cell, v.size(), lv.boff, n, i, dst);
+            drop(i);
             return;
         }
         case LV::Heap: {
@@ -1119,9 +1156,8 @@ struct Gen {
             if (!lv.index) { for (int k = 0; k < n; k++) { int64_t c = elem_cell(lv, k); clear(c); move(val + k, {{c, 1}}); } return; }
             int64_t i = tmp();
             eval8(*lv.index, i);
-            if (n == 1) { array_write(plane(v, lv.boff), i, val); drop(i); return; }
-            for (int k = 0; k < n; k++) { int64_t c = tmp(); copy(i, c); array_write(plane(v, lv.boff + k), c, val + k); drop(c); }
-            release(i);
+            elem_write(v.cell, v.size(), lv.boff, n, i, val);
+            drop(i);
             return;
         }
         case LV::Heap: {
@@ -1724,7 +1760,7 @@ struct Gen {
             // runtime index into a byte array
             int64_t t = tmp(); eval8(e, t);
             int64_t i = tmp(); eval8(*lv.index, i);
-            array_write(plane(*lv.arr, lv.boff), i, t);
+            elem_write(lv.arr->cell, lv.arr->size(), lv.boff, 1, i, t);
             drop(i); drop(t);
             return;
         }

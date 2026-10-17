@@ -73,7 +73,10 @@ std::string format_error(const Result& r, const Error& e, const char* kind = nul
 // Text form of the statement map and symbols, written next to --emit output.
 std::string describe(const Result& r);
 
-// The element data cell of a byte array declared at `base` (for debuggers).
-inline int64_t array_cell(int64_t base, int index) { return base + 3 + 3 * index + 2; }
+// The cell holding byte `byte` of element `index` of an array in cells declared at
+// `base` with `size`-byte elements (docs/LANG.md; for debuggers).
+inline int64_t array_cell(int64_t base, int index, int byte = 0, int size = 1) {
+    return base + (1 + 2 * (int64_t)size) * ((int64_t)index + 1) + 1 + size + byte;
+}
 
 } // namespace bfl

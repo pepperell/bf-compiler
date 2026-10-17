@@ -426,6 +426,11 @@ These are the building blocks; knowing them helps read the output and write
   temporary, and walks back `<<<[->>>>[-<<<+>>>]<<<<<<<]` carrying the value,
   clearing the markers. A write carries index and value down together and
   returns over the markers. Element *k*'s data cell is `base + 3 + 3k + 2`.
+- **Arrays of wider elements** use the same walk with a group of `K = 1 + 2s`
+  cells per element of `s` bytes: `(C, V₀…Vₛ₋₁, D₀…Dₛ₋₁)`, after a zero header
+  group. One walk carries every byte that is read or written (a field of a
+  struct element carries only its own bytes), so a `long` element costs one walk,
+  not four. Byte *b* of element *k* is at `base + K·(k+1) + 1 + s + b`.
 
 ## Limits and non-features
 

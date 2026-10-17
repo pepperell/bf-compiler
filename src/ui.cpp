@@ -377,11 +377,10 @@ void auto_watches() {
             swprintf(buf, 128, L"%s  %llX", name.c_str(), (long long)v.cell);
             add(v.cell, buf, cells, v.is_signed, v.kind == 'p');
         } else {
-            // one plane per byte of the element (docs/LANG.md): byte b of element k is in plane b
-            int64_t plane = 3 * ((int64_t)v.count + 1);
+            // each element is one group of cells holding all its bytes (docs/LANG.md)
             for (int k = 0; k < v.count && k < 16; k++) {
                 std::vector<int64_t> cells;
-                for (int b = 0; b < v.elem && b < 8; b++) cells.push_back(bfl::array_cell(v.cell + plane * b, k));
+                for (int b = 0; b < v.elem && b < 8; b++) cells.push_back(bfl::array_cell(v.cell, k, b, v.elem));
                 swprintf(buf, 128, L"%s[%d]  %llX", name.c_str(), k, (long long)cells[0]);
                 add(cells[0], buf, cells, v.is_signed && v.elem <= 8, false);
             }
