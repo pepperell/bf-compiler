@@ -491,9 +491,13 @@ void gen_update() {
         for (char c : app.lr.bf) { if (c == '\n') w += L"\r\n"; else w += (wchar_t)(unsigned char)c; }
     }
     SetWindowTextW(app.genedit, w.c_str());
-    wchar_t buf[160];
+    wchar_t buf[200];
     if (app.lr.bf.empty()) wcscpy(buf, app.lang ? L"No program compiled yet." : L"The editor holds brainfuck, not BFL.");
-    else swprintf(buf, 160, L"%zu commands, %zu bytes annotated, %lld cells of variables and temporaries", commands, app.lr.bf.size(), (long long)app.lr.cells_used);
+    else {
+        Program p = compile(app.lr.bf, true);
+        swprintf(buf, 200, L"%zu commands (%zu bytes annotated), %lld cells  ->  %zu IR instructions  ->  %zu bytes of x64 code",
+                 commands, app.lr.bf.size(), (long long)app.lr.cells_used, p.code.size(), jit_code_size(p));
+    }
     if (app.gen_info) SetWindowTextW(app.gen_info, buf);
 }
 
@@ -544,8 +548,8 @@ bool load_file(const std::wstring& path) {
     set_lang(is_bfl_path(path));
     if (!compile_editor(true)) return false;
     wchar_t buf[256];
-    if (app.lang) swprintf(buf, 256, L"Loaded BFL: %zu bytes of brainfuck (%lld cells), %zu IR instructions. F5 runs, Ctrl+F5 debugs, Ctrl+B shows the brainfuck.", app.lr.bf.size(), (long long)app.lr.cells_used, app.prog.code.size());
-    else swprintf(buf, 256, L"Loaded: %zu commands, %zu IR instructions. F5 runs, Ctrl+F5 debugs.", app.prog.raw_ops, app.prog.code.size());
+    if (app.lang) swprintf(buf, 256, L"Loaded BFL: %zu brainfuck commands, %lld cells, %zu IR instructions, %zu bytes of x64. F5 runs, Ctrl+F5 debugs, Ctrl+B shows the brainfuck.", app.prog.raw_ops, (long long)app.lr.cells_used, app.prog.code.size(), jit_code_size(app.prog));
+    else swprintf(buf, 256, L"Loaded: %zu commands, %zu IR instructions, %zu bytes of x64. F5 runs, Ctrl+F5 debugs.", app.prog.raw_ops, app.prog.code.size(), jit_code_size(app.prog));
     set_status(buf);
     return true;
 }
@@ -845,11 +849,11 @@ void fb_show(bool show) {
 LRESULT CALLBACK gen_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_SIZE: {
-        int cw = LOWORD(l), ch = HIWORD(l), bar = px(30), bh = px(24), y = px(3), x = px(6);
+        int cw = LOWORD(l), ch = HIWORD(l), bar = px(52), bh = px(24), y = px(3), x = px(6);
         MoveWindow(app.gen_annotated, x, y, px(230), bh, TRUE); x += px(236);
         MoveWindow(app.gen_compact, x, y, px(180), bh, TRUE);   x += px(186);
-        MoveWindow(app.gen_copy, x, y, px(60), bh, TRUE);       x += px(70);
-        MoveWindow(app.gen_info, x, y + px(4), std::max(10, cw - x - px(6)), bh, TRUE);
+        MoveWindow(app.gen_copy, x, y, px(60), bh, TRUE);
+        MoveWindow(app.gen_info, px(8), y + bh + px(4), std::max(10, cw - px(16)), px(18), TRUE);
         MoveWindow(app.genedit, 0, bar, cw, std::max(10, ch - bar), TRUE);
         return 0;
     }

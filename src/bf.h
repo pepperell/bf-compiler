@@ -60,6 +60,8 @@ struct Program {
 // folding), which is what the debugger steps through.
 Program     compile(const std::string& source, bool optimise = true);
 std::string disassemble(const Program& p);
+// Size in bytes of the x64 code the JIT produces for p (0 if it cannot be compiled).
+size_t      jit_code_size(const Program& p);
 
 // ---- hardware -----------------------------------------------------------------
 struct Device {

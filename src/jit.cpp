@@ -70,6 +70,11 @@ struct Fixup { size_t at; int32_t target_pc; };
 
 JitCode::~JitCode() { if (mem) VirtualFree(mem, 0, MEM_RELEASE); }
 
+size_t jit_code_size(const Program& p) {
+    JitCode jc;
+    return jit_compile(p, jc) ? jc.size : 0;
+}
+
 bool jit_compile(const Program& p, JitCode& out) {
     const auto& code = p.code;
     const size_t n = code.size();

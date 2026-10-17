@@ -121,7 +121,9 @@ int main(int argc, char** argv) {
             std::ofstream o(emit_path, std::ios::binary), m(emit_path + ".map", std::ios::binary);
             if (!o || !m) { fprintf(stderr, "cannot write %s\n", emit_path.c_str()); return 2; }
             o << lr.bf; m << bfl::describe(lr);
-            fprintf(stderr, "%zu bytes of brainfuck, %lld cells\n", lr.bf.size(), (long long)lr.cells_used);
+            Program lp = compile(lr.bf, true);
+            fprintf(stderr, "%zu commands (%zu bytes annotated), %lld cells, %zu IR instructions, %zu bytes of x64\n",
+                    lp.raw_ops, lr.bf.size(), (long long)lr.cells_used, lp.code.size(), jit_code_size(lp));
             return 0;
         }
         src = lr.bf;
