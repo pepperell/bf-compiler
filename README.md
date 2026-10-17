@@ -88,6 +88,16 @@ line, and the watch list is filled with the program's variables by name.
 `tests/golden/` holds their generated code, and `tests\test_lang.py` fails if it
 changes (run it with `--update-golden` after a deliberate codegen change).
 
+## Example programs
+
+`programs/` holds small demos for the devices (`leds`, `serial_echo`, `fb`) in
+brainfuck and in BFL. `programs/thirdparty/` holds programs by other authors:
+Erik Bosman's `mandelbrot.b`, and 32 programs by Daniel B. Cristofani from
+brainfuck.org (CC BY-SA 4.0) including a self-interpreter, a universal Turing
+machine, Life, tic-tac-toe, quines, sorts and streaming digits of e. Its README
+lists what each one does and what input to give it, and the test suite runs the
+terminating ones through every executor.
+
 ## Speed
 
 Source is compiled to an optimised IR and then to x64 machine code at run time.

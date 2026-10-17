@@ -127,6 +127,49 @@ def readme_matches_regs():
     return False, "README.md register table differs from `bf --regs`; paste its output into the README"
 
 
+TP = os.path.join(os.path.dirname(__file__), "..", "programs", "thirdparty", "cristofani")
+FEN = b"rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2\n"
+# Daniel B. Cristofani's programs (programs/thirdparty/README.md): file, stdin.  EOF reads as 0.
+THIRDPARTY = [
+    ("392quine", b""), ("400quine", b""), ("dquine", b""),
+    ("bsort", b"the quick brown fox"), ("isort", b"the quick brown fox"), ("qsort", b"the quick brown fox"),
+    ("chessboard", FEN), ("collatz", b"27\n97\n871\n"), ("dbf2c", b"++++++++[>++++++++<-]>+."),
+    ("dbfi", b"++++++++[>++++++++<-]>+.+.+.!"), ("dvorak", b"hello world\n"),
+    ("head", b"".join(b"line %d\n" % i for i in range(1, 16))), ("jabh", b""),
+    ("life", b"bc\ncd\nbd\nad\n\n\n\nq\n"), ("numwarp", b"3.14159\n"), ("rot13", b"Hello, World!\n"),
+    ("sierpinski", b""), ("squares", b""), ("tictactoe", b"1\n2\n3\n4\n5\n6\n7\n8\n9\n"),
+    ("utm", b"b1b1bbb1c1c11111d\n"), ("wc", b"one two three\nfour five\n"), ("xmastree", b"5\n"),
+    ("bounce", b"  ^  \n /  \\\n\n\n\n\n"),
+]
+
+
+def run_path(path, stdin, flags):
+    r = subprocess.run([BF, path, "--eof", "0", "--quiet-devices"] + flags, input=stdin, capture_output=True, timeout=60)
+    return r.returncode, r.stdout, r.stderr.decode("latin-1")
+
+
+def thirdparty_cases():
+    """Real programs through all three executors, checked against the reference interpreter."""
+    fails = 0
+    for name, stdin in THIRDPARTY:
+        path = os.path.join(TP, name + ".b")
+        src = open(path, encoding="latin-1").read()
+        expected = reference(src, stdin, "0")
+        results = {label: run_path(path, stdin, flags) for label, flags in (("jit", []), ("interp", ["--interp"]), ("noopt", ["--no-opt"]))}
+        ok = all(r[0] == 0 and r[1] == expected for r in results.values())
+        if ok and name.endswith("quine"):
+            # a quine's output, run again, must reproduce itself
+            again = subprocess.run([BF, "-e", expected.decode("latin-1"), "--quiet-devices"], capture_output=True, timeout=60).stdout
+            ok = again == expected
+        print(("PASS " if ok else "FAIL ") + "thirdparty-" + name)
+        if not ok:
+            fails += 1
+            print("   expected:", expected[:200])
+            for k, v in results.items():
+                print(f"   {k}: rc={v[0]} out={v[1][:200]!r} err={v[2].strip()!r}")
+    return fails
+
+
 def main():
     fails = 0
     ok, why = readme_matches_regs()
@@ -134,6 +177,7 @@ def main():
     if not ok:
         fails += 1
         print("   " + why)
+    fails += thirdparty_cases()
     for case in CASES:
         name, src, stdin, eof, expected, devices = case[:6]
         extra = list(case[6]) if len(case) > 6 else []
@@ -158,7 +202,8 @@ def main():
             print("   expected:", expected)
             for k, v in results.items():
                 print(f"   {k}: rc={v[0]} out={v[1]!r} err={v[2]!r}")
-    print(f"{len(CASES) + 1 - fails}/{len(CASES) + 1} passed")
+    total = len(CASES) + 1 + len(THIRDPARTY)
+    print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 
 

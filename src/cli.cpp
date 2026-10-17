@@ -22,9 +22,22 @@ namespace {
 struct StdioConsole : ConsoleIo {
     std::vector<uint8_t> buf;
     bool tty_in = _isatty(_fileno(stdin)) != 0;
+    bool tty_out = _isatty(_fileno(stdout)) != 0;
+    ULONGLONG last_flush = GetTickCount64();
     StdioConsole() { buf.reserve(1 << 16); }
-    void out(uint8_t c) override { buf.push_back(c); if (buf.size() >= (1 << 16)) flush(); }
-    void flush() override { if (!buf.empty()) { fwrite(buf.data(), 1, buf.size(), stdout); buf.clear(); } fflush(stdout); }
+    // Buffered for speed, but never held back long: a slow streaming program
+    // (digits of e, say) shows output within 50 ms, and a terminal gets whole lines.
+    void out(uint8_t c) override {
+        buf.push_back(c);
+        if (buf.size() >= (1 << 16) || (tty_out && c == '\n')) { flush(); return; }
+        ULONGLONG now = GetTickCount64();
+        if (now - last_flush >= 50) flush();
+    }
+    void flush() override {
+        if (!buf.empty()) { fwrite(buf.data(), 1, buf.size(), stdout); buf.clear(); }
+        fflush(stdout);
+        last_flush = GetTickCount64();
+    }
     int in() override {
         flush();
         if (tty_in) { int c = _getch(); if (c == '\r') c = '\n'; if (c == 26 || c == 4) return -1; putchar(c); fflush(stdout); return c & 255; }
