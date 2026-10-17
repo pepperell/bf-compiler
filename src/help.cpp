@@ -327,6 +327,20 @@ EXPRESSIONS
   Numbers with an L suffix (5L) are long.
   && and || only evaluate the right side when needed.
 
+ALLOCATION AND STRINGS
+  Node* n = new Node;  int* a = new int[100];  byte* b = alloc(64);  free(n);
+  Blocks are zeroed; null when the heap is full.  First fit, no merging.
+  string s = "hello";         a string is a byte* to bytes ending in 0
+  print s;                    prints the text
+
+IMPORTS AND THE STANDARD LIBRARY
+  import "strings.bfl";       next to this file first, then the standard library
+  strings.bfl   strlen strcpy strcat strcmp strchr strdup utoa ltoa atol
+  math.bfl      min max abs clamp (int); gcd isqrt pow (dword)
+  io.bfl        read_byte read_line(buf, size) read_long
+  memory.bfl    memset memcpy memcmp heap_unused
+  Each file is included once; a name defined in two files is an error.
+
 STRUCTS
   struct Point { int x; int y; }      fields in order, no padding
   Point p;  p.x = 3;  Point q = p;    in cells; copied, passed and returned by value

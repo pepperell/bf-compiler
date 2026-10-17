@@ -1,0 +1,45 @@
+// io.bfl - reading text input.
+//
+//     import "io.bfl";
+//
+// End of input reads as 0 in all of these (the byte read is cleared first).
+
+// One byte, or 0 at the end of input.
+proc byte read_byte() {
+    byte c = 0;
+    c = in;
+    return c;
+}
+
+// A line into buf (at most size - 1 bytes are kept, then a 0); returns its length.
+// The newline is not stored; a carriage return before it is dropped.
+proc word read_line(string buf, word size) {
+    word n = 0;
+    byte c = 0;
+    c = in;
+    while (c != 10 && c != 0) {
+        if (c != 13 && n + 1 < size) { buf[n] = c; n++; }
+        c = 0;
+        c = in;
+    }
+    buf[n] = 0;
+    return n;
+}
+
+// A decimal number: skips spaces and newlines, then an optional '-' and digits.
+// Stops at (and consumes) the first byte that is not a digit.
+proc long read_long() {
+    byte c = 0;
+    c = in;
+    while (c == ' ' || c == 9 || c == 10 || c == 13) { c = 0; c = in; }
+    byte neg = 0;
+    if (c == '-') { neg = 1; c = 0; c = in; }
+    long v = 0;
+    while (c >= '0' && c <= '9') {
+        v = v * 10 + (c - '0');
+        c = 0;
+        c = in;
+    }
+    if (neg) { return -v; }
+    return v;
+}

@@ -1,0 +1,111 @@
+// prelude.bfl - built into every BFL program.
+//
+// print, input, the string printer and the heap allocator are written in BFL
+// itself.  Like any procedure they are inlined where they are used, and only
+// then; the debugger steps over them.  Names starting with __ are reserved.
+
+proc __print_byte(byte v) {
+    byte h = v / 100;
+    byte r = v % 100;
+    byte t = r / 10;
+    byte u = r % 10;
+    if (h) { out h + '0'; }
+    if (h || t) { out t + '0'; }
+    out u + '0';
+}
+proc __print_sbyte(sbyte v) {
+    if (v < 0) { out '-'; __print_byte(byte(-v)); } else { __print_byte(byte(v)); }
+}
+proc __pw_digit(ref word v, word d, ref byte started) {
+    byte q = 0;
+    while (v >= d) { v -= d; q++; }
+    if (q || started) { out q + '0'; started = 1; }
+}
+proc __print_word(word v) {
+    byte started = 0;
+    __pw_digit(v, 10000, started);
+    __pw_digit(v, 1000, started);
+    __pw_digit(v, 100, started);
+    __pw_digit(v, 10, started);
+    out v + '0';
+}
+proc __print_int(int v) {
+    if (v < 0) { out '-'; __print_word(word(-v)); } else { __print_word(word(v)); }
+}
+proc __pd_digit(ref dword v, dword d, ref byte started) {
+    byte q = 0;
+    while (v >= d) { v -= d; q++; }
+    if (q || started) { out q + '0'; started = 1; }
+}
+proc __print_dword(dword v) {
+    byte started = 0;
+    __pd_digit(v, 1000000000, started);
+    __pd_digit(v, 100000000, started);
+    __pd_digit(v, 10000000, started);
+    __pd_digit(v, 1000000, started);
+    __pd_digit(v, 100000, started);
+    __pd_digit(v, 10000, started);
+    __pd_digit(v, 1000, started);
+    __pd_digit(v, 100, started);
+    __pd_digit(v, 10, started);
+    out byte(v) + '0';
+}
+proc __print_long(long v) {
+    if (v < 0) { out '-'; __print_dword(dword(-v)); } else { __print_dword(dword(v)); }
+}
+proc __print_str(byte* s) {
+    while (*s) { out *s; s++; }
+}
+proc __read_word(ref word w) {
+    w = 0;
+    byte c = in;
+    while (c >= '0' && c <= '9') {
+        w = w * 10 + (c - '0');
+        c = in;
+    }
+}
+
+// ---- the heap allocator ------------------------------------------------------------
+// Heap words at fixed addresses: 1 the break (next never-used byte),
+// 3 the head of the free list, 5 the end of the heap.  A block is a 2-byte
+// payload size followed by the payload; alloc returns the payload.  A free
+// block keeps the next free block's address in its first two payload bytes.
+// First fit, splitting big blocks; freed blocks are not merged.
+
+proc byte* alloc(word n) {
+    if (n < 2) { n = 2; }
+    word prev = 0;
+    word cur = *(word*)3;
+    while (cur) {
+        word size = *(word*)(cur - 2);
+        if (size >= n) {
+            word next = *(word*)cur;
+            if (size >= n + 4) {
+                word rest = cur + n + 2;
+                *(word*)(rest - 2) = size - n - 2;
+                *(word*)rest = next;
+                next = rest;
+                *(word*)(cur - 2) = n;
+            }
+            if (prev) { *(word*)prev = next; } else { *(word*)3 = next; }
+            byte* p = (byte*)cur;
+            word i;
+            for (i = 0; i < n; i++) { p[i] = 0; }
+            return p;
+        }
+        prev = cur;
+        cur = *(word*)cur;
+    }
+    word b = *(word*)1;
+    word e = b + n + 2;
+    if (e > *(word*)5 || e < b) { return null; }
+    *(word*)b = n;
+    *(word*)1 = e;
+    return (byte*)(b + 2);
+}
+
+proc free(byte* p) {
+    if (!p) { return; }
+    *(word*)p = *(word*)3;
+    *(word*)3 = word(p);
+}

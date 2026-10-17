@@ -33,6 +33,7 @@ struct StmtRange {
     int32_t start, end;     // [start, end) in the output text
     int     depth;          // nesting level (0 = top level)
     bool    cont;           // continuation of a statement split by a rec call (no step mark)
+    int     file = 0;       // index into Result::files
 };
 
 struct Symbol {

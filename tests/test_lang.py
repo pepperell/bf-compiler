@@ -17,7 +17,14 @@ BF = ARGS[0] if ARGS else os.path.join(os.path.dirname(__file__), "..", "out", "
 TMP = tempfile.mkdtemp(prefix="bfl")
 
 
+EXTRA_FILES = {}      # name -> text, written next to t.bfl for the current case
+
+
 def run(src, stdin=b"", flags=(), expect_rc=0):
+    for name, text in EXTRA_FILES.items():
+        os.makedirs(os.path.dirname(os.path.join(TMP, name)) or TMP, exist_ok=True)
+        with open(os.path.join(TMP, name), "w", newline="\n") as f:
+            f.write(text)
     path = os.path.join(TMP, "t.bfl")
     with open(path, "w", newline="\n") as f:
         f.write(src)
@@ -82,6 +89,8 @@ DIAGS = [
     ("err-struct-self", "struct S { S inner; }", ["1:12: a struct cannot contain itself; use a pointer"], (), 1),
     ("err-dot-on-pointer", "struct Point { int x; int y; } heap Point h[1]; Point* p = h; p.x = 1;", ["1:64: 'Point*' is a pointer: use '->'"], (), 1),
     ("err-cell-struct-runtime-index", "struct B { byte d[3]; } B b; byte i = 1; b.d[i] = 2;", ["1:46: an array field of a struct held in cells needs a constant index; put the struct in the heap"], (), 1),
+    ("err-import-missing", 'import "nope.bfl";', ["1:1: cannot find 'nope.bfl' next to this file or in the standard library"], (), 1),
+    ("warn-library-quiet", 'import "strings.bfl"; import "math.bfl"; byte x = 1; out x;', [], ["--warn"], 0),
     ("err-int-range", "int a = 40000; sbyte s = 300;",
      ["1:9: value 40000 does not fit an int", "1:26: value 300 does not fit a sbyte"], (), 1),
     ("diag-global-after-call", "f(); byte g = 0; proc f() { g++; }",
@@ -251,11 +260,39 @@ GRIDS = [
 CASES = []
 
 
-def case(name, src, expected, stdin=b"", extra=()):
-    CASES.append((name, src, expected, stdin, extra))
+def case(name, src, expected, stdin=b"", extra=(), files=None):
+    CASES.append((name, src, expected, stdin, extra, files or {}))
 
 
 case("hello", 'out "Hello\\n";', b"Hello\n")
+# ---- allocator and strings (phase 5) ----
+case("string-literal", 'string s = "hello"; print s, " ", s[1]; out s[4], 10; string t = "hello"; print t == s;', b"hello 101o\n1")
+case("alloc-free", "byte* a = alloc(10); byte* b = alloc(20); a[0] = 'a'; b[19] = 'b'; out a[0], b[19]; print \" \", b - a; free(a); byte* c = alloc(8); print \" \", c == a, \" \", c[0];",
+     b"ab 12 1 0")
+case("new-struct", "struct Node { int val; Node* next; } Node* head = null; byte i; for (i = 1; i <= 5; i++) { Node* n = new Node; n->val = int(i) * 10; n->next = head; head = n; } int s = 0; while (head) { s += head->val; Node* d = head; head = head->next; free(d); } print s;",
+     b"150")
+case("new-array", "int* a = new int[20]; byte i; for (i = 0; i < 20; i++) { a[i] = int(i) * int(i); } print a[19], \" \", a[7]; long* b = new long; *b = -5; print \" \", *b;", b"361 49 -5")
+case("alloc-exhaust", "heap 64; byte* p = alloc(40); byte* q = alloc(40); print p != null, q == null;", b"11")
+case("alloc-reuse-split", "byte* a = alloc(30); free(a); byte* b = alloc(4); byte* c = alloc(4); print b == a, \" \", c - b;", b"1 6")
+case("strings-lib", 'import "strings.bfl"; heap byte buf[40]; strcpy(buf, "brain"); strcat(buf, "fuck"); print buf, " ", strlen(buf), " ", strcmp(buf, "brainfuck"), " ", strcmp("abc", "abd") < 0, " ", strchr(buf, 102); string d = strdup(buf); d[0] = 66; print " ", d, " ", buf;',
+     b"brainfuck 9 0 1 5 Brainfuck brainfuck")
+case("strings-numbers", 'import "strings.bfl"; heap byte b[16]; print ltoa(-2147483648, b), " ", utoa(4000000000, b), " ", ltoa(0, b), " "; print atol("-12345") + 5, " ", atol("77x");',
+     b"-2147483648 4000000000 0 -12340 77")
+
+# ---- imports and the standard library (phase 6) ----
+case("import-math", 'import "math.bfl"; print min(-5, 3), " ", max(-5, 3), " ", abs(-300), " ", clamp(500, 0, 255), " ", gcd(1071, 462), " ", isqrt(1000000), " ", isqrt(99), " ", pow(3, 13);',
+     b"-5 3 300 255 21 1000 9 1594323")
+case("import-io", 'import "io.bfl"; heap byte line[20]; word n = read_line(line, 20); print n, ":", line; long a = read_long(); long b = read_long(); print " ", a + b, " ", read_byte();',
+     b"5:hello -42 0", b"hello\r\n 58 -100x")
+case("import-memory", 'import "memory.bfl"; heap byte a[8]; heap byte b[8]; memset(a, 7, 8); memcpy(b, a, 6); print b[5], b[6], " ", memcmp(a, b, 8) > 0, " ", heap_unused() > 7000;',
+     b"70 1 1")
+case("import-relative", 'import "helper.bfl"; print twice(21), " ", LIMIT;', b"42 99",
+     files={"helper.bfl": "const LIMIT = 99;\nproc byte twice(byte x) { return x * 2; }\n"})
+case("import-once-cycle", 'import "a.bfl"; import "b.bfl"; print fa(), fb();', b"12",
+     files={"a.bfl": 'import "b.bfl";\nproc byte fa() { return 1; }\n', "b.bfl": 'import "a.bfl";\nproc byte fb() { return 2; }\n'})
+case("import-subdir", 'import "sub/x.bfl"; print fx();', b"7",
+     files={"sub/x.bfl": 'import "y.bfl";\nproc byte fx() { return fy() + 1; }\n', "sub/y.bfl": "proc byte fy() { return 6; }\n"})
+
 # ---- structs (phase 4) ----
 case("struct-basics", "struct Point { int x; int y; } Point p; p.x = -3; p.y = 7; print p.x + p.y; Point q = p; q.x = 10; print \" \", p.x, \" \", q.x, \" \", q.y, \" \", sizeof(Point);",
      b"4 -3 10 7 4")
@@ -463,7 +500,8 @@ def main():
     fails = 0
     if not golden(update):
         fails += 1
-    for name, src, expected, stdin, extra in CASES:
+    for name, src, expected, stdin, extra, files in CASES:
+        EXTRA_FILES.clear(); EXTRA_FILES.update(files)
         if not check(name, src, expected, stdin, extra):
             fails += 1
     pairs8 = [(0, 0), (1, 0), (0, 1), (7, 3), (3, 7), (255, 1), (1, 255), (200, 100), (100, 200), (128, 128), (255, 255), (16, 4), (85, 170), (250, 7)]
@@ -494,12 +532,13 @@ def main():
         ("err-ref-needs-var", "proc f(ref byte a) { } f(1);", "must be a variable"),
         ("err-syntax", "byte x = ;", "expression"),
         ("err-unterminated-string", 'out "abc;', "unterminated string"),
-        ("err-string-in-expr", 'byte x = "a";', "string"),
+        ("err-string-in-expr", 'byte x = "a";', "cannot convert 'byte*' to 'byte'"),
         ("err-pulse-var", "byte x; pulse x;", "not a register"),
     ]
     for name, src, frag in errors:
         if not check_error(name, src, frag):
             fails += 1
+    EXTRA_FILES.clear()
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1

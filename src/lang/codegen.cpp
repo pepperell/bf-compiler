@@ -28,10 +28,16 @@
 #include "ast.h"
 #include "sema.h"
 #include "../registers.h"
+#include "stdlib_gen.h"
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <climits>
 #include <cstring>
 #include <functional>
+#include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -41,70 +47,11 @@ namespace bfl {
 
 namespace {
 
-// Procedures written in BFL itself; inlined like user procedures but kept
-// out of the statement map so the debugger steps over them.
-const char* PRELUDE = R"(
-proc __print_byte(byte v) {
-    byte h = v / 100;
-    byte r = v % 100;
-    byte t = r / 10;
-    byte u = r % 10;
-    if (h) { out h + '0'; }
-    if (h || t) { out t + '0'; }
-    out u + '0';
+// The standard library (lib/*.bfl), embedded at build time by tools/embed.cpp.
+const char* stdlib_text(const std::string& name) {
+    for (const EmbeddedFile& f : kStdLib) if (name == f.name) return f.text;
+    return nullptr;
 }
-proc __print_sbyte(sbyte v) {
-    if (v < 0) { out '-'; __print_byte(byte(-v)); } else { __print_byte(byte(v)); }
-}
-proc __pw_digit(ref word v, word d, ref byte started) {
-    byte q = 0;
-    while (v >= d) { v -= d; q++; }
-    if (q || started) { out q + '0'; started = 1; }
-}
-proc __print_word(word v) {
-    byte started = 0;
-    __pw_digit(v, 10000, started);
-    __pw_digit(v, 1000, started);
-    __pw_digit(v, 100, started);
-    __pw_digit(v, 10, started);
-    out v + '0';
-}
-proc __print_int(int v) {
-    if (v < 0) { out '-'; __print_word(word(-v)); } else { __print_word(word(v)); }
-}
-proc __pd_digit(ref dword v, dword d, ref byte started) {
-    byte q = 0;
-    while (v >= d) { v -= d; q++; }
-    if (q || started) { out q + '0'; started = 1; }
-}
-proc __print_dword(dword v) {
-    byte started = 0;
-    __pd_digit(v, 1000000000, started);
-    __pd_digit(v, 100000000, started);
-    __pd_digit(v, 10000000, started);
-    __pd_digit(v, 1000000, started);
-    __pd_digit(v, 100000, started);
-    __pd_digit(v, 10000, started);
-    __pd_digit(v, 1000, started);
-    __pd_digit(v, 100, started);
-    __pd_digit(v, 10, started);
-    out byte(v) + '0';
-}
-proc __print_long(long v) {
-    if (v < 0) { out '-'; __print_dword(dword(-v)); } else { __print_dword(dword(v)); }
-}
-proc __print_str(byte* s) {
-    while (*s) { out *s; s++; }
-}
-proc __read_word(ref word w) {
-    w = 0;
-    byte c = in;
-    while (c >= '0' && c <= '9') {
-        w = w * 10 + (c - '0');
-        c = in;
-    }
-}
-)";
 
 // Heap walking layout (docs/HEAP.md): HK cells per byte, coarse hops of HOP bytes.
 constexpr int HK = 5, HOP = 16;
@@ -189,7 +136,7 @@ struct LV {
 };
 
 struct Gen {
-    const std::string& src;
+    const std::vector<std::string>& texts;      // source text by file index
     int64_t ram;
     Result res;
     std::string& out;
@@ -197,7 +144,7 @@ struct Gen {
     std::vector<int64_t> loops;
     std::unordered_map<int64_t, int> known;      // cell -> constant value (RAM cells below the heap only)
     int64_t next_free, high;
-    std::vector<int32_t> line_starts;
+    std::vector<std::vector<int32_t>> line_starts;
     Types* T = nullptr;
     Options opt;
     const SemaResult* sr = nullptr;
@@ -225,6 +172,7 @@ struct Gen {
     std::vector<size_t> stmt_stack;
     int prelude_depth = 0;
     Program prelude;
+    std::vector<std::string> file_names;
 
     // trampoline
     std::vector<std::unique_ptr<TProc>> tprocs;
@@ -235,18 +183,22 @@ struct Gen {
     int64_t state_cell = -1, alive_cell = -1, sp_cell = -1, stack_base = -1;
     int stack_size = 128;
 
-    Gen(const std::string& s, int64_t ram_start) : src(s), ram(ram_start), out(res.bf), cur(ram_start), next_free(ram_start), high(ram_start) {
-        line_starts.push_back(0);
-        for (size_t i = 0; i < s.size(); i++) if (s[i] == '\n') line_starts.push_back((int32_t)i + 1);
+    Gen(const std::vector<std::string>& t, int64_t ram_start) : texts(t), ram(ram_start), out(res.bf), cur(ram_start), next_free(ram_start), high(ram_start) {
+        for (const std::string& s : texts) {
+            line_starts.emplace_back(1, 0);
+            for (size_t i = 0; i < s.size(); i++) if (s[i] == '\n') line_starts.back().push_back((int32_t)i + 1);
+        }
     }
 
     [[noreturn]] void fail(Pos p, const std::string& m) { throw Fail{p, m}; }
     [[noreturn]] void internal(const std::string& m) { throw Fail{Pos{0, 0, 0, 0}, "internal compiler error: " + m}; }
     static const Type* ret_of(const Stmt* d) { return d->vtype; }
 
-    int line_of(int32_t off) const {
-        auto it = std::upper_bound(line_starts.begin(), line_starts.end(), off);
-        return (int)(it - line_starts.begin());
+    int line_of(int file, int32_t off) const {
+        if (file < 0 || file >= (int)line_starts.size()) return 0;
+        const auto& ls = line_starts[(size_t)file];
+        auto it = std::upper_bound(ls.begin(), ls.end(), off);
+        return (int)(it - ls.begin());
     }
 
     // ---- registers --------------------------------------------------------------
@@ -1565,7 +1517,8 @@ struct Gen {
     // ---- statement map ----------------------------------------------------------------------------------
     bool mapping() const { return prelude_depth == 0; }
     void begin_stmt(const Stmt& s, bool cont = false) {
-        if (!mapping()) return;
+        if (!mapping() || s.pos.file < 0 || s.pos.file >= (int)texts.size()) return;
+        const std::string& src = texts[(size_t)s.pos.file];
         int line = s.pos.line;
         size_t a = (size_t)s.pos.off, b = a;
         while (b < src.size() && src[b] != '\n' && b < (size_t)s.end.off) b++;
@@ -1574,9 +1527,11 @@ struct Gen {
         while (!text.empty() && isspace((unsigned char)text.back())) text.pop_back();
         out += '\n';
         out.append(stmt_stack.size() * 2, ' ');
-        out += "# L" + std::to_string(line) + (cont ? " (continued): " : ": ") + text + "\n";
+        std::string where = s.pos.file > 0 ? std::filesystem::path(file_names[(size_t)s.pos.file]).filename().string() + " " : std::string();
+        for (char& c : where) if (strchr("+-<>.,[]", c)) c = '_';
+        out += "# " + where + "L" + std::to_string(line) + (cont ? " (continued): " : ": ") + text + "\n";
         out.append(stmt_stack.size() * 2, ' ');
-        StmtRange r{line, s.pos.col, line_of(std::max(s.pos.off, s.end.off - 1)), (int32_t)out.size(), 0, (int)stmt_stack.size(), cont};
+        StmtRange r{line, s.pos.col, line_of(s.pos.file, std::max(s.pos.off, s.end.off - 1)), (int32_t)out.size(), 0, (int)stmt_stack.size(), cont, s.pos.file};
         stmt_stack.push_back(res.stmts.size());
         res.stmts.push_back(r);
     }
@@ -1608,10 +1563,19 @@ struct Gen {
     static bool has_exit(const std::vector<StmtP>& v) { for (auto& x : v) if (may_exit(*x)) return true; return false; }
 
     // ---- statements -------------------------------------------------------------------------------------------
+    std::unordered_map<const Stmt*, int64_t> prealloc;     // cells reserved for declarations after an early exit
     void gen_stmts(const std::vector<StmtP>& v, size_t from = 0) {
         for (size_t i = from; i < v.size(); i++) {
             gen_stmt(*v[i]);
             if (i + 1 < v.size() && !ctxs.empty() && ctxs.back().needs && may_exit(*v[i])) {
+                // the rest runs only while the context is alive; its variables belong to
+                // this scope, so their cells are reserved now, below the test's temporary
+                for (size_t j = i + 1; j < v.size(); j++) {
+                    const Stmt& d = *v[j];
+                    if (d.kind != Stmt::Decl || d.in_heap || prealloc.count(&d)) continue;
+                    Var tv; tv.type = d.vtype; tv.count = d.count;
+                    prealloc[&d] = alloc((int)(d.count >= 0 ? array_total(tv) : tv.size()));
+                }
                 int64_t t = tmp();
                 copy(ctxs.back().alive, t);
                 if_nonzero(t, [&] { gen_stmts(v, i + 1); });
@@ -1759,11 +1723,14 @@ struct Gen {
             declare(v, s.pos);
             return;
         }
+        auto pre = prealloc.find(&s);
         if (s.count >= 0) {
-            v.cell = alloc((int)array_total(v));
+            v.cell = pre != prealloc.end() ? pre->second : alloc((int)array_total(v));
+            if (pre != prealloc.end()) prealloc.erase(pre);
         } else {
             int n = v.size();
-            v.cell = alloc(n);
+            v.cell = pre != prealloc.end() ? pre->second : alloc(n);
+            if (pre != prealloc.end()) prealloc.erase(pre);
             if (s.e) {
                 auto k = v.type->is_scalar() ? fold(*s.e) : std::nullopt;
                 if (k) for (int b = 0; b < n; b++) add(v.cell + b, (*k >> (8 * b)) & 255);
@@ -2561,28 +2528,99 @@ static Features current_features() {
     Features f;
     f.wide_ints = true;
     f.heap = true;
-    f.alloc = false;
+    f.alloc = true;
     f.structs = true;
     return f;
 }
 
+namespace {
+
+// Loads files for import statements: next to the importing file first, then the
+// standard library.  Every file is loaded once; its items replace the first
+// import statement that names it.
+struct Importer {
+    std::vector<std::string>& names;
+    std::vector<std::string>& texts;
+    std::vector<std::string> dirs;
+    std::set<int> libs;
+    std::map<std::string, int> loaded;      // key -> file index
+    std::vector<ParseError>& errors;
+
+    void expand(Program& prog, int file) {
+        std::vector<StmtP> outv;
+        for (StmtP& s : prog.items) {
+            if (s->kind != Stmt::Import) { outv.push_back(std::move(s)); continue; }
+            int idx = load(s->name, file, s->pos);
+            if (idx < 0) continue;
+            std::vector<ParseError> perr;
+            Program sub = parse(texts[(size_t)idx], idx, perr);
+            for (const ParseError& e : perr) errors.push_back(e);
+            expand(sub, idx);
+            for (StmtP& x : sub.items) outv.push_back(std::move(x));
+        }
+        prog.items = std::move(outv);
+    }
+    // returns the new file's index, or -1 when it is already loaded or missing
+    int load(const std::string& name, int from, Pos pos) {
+        namespace fs = std::filesystem;
+        std::string key, text;
+        bool lib = false;
+        std::error_code ec;
+        fs::path candidate = dirs[(size_t)from].empty() ? fs::path() : fs::path(dirs[(size_t)from]) / name;
+        if (!candidate.empty() && fs::is_regular_file(candidate, ec)) {
+            key = fs::weakly_canonical(candidate, ec).string();
+            if (loaded.count(key)) return -1;
+            std::ifstream f(candidate, std::ios::binary);
+            std::stringstream ss; ss << f.rdbuf(); text = ss.str();
+        } else if (const char* t = stdlib_text(name)) {
+            key = "<std>/" + name;
+            if (loaded.count(key)) return -1;
+            text = t; lib = true;
+        } else {
+            errors.push_back(ParseError{pos, "cannot find '" + name + "' next to this file or in the standard library"});
+            return -1;
+        }
+        int idx = (int)texts.size();
+        loaded[key] = idx;
+        names.push_back(lib ? "<std>/" + name : candidate.string());
+        texts.push_back(text);
+        dirs.push_back(lib ? std::string() : candidate.parent_path().string());
+        if (lib) libs.insert(idx);
+        return idx;
+    }
+};
+
+} // namespace
+
 Result compile(const std::string& source, uint32_t ram_start, const Options& opt) {
+    namespace fs = std::filesystem;
     Result res;
+    std::vector<std::string> texts{source};
     res.files.push_back(opt.file_name.empty() ? "<source>" : opt.file_name);
     auto err = [&](const Pos& p, const std::string& m) { res.errors.push_back(Error{p.line, p.col, m, p.file}); };
     std::vector<ParseError> perr;
     Program prog = parse(source, 0, perr);
+    Importer imp{res.files, texts, {}, {}, {}, perr};
+    {
+        std::error_code ec;
+        fs::path mp(opt.file_name);
+        imp.dirs.push_back(!opt.file_name.empty() && fs::is_regular_file(mp, ec) ? mp.parent_path().string() : std::string());
+        if (imp.dirs[0].empty() && !opt.file_name.empty() && opt.file_name[0] != '<') imp.dirs[0] = ".";
+    }
+    imp.expand(prog, 0);
     for (const ParseError& e : perr) err(e.pos, e.msg);
     if (!res.errors.empty()) return res;
     Types types;
     Program prelude;
     try {
-        prelude = parse(PRELUDE, -1);
+        const char* pt = stdlib_text("prelude.bfl");
+        if (!pt) throw ParseError{Pos{}, "prelude.bfl is missing from the standard library"};
+        prelude = parse(pt, -1);
     } catch (const ParseError& e) {
         err(Pos{}, "internal compiler error in the prelude: " + e.msg);
         return res;
     }
-    SemaResult sr = analyse(prelude, prog, types, current_features(), opt.warnings);
+    SemaResult sr = analyse(prelude, prog, types, current_features(), opt.warnings, imp.libs, res.files);
     auto by_pos = [](const Diag& a, const Diag& b) {
         if (a.pos.file != b.pos.file) return a.pos.file < b.pos.file;
         return a.pos.line != b.pos.line ? a.pos.line < b.pos.line : a.pos.col < b.pos.col;
@@ -2596,8 +2634,9 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
     // One pass without a heap, or two: the first finds how many cells the
     // variables need, the second places the heap just above them.
     auto generate = [&](int64_t heap_lo, bool dry) -> std::unique_ptr<Gen> {
-        auto g = std::make_unique<Gen>(source, ram_start);
+        auto g = std::make_unique<Gen>(texts, ram_start);
         g->T = &types; g->opt = opt; g->sr = &sr; g->dry = dry;
+        g->file_names = res.files;
         g->prelude = std::move(prelude);
         if (heap_lo != INT64_MAX) {
             g->heap_lo = heap_lo;
@@ -2640,9 +2679,11 @@ std::string format_error(const Result& r, const Error& e, const char* kind) {
 }
 
 std::string describe(const Result& r) {
-    std::string s = "# statement map: S line col end_line start end depth cont\n";
+    std::string s = "# files: F index name\n";
+    for (size_t i = 0; i < r.files.size(); i++) s += "F " + std::to_string(i) + " " + r.files[i] + "\n";
+    s += "# statement map: S line col end_line start end depth cont file\n";
     char buf[256];
-    for (const StmtRange& m : r.stmts) { snprintf(buf, sizeof buf, "S %d %d %d %d %d %d %d\n", m.line, m.col, m.end_line, m.start, m.end, m.depth, m.cont ? 1 : 0); s += buf; }
+    for (const StmtRange& m : r.stmts) { snprintf(buf, sizeof buf, "S %d %d %d %d %d %d %d %d\n", m.line, m.col, m.end_line, m.start, m.end, m.depth, m.cont ? 1 : 0, m.file); s += buf; }
     s += "# symbols: V name kind cell cells count scope\n";
     for (const Symbol& v : r.symbols) { snprintf(buf, sizeof buf, "V %s %c 0x%llX %d %d %s\n", v.name.c_str(), v.kind, (long long)v.cell, v.cells, v.count, v.scope.c_str()); s += buf; }
     if (r.sp_cell >= 0) { snprintf(buf, sizeof buf, "# trampoline stack pointer cell 0x%llX\n", (long long)r.sp_cell); s += buf; }

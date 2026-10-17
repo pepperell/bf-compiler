@@ -119,6 +119,48 @@ Rules:
 - Each byte of a multi-byte value is a separate access, so reading a `long`
   through a pointer costs four walks.
 
+## Allocation and strings
+
+```
+Node* n = new Node;          // a zeroed Node in the heap, or null when the heap is full
+int* a = new int[100];       // an array
+byte* raw = alloc(64);       // 64 zeroed bytes
+free(n);                     // give a block back (free(null) does nothing)
+
+string s = "hello";          // a string literal is a byte* to NUL-terminated bytes
+print s, " ", s[1];          // print writes a string's text
+```
+
+`alloc`, `free` and `new` are part of the built-in prelude (`lib/prelude.bfl`),
+written in BFL. The allocator is first fit over a free list with a two-byte size
+header per block; big free blocks are split, freed blocks are not merged, and
+there is no garbage collector. Blocks come back zeroed. The allocator's state
+lives in heap bytes 1 to 6, so `heap N;` bounds everything. Identical string
+literals share one copy; they are written into the heap at start-up, and changing
+one through a pointer changes it for every use.
+
+## Imports and the standard library
+
+```
+import "strings.bfl";        // the standard library
+import "shapes.bfl";         // a file next to this one (or "lib/shapes.bfl" below it)
+```
+
+An import includes a file's procedures, structs, constants and variables at that
+point, once: importing the same file again (including through a cycle) does
+nothing. The path is looked up next to the importing file first, then in the
+standard library, which is compiled into `bf.exe` and `bfui.exe` from `lib/`.
+Names are global: a clash between two files is an error that names both places.
+Warnings are not reported for the standard library.
+
+| File | Contents |
+|------|----------|
+| `strings.bfl` | `strlen`, `strcpy`, `strcat`, `strcmp`, `strchr`, `strdup`, `utoa`, `ltoa`, `atol` |
+| `math.bfl` | `min`, `max`, `abs`, `clamp` (int); `gcd`, `isqrt`, `pow` (dword) |
+| `io.bfl` | `read_byte`, `read_line(buf, size)`, `read_long` |
+| `memory.bfl` | `memset`, `memcpy`, `memcmp`, `heap_unused` |
+| `prelude.bfl` | built in: decimal print and input, the string printer, `alloc`, `free` |
+
 ## Statements
 
 ```

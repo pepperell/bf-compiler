@@ -70,7 +70,15 @@ struct Sema {
         R.errors.push_back(Diag{p, m});
         if (R.errors.size() >= 20) throw Abort{};
     }
-    void warning(Pos p, const std::string& m) { if (warn && !in_prelude) R.warnings.push_back(Diag{p, m}); }
+    std::set<int> quiet_files;
+    std::vector<std::string> file_names;
+    // " (first at FILE line N)" when the earlier declaration is in another file
+    std::string first_at(Pos first, Pos now) const {
+        if (first.file == now.file) return "";
+        std::string f = first.file >= 0 && first.file < (int)file_names.size() ? file_names[(size_t)first.file] : std::string("the prelude");
+        return " (first at " + f + " line " + std::to_string(first.line) + ")";
+    }
+    void warning(Pos p, const std::string& m) { if (warn && !in_prelude && !quiet_files.count(p.file)) R.warnings.push_back(Diag{p, m}); }
     void need_heap() { if (!in_prelude) R.uses_heap = true; }
     std::map<std::string, int64_t> strings;     // literal -> heap address
     int64_t heap_alloc(int64_t bytes, Pos p) {   // static heap space for arrays and literals
@@ -96,7 +104,7 @@ struct Sema {
     Sym* declare(const std::string& n, Pos p, Sym::K k) {
         if (find_reg(n)) { error(p, "'" + n + "' is a register name"); return nullptr; }
         auto& sc = scopes.back();
-        if (sc.count(n)) { error(p, "'" + n + "' is already declared in this scope"); return nullptr; }
+        if (sc.count(n)) { error(p, "'" + n + "' is already declared in this scope" + first_at(sc[n]->pos, p)); return nullptr; }
         syms.push_back(Sym{});
         Sym* s = &syms.back();
         s->k = k; s->name = n; s->pos = p;
@@ -817,7 +825,7 @@ struct Sema {
 
     // ---- procedures ----------------------------------------------------------------------------------
     void signature(Stmt& s, bool prelude) {
-        if (procs.count(s.name)) { error(s.pos, "procedure '" + s.name + "' is already defined"); return; }
+        if (procs.count(s.name)) { error(s.pos, "procedure '" + s.name + "' is already defined" + first_at(procs[s.name].decl->pos, s.pos)); return; }
         if (find_reg(s.name)) { error(s.pos, "'" + s.name + "' is a register name"); return; }
         ProcSig ps;
         ps.decl = &s; ps.prelude = prelude; ps.item = prelude ? -1 : item;
@@ -973,8 +981,11 @@ struct Sema {
 
 } // namespace
 
-SemaResult analyse(Program& prelude, Program& prog, Types& types, const Features& f, bool warnings) {
+SemaResult analyse(Program& prelude, Program& prog, Types& types, const Features& f, bool warnings, const std::set<int>& quiet_files,
+                   const std::vector<std::string>& file_names) {
     Sema s(types, f, warnings);
+    s.quiet_files = quiet_files;
+    s.file_names = file_names;
     try { s.run(prelude, prog); } catch (const Abort&) {}
     return std::move(s.R);
 }

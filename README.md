@@ -78,9 +78,12 @@ while (led) { LEDS = led; wait_ms(60); led = led << 1; }
 halt;
 ```
 
-Bytes and 16-bit words, arrays with variable index, `if`/`while`/`for`/`break`,
-the usual operators, `out`/`print`/`in`/`input`, `pulse` for trigger registers,
-`asm { }` for raw brainfuck, procedures with return values, and recursion:
+Signed and unsigned 8, 16 and 32-bit integers, pointers into a heap of up to
+64 KB with `new` and `free`, structs, strings, arrays of any type,
+`if`/`while`/`for`/`break`, the usual operators, `out`/`print`/`in`/`input`,
+`pulse` for trigger registers, `asm { }` for raw brainfuck, `import` with a
+standard library in `lib/` (strings, math, io, memory), procedures with return
+values, and recursion:
 `rec proc` compiles a procedure as a trampoline with an explicit stack array
 (`docs/TRAMPOLINE.md`), so `programs/hanoi.bfl` and `programs/quicksort.bfl`
 are written the way they would be in C. `bf --emit prog.b prog.bfl` writes the generated
@@ -177,7 +180,10 @@ src/interp.cpp  IR interpreter: reference executor and the JIT's slow path
 src/machine.cpp tape, device bus, run loop, stop and fault handling
 src/devices.h   the standard devices above
 src/registers.h the register table: memory map, access, kind (single source of truth)
-src/lang/       the BFL compiler: parse.cpp (lexer, parser), codegen.cpp (brainfuck emitter)
+src/lang/       the BFL compiler: parse.cpp (lexer, parser), sema.cpp (types and checks),
+                codegen.cpp (brainfuck emitter)
+lib/            the BFL standard library, embedded into the executables at build time
+tools/          embed.cpp (the build step that embeds lib/), heap_proto.py (docs/HEAP.md)
 src/cli.cpp     bf.exe
 src/ui.cpp      bfui.exe
 ```

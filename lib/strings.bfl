@@ -1,0 +1,93 @@
+// strings.bfl - NUL-terminated byte strings in the heap.
+//
+//     import "strings.bfl";
+//
+// A string is a byte* (the type 'string' is the same thing) pointing at bytes
+// that end with a 0.  String literals are such strings.  Buffers must be big
+// enough: none of these procedures checks.
+
+// Number of bytes before the terminating 0.
+proc word strlen(string s) {
+    word n = 0;
+    while (s[n]) { n++; }
+    return n;
+}
+
+// Copy src, including its terminating 0, to dst.
+proc strcpy(string dst, string src) {
+    word i = 0;
+    while (src[i]) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+// Append src to the string in dst.
+proc strcat(string dst, string src) {
+    strcpy(dst + strlen(dst), src);
+}
+
+// Negative, zero or positive as a sorts before, equal to or after b.
+proc int strcmp(string a, string b) {
+    word i = 0;
+    while (a[i] && a[i] == b[i]) { i++; }
+    return int(a[i]) - int(b[i]);
+}
+
+// Index of the first c in s, or -1.
+proc int strchr(string s, byte c) {
+    word i = 0;
+    while (s[i]) {
+        if (s[i] == c) { return int(i); }
+        i++;
+    }
+    return -1;
+}
+
+// A new heap copy of s (free it when done), or null when the heap is full.
+proc string strdup(string s) {
+    word n = strlen(s);
+    string d = alloc(n + 1);
+    if (d) { strcpy(d, s); }
+    return d;
+}
+
+// The decimal text of v in buf (12 bytes are always enough); returns buf.
+proc string utoa(dword v, string buf) {
+    byte d[10];
+    byte n = 0;
+    while (v) {
+        dword q = v / 10;
+        d[n] = byte(v - q * 10) + '0';
+        v = q;
+        n++;
+    }
+    if (n == 0) { d[0] = '0'; n = 1; }
+    word i = 0;
+    while (n) { n--; buf[i] = d[n]; i++; }
+    buf[i] = 0;
+    return buf;
+}
+
+// The decimal text of v, with a '-' when negative; returns buf.
+proc string ltoa(long v, string buf) {
+    if (v < 0) {
+        buf[0] = '-';
+        utoa(dword(-v), buf + 1);
+    } else {
+        utoa(dword(v), buf);
+    }
+    return buf;
+}
+
+// The number at the start of s: an optional '-', then digits.
+proc long atol(string s) {
+    word i = 0;
+    byte neg = 0;
+    if (s[0] == '-') { neg = 1; i = 1; }
+    long v = 0;
+    while (s[i] >= '0' && s[i] <= '9') {
+        v = v * 10 + (s[i] - '0');
+        i++;
+    }
+    if (neg) { return -v; }
+    return v;
+}

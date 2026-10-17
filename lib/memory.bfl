@@ -1,0 +1,32 @@
+// memory.bfl - working with heap memory.
+//
+//     import "memory.bfl";
+//
+// alloc(n), free(p) and new T are built in (see prelude.bfl); these add the
+// usual block operations.  Pointers are byte*, so any pointer converts.
+
+// Set n bytes at p to v.
+proc memset(byte* p, byte v, word n) {
+    word i;
+    for (i = 0; i < n; i++) { p[i] = v; }
+}
+
+// Copy n bytes from s to d (the blocks must not overlap).
+proc memcpy(byte* d, byte* s, word n) {
+    word i;
+    for (i = 0; i < n; i++) { d[i] = s[i]; }
+}
+
+// Compare n bytes: negative, zero or positive.
+proc int memcmp(byte* a, byte* b, word n) {
+    word i;
+    for (i = 0; i < n; i++) {
+        if (a[i] != b[i]) { return int(a[i]) - int(b[i]); }
+    }
+    return 0;
+}
+
+// Bytes the allocator has never handed out (freed blocks are not counted).
+proc word heap_unused() {
+    return *(word*)5 - *(word*)1;
+}

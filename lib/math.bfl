@@ -1,0 +1,48 @@
+// math.bfl - integer helpers.
+//
+//     import "math.bfl";
+//
+// min, max, abs and clamp work on int (16-bit signed); the others on dword.
+
+proc int min(int a, int b) { if (a < b) { return a; } return b; }
+proc int max(int a, int b) { if (a > b) { return a; } return b; }
+proc int abs(int a) { if (a < 0) { return -a; } return a; }
+
+proc int clamp(int v, int lo, int hi) {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// Greatest common divisor (Euclid).
+proc dword gcd(dword a, dword b) {
+    while (b) {
+        dword t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+// The largest r with r * r <= n (Newton's method).
+proc dword isqrt(dword n) {
+    if (n < 2) { return n; }
+    dword x = n;
+    dword y = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    return x;
+}
+
+// b to the power e, wrapping at 32 bits.
+proc dword pow(dword b, byte e) {
+    dword r = 1;
+    while (e) {
+        if (e % 2) { r *= b; }
+        b *= b;
+        e /= 2;
+    }
+    return r;
+}

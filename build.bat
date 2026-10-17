@@ -8,10 +8,16 @@ if errorlevel 1 ( echo could not set up the MSVC environment & exit /b 1 )
 cd /d "%~dp0"
 if not exist out mkdir out
 
-set CXX=/nologo /std:c++20 /utf-8 /EHsc /W4 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /MT /Fo:out\ /Fd:out\
+set CXX=/nologo /std:c++20 /utf-8 /EHsc /W4 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /MT /Fo:out\ /Fd:out\ /Iout
 if "%1"=="debug" ( set CXX=%CXX% /Od /Zi /DDEBUG ) else ( set CXX=%CXX% /O2 /Oi /GL /DNDEBUG )
 set LNK=/link /OPT:REF /OPT:ICF
 if not "%1"=="debug" set LNK=%LNK% /LTCG
+
+rem the standard library (lib\*.bfl) is embedded into the compiler
+cl /nologo /std:c++20 /EHsc /O2 tools\embed.cpp /Fe:out\embed.exe /Fo:out\ /link /SUBSYSTEM:CONSOLE >nul
+if errorlevel 1 ( echo could not build tools\embed.cpp & exit /b 1 )
+out\embed.exe out\stdlib_gen.h lib
+if errorlevel 1 exit /b 1
 
 set CORE=src\ir.cpp src\jit.cpp src\interp.cpp src\machine.cpp src\debugger.cpp src\lang\parse.cpp src\lang\sema.cpp src\lang\codegen.cpp
 

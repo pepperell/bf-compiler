@@ -35,6 +35,9 @@ struct SemaResult {
 
 // Checks prelude + program (prelude procedures first, unchecked for warnings)
 // and annotates both.  `types` owns all types referred to by the annotations.
-SemaResult analyse(Program& prelude, Program& prog, Types& types, const Features& f, bool warnings);
+// Warnings are not reported for files in quiet_files (the standard library).
+// file_names (by Pos::file) lets messages about clashes between files name both.
+SemaResult analyse(Program& prelude, Program& prog, Types& types, const Features& f, bool warnings,
+                   const std::set<int>& quiet_files = {}, const std::vector<std::string>& file_names = {});
 
 } // namespace bfl
