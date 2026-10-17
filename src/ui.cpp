@@ -17,6 +17,7 @@
 // request_stop(), bus_read(), the Debugger API and the thread-safe devices.
 #include "bf.h"
 #include "devices.h"
+#include "hw.h"
 #include "terminal.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -50,8 +51,10 @@ enum : int {
     ID_EDITOR, ID_CONSOLE, ID_MEMVIEW, ID_MEM_ADDR, ID_MEM_GO, ID_MEM_PREV, ID_MEM_NEXT, ID_MEM_PTR, ID_MEM_START, ID_MEM_DEV, ID_MEM_AUTO,
     ID_MEM_FOCUS, ID_BAUD0, ID_BAUD1, ID_BAUD2, ID_BAUD3, ID_BAUD4,
     ID_TB_SPEED, ID_TB_INTERP,
-    ID_WATCHLIST, ID_WATCH_ADD, ID_WATCH_PTR, ID_WATCH_REMOVE, ID_WATCH_DEV
+    ID_WATCHLIST, ID_WATCH_ADD, ID_WATCH_PTR, ID_WATCH_REMOVE, ID_WATCH_DEV,
+    ID_VIEW_FB, ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400   // ID_SER_COM_BASE + n = COMn
 };
+enum : UINT { WM_APP_FBSHOW = WM_APP + 10 };
 const int BAUDS[5] = {0, 115200, 38400, 9600, 2400};
 enum : int { TIMER_MEM = 1 };
 
@@ -97,6 +100,10 @@ struct App {
     UINT  dpi = 96;
     Machine*   machine = nullptr;
     StdDevices dev;
+    SerialDevice      ser;
+    FramebufferDevice fb;
+    HWND  fbwnd = nullptr;
+    std::vector<std::string> com_ports;
     UiConsole  con;
     Program    prog;
     std::wstring path;
@@ -450,6 +457,7 @@ void start_run() {
     if (!app.prog.error.empty()) { set_status(L"Compile error: " + widen(app.prog.error)); return; }
     term::clear(app.console);
     app.dev.reset();
+    app.fb.clear();
     app.machine->reset();
     app.have_last = false;
     set_mode(Mode::Running);
@@ -517,6 +525,7 @@ void start_debug() {
     for (size_t i = 0; i < app.prog.code.size(); i++) app.pc_of_src.emplace(app.prog.code[i].src, (int32_t)i);
     term::clear(app.console);
     app.dev.reset();
+    app.fb.clear();
     app.machine->reset();
     app.have_last = false;
     app.dbg = std::make_unique<Debugger>(*app.machine, app.prog, [](Debugger::Event e) {
@@ -579,6 +588,73 @@ void stop_any() {
     else if (app.dbg) app.dbg->stop();
 }
 
+// ---- framebuffer window -------------------------------------------------------------------
+constexpr int FB_SCALE = 5;
+
+LRESULT CALLBACK fb_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE: SetTimer(h, 1, 30, nullptr); return 0;
+    case WM_TIMER: if (app.fb.dirty.exchange(false)) InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        static uint32_t pix[FramebufferDevice::W * FramebufferDevice::H];
+        for (int i = 0; i < FramebufferDevice::W * FramebufferDevice::H; i++) {
+            COLORREF c = FramebufferDevice::colour(app.fb.pixels[i]);
+            pix[i] = (uint32_t)(GetRValue(c) << 16 | GetGValue(c) << 8 | GetBValue(c));
+        }
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = FramebufferDevice::W;
+        bi.bmiHeader.biHeight = -FramebufferDevice::H;      // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        RECT rc; GetClientRect(h, &rc);
+        SetStretchBltMode(dc, COLORONCOLOR);
+        StretchDIBits(dc, 0, 0, rc.right, rc.bottom, 0, 0, FramebufferDevice::W, FramebufferDevice::H, pix, &bi, DIB_RGB_COLORS, SRCCOPY);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_CLOSE: ShowWindow(h, SW_HIDE); return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+void fb_create(HINSTANCE inst) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = fb_proc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"BfFramebuffer";
+    RegisterClassW(&wc);
+    RECT r{0, 0, px(FramebufferDevice::W * FB_SCALE), px(FramebufferDevice::H * FB_SCALE)};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
+    app.fbwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Framebuffer 128x64", WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
+                                CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, app.wnd, nullptr, inst, nullptr);
+}
+void fb_show(bool show) {
+    ShowWindow(app.fbwnd, show ? SW_SHOWNOACTIVATE : SW_HIDE);
+    CheckMenuItem(app.menu, ID_VIEW_FB, show ? MF_CHECKED : MF_UNCHECKED);
+}
+
+// ---- serial port selection ------------------------------------------------------------------
+void serial_select(const std::string& port) {
+    app.ser.configure(port);
+    CheckMenuRadioItem(app.menu, ID_SER_NONE, ID_SER_COM_BASE + 255,
+                       port.empty() ? ID_SER_NONE : port == "loopback" ? ID_SER_LOOP : ID_SER_COM_BASE + atoi(port.c_str() + 3), MF_BYCOMMAND);
+    if (!port.empty() && !app.ser.is_open()) set_status(L"Could not open " + widen(port) + L".");
+    else set_status(port.empty() ? L"Serial device detached." : L"Serial device attached to " + widen(port) + L".");
+    notify_device();
+}
+std::wstring serial_text() {
+    if (app.ser.port.empty()) return L"Serial: none";
+    wchar_t buf[96];
+    swprintf(buf, 96, L"Serial: %s %d%s", widen(app.ser.port).c_str(), SER_BAUDS[app.ser.baud_idx & 7],
+             app.ser.error ? L" ERROR" : app.ser.is_open() ? L" open" : L" closed");
+    return buf;
+}
+
 // ---- painting / layout -------------------------------------------------------------
 void paint_panel(HDC dc, const RECT& rc) {
     HBRUSH bg = CreateSolidBrush(RGB(30, 30, 34));
@@ -622,7 +698,8 @@ void paint_panel(HDC dc, const RECT& rc) {
     default: break;
     }
     SetTextColor(dc, app.mode == Mode::DebugPaused ? RGB(255, 210, 90) : RGB(200, 200, 210));
-    DrawTextW(dc, text, -1, &right, DT_LEFT | DT_VCENTER);
+    std::wstring all = std::wstring(text) + L"\r\n" + serial_text() + L"     Framebuffer: Ctrl+F";
+    DrawTextW(dc, all.c_str(), -1, &right, DT_LEFT | DT_VCENTER);
 }
 
 void layout() {
@@ -719,9 +796,19 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(debug, MF_STRING, ID_WATCH_ADD, L"&Watch cell at viewer address");
         AppendMenuW(debug, MF_STRING, ID_WATCH_PTR, L"Watch cell at &pointer");
         AppendMenuW(help, MF_STRING, ID_MEMMAP, L"&Memory map...");
+        HMENU devices = CreatePopupMenu(), serial = CreatePopupMenu();
+        AppendMenuW(serial, MF_STRING | MF_CHECKED, ID_SER_NONE, L"&None");
+        AppendMenuW(serial, MF_STRING, ID_SER_LOOP, L"&Loopback (TX wired to RX)");
+        app.com_ports = list_com_ports();
+        if (!app.com_ports.empty()) AppendMenuW(serial, MF_SEPARATOR, 0, nullptr);
+        for (const std::string& p : app.com_ports)
+            AppendMenuW(serial, MF_STRING, ID_SER_COM_BASE + atoi(p.c_str() + 3), widen(p).c_str());
+        AppendMenuW(devices, MF_POPUP, (UINT_PTR)serial, L"&Serial port");
+        AppendMenuW(devices, MF_STRING, ID_VIEW_FB, L"&Framebuffer window\tCtrl+F");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)file, L"&File");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)run, L"&Run");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)debug, L"&Debug");
+        AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)devices, L"De&vices");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)help, L"&Help");
         SetMenu(h, app.menu);
 
@@ -841,6 +928,10 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (mem_auto() && app.mode != Mode::Idle) SetTimer(h, TIMER_MEM, 150, nullptr); else KillTimer(h, TIMER_MEM);
             return 0;
         }
+        if (id == ID_VIEW_FB) { fb_show(!IsWindowVisible(app.fbwnd)); return 0; }
+        if (id == ID_SER_NONE) { serial_select(""); return 0; }
+        if (id == ID_SER_LOOP) { serial_select("loopback"); return 0; }
+        if (id > ID_SER_COM_BASE && id <= ID_SER_COM_BASE + 255) { serial_select("COM" + std::to_string(id - ID_SER_COM_BASE)); return 0; }
         switch (id) {
         case ID_OPEN:   if (app.mode == Mode::Idle) open_dialog(); break;
         case ID_RELOAD: if (app.mode == Mode::Idle && !app.path.empty()) load_file(app.path); break;
@@ -928,6 +1019,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_APP_DONE:  finish_run(); return 0;
+    case WM_APP_FBSHOW: if (!IsWindowVisible(app.fbwnd)) fb_show(true); return 0;
     case WM_APP_DEBUG: debug_event((Debugger::Event)w); return 0;
     case WM_CLOSE:
         if (app.modified && MessageBoxW(h, L"The editor has unsaved changes. Discard them?", L"bf", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
@@ -958,8 +1050,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
     app.dev.install(machine, &app.con);
     app.dev.leds.on_change = [](uint8_t) { notify_device(); };
     app.dev.number.on_change = [](uint16_t) { notify_device(); };
+    install_hw(machine, app.ser, app.fb);
+    app.ser.on_change = [] { notify_device(); };
+    app.fb.on_first_plot = [] { PostMessageW(app.wnd, WM_APP_FBSHOW, 0, 0); };
 
     ACCEL acc[] = {
+        {FVIRTKEY | FCONTROL, 'F', ID_VIEW_FB},
         {FVIRTKEY, VK_F5, ID_RUN}, {FVIRTKEY | FSHIFT, VK_F5, ID_STOP}, {FVIRTKEY | FCONTROL, VK_F5, ID_DEBUG},
         {FVIRTKEY, VK_F11, ID_STEP}, {FVIRTKEY, VK_F10, ID_STEP_OVER}, {FVIRTKEY | FCONTROL, VK_F10, ID_RUN_TO_CURSOR},
         {FVIRTKEY, VK_F6, ID_PAUSE}, {FVIRTKEY, VK_F9, ID_TOGGLE_BP},
@@ -979,6 +1075,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
                              CW_USEDEFAULT, CW_USEDEFAULT, 1400, 860, nullptr, nullptr, inst, nullptr);
     app.con.hwnd = h;
     ShowWindow(h, SW_SHOW);
+    fb_create(inst);
 
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(cmdline, &argc);

@@ -41,9 +41,11 @@ struct Instr {
 };
 
 struct Program {
-    std::vector<Instr> code;
-    std::string error;      // non-empty => compile failed
-    size_t raw_ops = 0;     // number of brainfuck commands in the source
+    std::vector<Instr> code;     // what runs: optimised, or == literal when optimise=false
+    std::vector<Instr> literal;  // one instruction per source command, always present
+    std::string error;           // non-empty => compile failed
+    size_t raw_ops = 0;          // number of brainfuck commands in the source
+    size_t src_size = 0;
 };
 
 // optimise=false produces one IR instruction per source command (no run

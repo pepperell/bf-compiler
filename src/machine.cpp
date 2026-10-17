@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <chrono>
 #include <mutex>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace bf {
@@ -56,10 +58,27 @@ uint32_t machine_in_thunk(Ctx* c) {
     default:                return 256;
     }
 }
+// Run the literal program from the source position of optimised instruction pc
+// until it reaches a position where the optimised code can resume with the
+// pointer in RAM.  Returns the literal pc it stopped at (or -1 if the run ended).
+static int32_t run_literal_from(Ctx* c, int32_t pc) {
+    const Program* opt = c->prog;
+    const void* const* opt_labels = c->labels;
+    const int32_t* gm = c->guard_min;
+    int32_t pl = c->lit_pc_of_src[opt->code[pc].src];
+    static const bool trace = getenv("BF_TRACE") != nullptr;
+    if (trace) fprintf(stderr, "[literal] opt pc %d src %d -> lit pc %d, ptr %lld\n", pc, opt->code[pc].src, pl, (long long)(c->ptr - c->tape));
+    c->prog = c->lit; c->labels = c->lit_labels; c->guard_min = nullptr;
+    int32_t at = interp_run(c, pl, true);
+    c->prog = opt; c->labels = opt_labels; c->guard_min = gm;
+    if (trace) fprintf(stderr, "[literal] stopped at lit pc %d src %d, ptr %lld, status %d\n", at, at >= 0 && (size_t)at < c->lit->code.size() ? c->lit->code[at].src : -1, (long long)(c->ptr - c->tape), c->status);
+    return c->status == (int32_t)Status::Running ? at : -1;
+}
+
 static void* slow_thunk(Ctx* c, int32_t pc) {
-    int32_t at = interp_run(c, pc, true);
-    if (c->status != (int32_t)Status::Running) return c->exit_slow;
-    return const_cast<void*>(c->labels[at]);
+    int32_t at = run_literal_from(c, pc);
+    if (at < 0) return c->exit_slow;
+    return const_cast<void*>(c->lit_labels[at]);
 }
 
 // ---- Machine ----------------------------------------------------------------------
@@ -172,13 +191,60 @@ RunResult Machine::run(const Program& p, bool use_jit) {
         ctx.jit_end = jit.mem + jit.size;
     }
 
+    // Maps for device-window execution.  Optimised instructions must never run
+    // against device registers (their merged writes would skip trigger side
+    // effects), so blocks that can reach the window run the literal program
+    // from the same source position instead.
+    Program lit_prog;                      // interpreter view of the literal code
+    lit_prog.code = p.literal;
+    const std::vector<Instr>& L = lit_prog.code;
+    std::vector<int32_t> lit_pc_of_src(p.src_size + 1, -1);
+    for (size_t i = 0; i < L.size(); i++) if ((size_t)L[i].src <= p.src_size) lit_pc_of_src[L[i].src] = (int32_t)i;
+    for (int32_t i = (int32_t)p.src_size - 1, last = lit_pc_of_src[p.src_size]; i >= 0; i--) {   // non-command bytes map forward
+        if (lit_pc_of_src[i] < 0) lit_pc_of_src[i] = last; else last = lit_pc_of_src[i];
+    }
+    std::vector<int32_t> opt_label_of_src(p.src_size + 1, -1);
+    std::vector<const void*> opt_label_flags(p.code.size(), nullptr);
+    static const int here = 0;
+    for (size_t i = 0; i < p.code.size(); i++) {
+        if (!has_label(p, i)) continue;
+        opt_label_flags[i] = use_jit ? jit.labels[i] : &here;
+        if (opt_label_of_src[p.code[i].src] < 0) opt_label_of_src[p.code[i].src] = (int32_t)i;
+    }
+    std::vector<const void*> lit_labels(L.size(), nullptr);
+    for (size_t i = 0; i < L.size(); i++) {
+        int32_t o = opt_label_of_src[L[i].src];
+        if (o >= 0) lit_labels[i] = opt_label_flags[o];
+    }
+    std::vector<int32_t> guard_min(p.code.size(), 0);
+    for (size_t i = 0; i < p.code.size();) {
+        if (is_special(p.code[i].op)) { i++; continue; }
+        size_t j; int64_t m = block_min_reach(p.code, i, j);
+        guard_min[i] = (int32_t)m;
+        i = j;
+    }
+    ctx.lit = &lit_prog;
+    ctx.lit_labels = lit_labels.data();
+    ctx.lit_pc_of_src = lit_pc_of_src.data();
+    if (!use_jit) { ctx.labels = opt_label_flags.data(); ctx.guard_min = guard_min.data(); }
+
     protect_ram(true);
     running_ = true;
     ctx_ = &ctx;
     t_active = &ctx;
     auto t0 = std::chrono::steady_clock::now();
     if (use_jit) jit.entry(&ctx);
-    else         interp_run(&ctx, 0, false);
+    else {
+        int32_t pc = 0;
+        for (;;) {
+            pc = interp_run(&ctx, pc, false);
+            if (ctx.status != STATUS_NEED_LITERAL) break;
+            ctx.status = (int32_t)Status::Running;
+            int32_t at = run_literal_from(&ctx, pc);
+            if (at < 0) break;                                     // run ended inside the literal program
+            pc = opt_label_of_src[L[at].src];
+        }
+    }
     auto t1 = std::chrono::steady_clock::now();
     t_active = nullptr;
     ctx_ = nullptr;

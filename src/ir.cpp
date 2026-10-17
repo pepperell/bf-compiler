@@ -26,12 +26,16 @@ static Code parse(const std::string& s, bool fold, size_t& raw, std::string& err
     for (size_t i = 0; i < s.size(); i++) {
         int32_t at = (int32_t)i;
         switch (s[i]) {
+        // A run of '<'/'>' becomes one MOVE (or one per command when not
+        // folding).  It is flushed before any other command so the first
+        // instruction of every block carries the source offset of the block's
+        // first command; the device-window slow path relies on that.
         case '>': if (!cur) cur_src = at; cur++; raw++; if (!fold) flush(); break;
         case '<': if (!cur) cur_src = at; cur--; raw++; if (!fold) flush(); break;
-        case '+': if (!fold) flush(); c.push_back({ADD, cur, 1, 0, at});  raw++; break;
-        case '-': if (!fold) flush(); c.push_back({ADD, cur, -1, 0, at}); raw++; break;
-        case '.': if (!fold) flush(); c.push_back({OUT, cur, 0, 0, at});  raw++; break;
-        case ',': if (!fold) flush(); c.push_back({IN, cur, 0, 0, at});   raw++; break;
+        case '+': flush(); c.push_back({ADD, 0, 1, 0, at});  raw++; break;
+        case '-': flush(); c.push_back({ADD, 0, -1, 0, at}); raw++; break;
+        case '.': flush(); c.push_back({OUT, 0, 0, 0, at});  raw++; break;
+        case ',': flush(); c.push_back({IN, 0, 0, 0, at});   raw++; break;
         case '[': flush(); c.push_back({JZ, 0, 0, 0, at}); depth++; raw++; break;
         case ']':
             flush(); raw++;
@@ -51,26 +55,40 @@ static Code parse(const std::string& s, bool fold, size_t& raw, std::string& err
 // A block is a maximal run of non-branch instructions.  Canonical form:
 //   {ADD,SET,MUL,OUT,IN} with absolute offsets, at most one pending ADD/SET per
 //   offset between barriers (OUT/IN/MUL), then at most one trailing MOVE.
-struct Cell { bool has_set = false; int32_t set_val = 0; int32_t add = 0; };
+struct Cell { int32_t off; bool has_set = false; int32_t set_val = 0; int32_t add = 0; };
 
-static void flush_pending(std::map<int32_t, Cell>& pend, Code& out, int32_t src) {
-    for (auto& [off, c] : pend) {
-        if (c.has_set) out.push_back({SET, off, (c.set_val + c.add) & 255, 0, src});
-        else if (c.add & 255) out.push_back({ADD, off, (int32_t)(int8_t)(c.add & 255), 0, src});
+// Pending writes are kept in first-touch order, not sorted: for RAM the order
+// is irrelevant, but device registers with triggers (load a latch, then write
+// the trigger) must see the program's order.
+static void flush_pending(std::vector<Cell>& pend, Code& out, int32_t src) {
+    for (Cell& c : pend) {
+        if (c.has_set) out.push_back({SET, c.off, (c.set_val + c.add) & 255, 0, src});
+        else if (c.add & 255) out.push_back({ADD, c.off, (int32_t)(int8_t)(c.add & 255), 0, src});
     }
     pend.clear();
 }
 
+// Writes to one cell merge only while it is the most recently touched cell;
+// touching it again after other cells flushes first, so "load latch, write
+// trigger, load latch, write trigger" keeps every intermediate value.
+static Cell& pending_cell(std::vector<Cell>& pend, int32_t off, Code& out, int32_t src) {
+    if (!pend.empty() && pend.back().off == off) return pend.back();
+    for (Cell& c : pend) if (c.off == off) { flush_pending(pend, out, src); break; }
+    pend.push_back(Cell{off});
+    return pend.back();
+}
+
 static void canon_block(const Code& in, size_t b, size_t e, Code& out) {
-    std::map<int32_t, Cell> pend;
+    std::vector<Cell> pend;
     int32_t delta = 0;
     int32_t src = in[b].src;
+    size_t first = out.size();
     for (size_t i = b; i < e; i++) {
         const Instr& x = in[i];
         switch (x.op) {
         case MOVE: delta += x.arg; break;
-        case ADD:  pend[x.off + delta].add += x.arg; break;
-        case SET: { Cell& c = pend[x.off + delta]; c.has_set = true; c.set_val = x.arg; c.add = 0; break; }
+        case ADD:  pending_cell(pend, x.off + delta, out, src).add += x.arg; break;
+        case SET: { Cell& c = pending_cell(pend, x.off + delta, out, src); c.has_set = true; c.set_val = x.arg; c.add = 0; break; }
         case OUT:  flush_pending(pend, out, src); out.push_back({OUT, x.off + delta, 0, 0, x.src}); break;
         case IN:   flush_pending(pend, out, src); out.push_back({IN, x.off + delta, 0, 0, x.src}); break;
         case MUL:  flush_pending(pend, out, src); out.push_back({MUL, x.off + delta, x.arg, x.target + delta, x.src}); break;
@@ -79,6 +97,10 @@ static void canon_block(const Code& in, size_t b, size_t e, Code& out) {
     }
     flush_pending(pend, out, src);
     if (delta) out.push_back({MOVE, 0, delta, 0, src});
+    // The block's first instruction is its resume point for the device-window
+    // slow path, so it must carry the source offset of the block's first command
+    // even when it was produced by a loop transform (which carries the '[').
+    if (out.size() > first) out[first].src = src;
 }
 
 static Code canonicalise(const Code& in) {
@@ -110,6 +132,7 @@ static bool transform_loop(const Code& in, size_t i, size_t j, Code& rep) {
     for (size_t k = 0; k < n; k++) {
         const Instr& x = body[k];
         if (x.op == MOVE || x.op == MUL || x.op == OUT || x.op == IN) return false;
+        for (size_t q = 0; q < k; q++) if (body[q].off == x.off) return false;   // a cell written twice: keep the loop literal
         if (x.off == 0) {
             if (x.op == ADD) { add0 = true; d0 = x.arg; }
             else             { set0 = true; set0v = x.arg; }
@@ -225,12 +248,18 @@ static bool fix_targets(Code& c, std::string& err) {
 
 Program compile(const std::string& src, bool optimise) {
     Program p;
-    Code c = parse(src, optimise, p.raw_ops, p.error);
+    p.src_size = src.size();
+    // The literal program is always built: it is what executes inside the
+    // device window, where optimised instructions must not be used.
+    Code lit = parse(src, false, p.raw_ops, p.error);
     if (!p.error.empty()) return p;
-    if (optimise) {
-        c = canonicalise(c);
-        for (int iter = 0; iter < 32 && optimise_once(c); iter++) {}
-    }
+    if (!fix_targets(lit, p.error)) return p;
+    p.literal = lit;
+    if (!optimise) { p.code = std::move(lit); return p; }
+    size_t raw = 0;
+    Code c = parse(src, true, raw, p.error);
+    c = canonicalise(c);
+    for (int iter = 0; iter < 32 && optimise_once(c); iter++) {}
     if (!fix_targets(c, p.error)) return p;
     p.code = std::move(c);
     return p;

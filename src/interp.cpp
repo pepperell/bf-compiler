@@ -39,6 +39,10 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
             break;
         }
         if (until_label && pc != start && p >= ram && c->labels[pc]) break;   // back to native code
+        if (c->guard_min && c->guard_min[pc] && p + c->guard_min[pc] < ram) {  // block may reach the device window
+            c->status = STATUS_NEED_LITERAL;
+            break;
+        }
         if (c->dbg || c->bp || c->watch_n || c->watch_mmio || c->temp_bp >= 0) {
             // Decide whether to pause before this instruction.  Reasons are
             // bf::Debugger::Reason values: 1 step, 2 breakpoint, 3 run-to,

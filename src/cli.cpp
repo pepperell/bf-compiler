@@ -1,6 +1,7 @@
 // cli.cpp - console runner:  bf [options] program.b
 #include "bf.h"
 #include "devices.h"
+#include "hw.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <conio.h>
@@ -64,7 +65,8 @@ void usage() {
         "  --eof MODE      ',' at end of input: nochange (default), 0, 255\n"
         "  --ram N         RAM cells (default 1048576)\n"
         "  --mmio N        device window cells (default 256, 0 disables devices)\n"
-        "  --quiet-devices do not report LED / number display changes on stderr\n",
+        "  --quiet-devices do not report LED / number display changes on stderr\n"
+        "  --serial PORT   attach the serial device to COMn, or 'loopback' for testing\n",
         stderr);
 }
 
@@ -73,7 +75,7 @@ void usage() {
 int main(int argc, char** argv) {
     bool use_jit = true, optimise = true, dump = false, show_time = false, quiet = false;
     Machine::Config cfg;
-    std::string src, path;
+    std::string src, path, serial_port;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto need = [&](const char* what) -> const char* { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", what); exit(2); } return argv[++i]; };
@@ -90,6 +92,7 @@ int main(int argc, char** argv) {
             else if (m == "nochange") cfg.eof = EofMode::NoChange; else { fprintf(stderr, "bad --eof\n"); return 2; }
         }
         else if (a == "-e") src = need("-e");
+        else if (a == "--serial") serial_port = need("--serial");
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 2; }
         else path = a;
@@ -112,9 +115,16 @@ int main(int argc, char** argv) {
     m.set_console(&con);
     StdDevices dev;
     CliKeyboard kb; kb.con = &con;
+    SerialDevice ser;
+    FramebufferDevice fb;
     if (cfg.mmio_size >= 256) {
         dev.install(m, &con);
         m.map(A_KEY_DATA, 2, &kb);
+        install_hw(m, ser, fb);
+        if (!serial_port.empty()) {
+            ser.configure(serial_port);
+            if (!ser.is_open()) { fprintf(stderr, "cannot open serial port %s\n", serial_port.c_str()); return 2; }
+        }
         if (!quiet) {
             dev.leds.on_change = [&](uint8_t v) {
                 con.flush();

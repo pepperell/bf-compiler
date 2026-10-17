@@ -94,33 +94,47 @@ CASES = [
     ("square", "++++++++[>++++++++<-]>[<+>-]<[>+>+<<-]>>[<<+>>-]<<[>[>+>+<<-]>>[<<+>>-]<<<-]>>.", b"", "nochange", None, False),
     # devices: write 65 into LEDS via a multiply-loop copy, read back and print
     ("mmio-leds", "++++++++[>++++++++<-]>+[<<+>>-]<<[>>+<<-]>>.", b"", "nochange", b"A", True),
-    ("mmio-conout", "++++++++[>++++++++<-]>+[<<<<<+>>>>>-]", b"", "nochange", b"A", True),
+    # CONOUT does not read back, so the copy loop literally writes 1 sixty-five times in every mode
+    ("mmio-conout", "++++++++[>++++++++<-]>+[<<<<<+>>>>>-]", b"", "nochange", b"\x01" * 65, True),
+    # a block that starts with a pointer move and then a transformed loop reaching the device
+    # window must resume the literal program from the move, not from the loop
+    ("mmio-block-leading-move", ">+++[<<<<+>>>>-]<<<<[>>>>+<<<<-]>>>>.", b"", "nochange", b"\x03", True),
+    # a trigger inside a loop must fire once per iteration even though the loop optimises to a multiply
+    ("fb-trigger-in-loop",
+     "+++[" + "<" * 22 + "+<+" + ">" * 23 + "-]" + "<" * 20 + "[-]++" + "<<<<<+" + ">>>.",
+     b"", "nochange", b"\x03", True),
     ("mmio-halt", "+++.<<<<<<<<<<<+>>>>>>>>>>>.", b"", "nochange", b"\x03", True),
     ("mmio-number", "+++++[<<<<<<<<<+>>>>>>>>>-]<<<<<<<<<<+>[>>>>>>>>>+<<<<<<<<<-]>>>>>>>>>.", b"", "nochange", b"\x05", True),
     ("mmio-scan-into", "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>[<]>+.", b"", "nochange", None, True),
     ("mmio-key-pop", "<<+<[>>>+<<<-]>>>.", b"q", "nochange", b"q", True),
+    # serial loopback: send 'H' and 'i' through SER_DATA/SER_TX, then pop and print what came back
+    ("serial-loopback",
+     "<<<<<<<<<<<<<<<<" + "+" * 72 + "<+>[-]" + "+" * 105 + "<+>>[+<.>]",
+     b"", "nochange", b"Hi", True, ["--serial", "loopback"]),
+    # framebuffer: plot two pixels, read the first back and print it (FB_COLOR latch = 0x41)
+    ("framebuffer-readback",
+     "<" * 22 + "+" * 65 + "<+" + ">[-]+<+" + ">>>[-]" + "<<<<<+" + ">>>.",
+     b"", "nochange", b"A", True),
 ]
 
 
 def main():
     fails = 0
-    for name, src, stdin, eof, expected, devices in CASES:
+    for case in CASES:
+        name, src, stdin, eof, expected, devices = case[:6]
+        extra = list(case[6]) if len(case) > 6 else []
         try:
             if expected is None and not devices:
                 expected = reference(src, stdin, eof)
             results = {}
             for label, flags in (("jit", []), ("interp", ["--interp"]), ("noopt", ["--no-opt"])):
-                rc, out, err = run_bf(src, stdin, eof, flags + ["--quiet-devices"])
+                rc, out, err = run_bf(src, stdin, eof, flags + extra + ["--quiet-devices"])
                 results[label] = (rc, out, err.strip())
             ok = all(r[1] == (expected if expected is not None else results["jit"][1]) for r in results.values())
             ok = ok and all(r[0] == 0 for r in results.values())
             if name == "mmio-scan-into":
                 # pointer scanned deep into the device window and came back; just require agreement
                 ok = results["jit"][1] == results["interp"][1] == results["noopt"][1] and all(r[0] == 0 for r in results.values())
-            if name == "mmio-conout":
-                # CONOUT is write-only and does not read back, so a literal read-modify-write loop
-                # differs from the multiply-loop form by design; only the optimised executors must agree.
-                ok = results["jit"][1] == results["interp"][1] == expected and results["jit"][0] == results["interp"][0] == 0
         except Exception as e:  # noqa
             ok = False
             results = {"exception": (None, str(e).encode(), "")}

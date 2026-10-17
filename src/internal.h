@@ -21,9 +21,16 @@ struct Ctx {
     uint8_t*       tape;
     size_t         tape_size;
     uint32_t       mmio_size;
-    const Program* prog;
+    const Program* prog;          // the code being interpreted (optimised or literal)
     ConsoleIo*     console;
-    const void* const* labels;    // native address per IR index, or nullptr
+    const void* const* labels;    // per IR index: non-null where native code can resume
+    // Device-window execution: the literal program and the maps between it and
+    // the optimised code (see Machine::run).  guard_min is per optimised pc:
+    // the lowest pointer offset a block starting there can reach (0 = no check).
+    const Program* lit;
+    const void* const* lit_labels;
+    const int32_t* lit_pc_of_src;
+    const int32_t* guard_min;
     void*          exit_slow;     // stub: eax = ctx->status, then exit
     const uint8_t* jit_begin;
     const uint8_t* jit_end;
@@ -51,7 +58,27 @@ static_assert(offsetof(Ctx, out_fn) == 48 && offsetof(Ctx, in_fn) == 56 && offse
 // stopped; ctx->status != Running means the run ended.
 int32_t interp_run(Ctx* c, int32_t pc, bool until_label);
 
+// interp_run status meaning "this block may touch the device window: run the literal program"
+constexpr int32_t STATUS_NEED_LITERAL = 100;
+
 inline bool is_special(Op o) { return o == JZ || o == JNZ || o == ENDIF || o == SCAN || o == END; }
+
+// Lowest pointer offset (<= 0) reachable by the straight-line block starting at i;
+// sets j to the index after the block.
+inline int64_t block_min_reach(const std::vector<Instr>& code, size_t i, size_t& j) {
+    int64_t minoff = 0, delta = 0;
+    j = i;
+    while (j < code.size() && !is_special(code[j].op)) {
+        const Instr& y = code[j];
+        if (y.op == MOVE) { delta += y.arg; if (delta < minoff) minoff = delta; }
+        else {
+            if (delta + y.off < minoff) minoff = delta + y.off;
+            if (y.op == MUL && delta + y.target < minoff) minoff = delta + y.target;
+        }
+        j++;
+    }
+    return minoff;
+}
 inline bool has_label(const Program& p, size_t i) {
     return i == 0 || is_special(p.code[i].op) || is_special(p.code[i - 1].op);
 }

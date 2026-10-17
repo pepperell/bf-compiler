@@ -77,12 +77,32 @@ The pointer starts at the first RAM cell, so hardware lives just to the left of 
 | 0xF4 | <12 | RANDOM     | r/w | latch holding the last random byte |
 | 0xF3 | <13 | TICK_LATCH | w   | writing loads TICKS0..3 with the current time |
 | 0xF2 | <14 | ROLL       | w   | writing loads RANDOM with a new byte |
+| 0xF1 | <15 | SER_STATUS | r/w | reads 1 while a received byte waits; a write pops it into SER_DATA |
+| 0xF0 | <16 | SER_DATA   | r/w | latch: byte to send, or the byte last popped |
+| 0xEF | <17 | SER_TX     | w   | transmit SER_DATA |
+| 0xEE | <18 | SER_CTRL   | r/w | write 0 close, 1 open; reads bit0 open, bit7 error |
+| 0xED | <19 | SER_BAUD   | r/w | 0:300 1:1200 2:2400 3:9600 4:19200 5:38400 6:57600 7:115200 |
+| 0xEC | <20 | FB_X       | r/w | framebuffer cursor column 0..127 |
+| 0xEB | <21 | FB_Y       | r/w | framebuffer cursor row 0..63 |
+| 0xEA | <22 | FB_COLOR   | r/w | latch, colour as RRRGGGBB |
+| 0xE9 | <23 | FB_PLOT    | w   | plot FB_COLOR at the cursor, then advance (wraps to the next row) |
+| 0xE8 | <24 | FB_FILL    | w   | fill the screen with the written value |
+| 0xE7 | <25 | FB_READ    | w   | load FB_COLOR with the pixel under the cursor |
 
-Readable registers are latches: they read back what was last written. That is what makes
-the normal brainfuck copy idiom `[>+<-]` work on a register, and it means the optimiser's
-multiply loops behave the same as the literal loop would. Write-only registers such as
-CONOUT do not read back, so a read-modify-write loop over them differs from its optimised
-form by design; use a copy from RAM instead (see `tests/test.py`, case `mmio-conout`).
+The serial device (`src/hw.h`) talks to a real COM port chosen from the UI's Devices menu
+or with `bf --serial COM3`; `loopback` wires TX to RX for testing without hardware.
+Sends and pops are triggers separate from the data latch, so the usual `+` loops never
+transmit by accident. The framebuffer is a 128x64 byte-per-pixel display shown in its own
+window (Ctrl+F, or automatically on the first plot). `programs/serial_echo.b` and
+`programs/fb.b` demonstrate both.
+
+Readable registers are latches: they read back what was last written, which is what makes
+the normal brainfuck copy idiom `[>+<-]` work on a register. Optimised code never executes
+against device registers: every compiled program keeps a literal one-instruction-per-command
+copy, and whenever a block of optimised code could reach the device window the executor
+runs the literal copy from the same source position until the pointer is back in RAM at a
+point where the optimised code can resume. So a trigger written inside a loop fires once
+per iteration exactly as the source says, in the JIT, the interpreter and the debugger.
 
 `programs/leds.b` is a chaser that drives LEDS, paces itself with TICK_LATCH / TICKS1 and
 finishes through HALT. Comments in `.b` files must avoid the eight command characters.
