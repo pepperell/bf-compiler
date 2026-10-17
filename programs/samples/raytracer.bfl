@@ -1,0 +1,594 @@
+// raytracer.bfl - reflective spheres on a checkerboard, lit by two coloured
+// lights, rendered on the framebuffer while the camera circles the scene.
+//
+// Everything is computed with whole numbers in fixed point: positions in units
+// of 1/256 (Q8), ray directions in units of 1/4096 (Q12).
+//
+//   - Primary rays: the camera's right vector stays horizontal, so along a row
+//     each ray's direction, its squared length and its floor hit point change
+//     by a constant step and are updated with additions only.  The floor needs
+//     one division per row.
+//   - Spheres are projected to a screen box once per frame and tested only
+//     inside it.  A hit is shaded with diffuse and specular light from both
+//     lamps (16-bit dot products of 7-bit unit vectors), then a reflected ray
+//     is traced against the other spheres, the floor and the sky.
+//   - The floor's lighting (checkerboard, the two lamps' colour and falloff,
+//     and soft shadows of the spheres) does not depend on the camera, so it is
+//     computed once into a 64 x 64 light map in the heap; you can watch it
+//     being built as a top-down view before the first frame.
+//   - Colours are reduced to the framebuffer's RRRGGGBB with a 4 x 4 ordered
+//     dither, so smooth shading survives the 256-colour palette.
+//
+//     bfui programs\samples\raytracer.bfl   F5 runs it (the framebuffer window
+//                                          opens by itself), Shift+F5 stops
+//     bf programs\samples\raytracer.bfl     renders headless; frame times on stdout
+
+heap 16384;
+
+const W = 128;
+const H = 64;
+const NS = 4;               // spheres
+const PIX = 45;             // ray direction step per pixel, Q12 (about 70 degrees across)
+const AMB = 48;             // ambient light, 0..256
+const ORBIT = 1664;         // camera distance from the centre, Q8 (6.5 units)
+const CAMY = 563;           // camera height (2.2 units)
+const TY = 256;             // height it looks at (1 unit)
+const STEP = 10;            // degrees the camera moves per frame
+const LS = 425984;          // floor light strength: 6.5 square units, Q16
+const FAR = 15000;          // floor hits further than this (Q8) are lost in the haze
+
+heap byte lmap[12288];      // floor light map: 64 x 64 cells of a quarter unit, RGB
+
+// ---- the scene ----------------------------------------------------------------------------
+long scx[4];   long scy[4];   long scz[4];      // sphere centres, Q8
+long srad[4];  long srr[4];                     // radius (Q8) and radius squared (Q16)
+long skn[4];                                    // N = (P - C) * skn >> 8 is the unit normal in Q12
+int  scr[4];   int  scg[4];   int  scb[4];      // colour
+int  sref[4];                                   // reflectivity, 0..128
+
+long lpx[2];   long lpy[2];   long lpz[2];      // lamp positions, Q8
+int  lcr[2];   int  lcg[2];   int  lcb[2];      // lamp colours
+
+int  ldx[8];   int  ldy[8];   int  ldz[8];      // unit vector from sphere s to lamp l (Q7), index s*2+l
+int  hvx[8];   int  hvy[8];   int  hvz[8];      // half vectors for the highlights, per frame
+long shin[4];  long shout[4];                   // shadow band per sphere: inner and outer radius squared, Q16
+byte bayer[16];
+
+// ---- per frame ---------------------------------------------------------------------------
+long ox;  long oy;  long oz;                    // camera position, Q8
+long fx;  long fy;  long fz;                    // forward, Q12
+long rx;  long rz;                              // right (its y is 0), Q12
+long ux;  long uy;  long uz;                    // up, Q12
+long dux; long duz;                             // ray step per pixel along a row
+long dvx; long dvy; long dvz;                   // ray step per row
+long d0x; long d0y; long d0z;                   // ray through the top left pixel
+long sc[4];                                     // per sphere: c = (|O - C|^2 - r^2) >> 8
+long socdu[4]; long socdv[4]; long socd0[4];    // (O - C) . du, . dv, . d0  (Q20)
+byte bvis[4]; byte bx0[4]; byte bx1[4]; byte by0[4]; byte by1[4];   // screen boxes
+long brow[4];                                   // (O - C) . d at the start of the row
+
+// results passed between procedures
+int  cr;  int cg;  int cb;                      // the colour being worked out
+long nx;  long ny; long nz;                     // the normal at the last sphere hit, Q12
+
+// ---- maths --------------------------------------------------------------------------------
+// Sine of whole degrees times 1024 (Bhaskara I's formula, error under 0.2%).
+proc int sin1024(word deg) {
+    deg = deg % 360;
+    byte neg = 0;
+    if (deg >= 180) { deg -= 180; neg = 1; }
+    long p = long(deg) * (180 - deg);
+    int s = int((4096 * p) / (40500 - p));
+    if (neg) { return -s; }
+    return s;
+}
+
+// Square root of a non-negative 32-bit value: a power-of-four bound, then Newton.
+proc long isqrt(long v) {
+    if (v <= 0) { return 0; }
+    long bit = 1073741824;
+    long root = 32768;
+    while ((bit >> 8) > v) { bit = bit >> 8; root = root >> 4; }
+    while (bit > v) { bit = bit >> 2; root = root >> 1; }
+    long g = root + (root >> 1);          // root <= sqrt(v) < 2 root
+    g = (g + v / g) >> 1;
+    g = (g + v / g) >> 1;
+    g = (g + v / g) >> 1;
+    return g;
+}
+
+proc dword millis() {
+    pulse TICK_LATCH;
+    return (dword(TICKS3) << 24) | (dword(TICKS2) << 16) | (dword(TICKS1) << 8) | dword(TICKS0);
+}
+
+// ---- colours ------------------------------------------------------------------------------
+proc sky(long dy) {                   // by the ray's height: pale at the horizon, deep blue above
+    long up = dy >> 5;
+    if (up < 0) { up = 0; }
+    if (up > 128) { up = 128; }
+    int u = int(up);
+    cr = 190 + ((-160 * u) >> 7);
+    cg = 200 + ((-150 * u) >> 7);
+    cb = 225 + ((-105 * u) >> 7);
+}
+
+// Blend the colour towards the horizon haze; f is 0..128.
+proc haze(int f) {
+    cr = cr + (((190 - cr) * f) >> 7);
+    cg = cg + (((200 - cg) * f) >> 7);
+    cb = cb + (((225 - cb) * f) >> 7);
+}
+
+// The floor at quarter-unit cell (qx, qz): from the light map, or unlit tiles beyond it.
+proc floor_colour(int qx, int qz) {
+    int ix = qx + 32;
+    int iz = qz + 32;
+    if (ix >= 0 && ix < 64 && iz >= 0 && iz < 64) {
+        word i = (word(iz) * 64 + word(ix)) * 3;
+        cr = lmap[i];
+        cg = lmap[i + 1];
+        cb = lmap[i + 2];
+    } else if (((qx >> 2) ^ (qz >> 2)) & 1) {
+        cr = 50; cg = 50; cb = 48;
+    } else {
+        cr = 10; cg = 11; cb = 15;
+    }
+}
+
+// Write the colour to the framebuffer as RRRGGGBB with an ordered dither: a
+// channel with n + 1 levels shows level (v * n + threshold) / 256, where the
+// threshold runs over 8, 24, ..., 248 in a 4 x 4 Bayer pattern.
+proc put(byte x, byte y) {
+    int t = int(bayer[(y & 3) * 4 + (x & 3)]) * 16 + 8;
+    int rv = cr;  int gv = cg;  int bv = cb;
+    if (rv < 0) { rv = 0; } if (rv > 255) { rv = 255; }
+    if (gv < 0) { gv = 0; } if (gv > 255) { gv = 255; }
+    if (bv < 0) { bv = 0; } if (bv > 255) { bv = 255; }
+    byte r3 = byte((rv * 7 + t) >> 8);
+    byte g3 = byte((gv * 7 + t) >> 8);
+    byte b2 = byte((bv * 3 + t) >> 8);
+    FB_COLOR = r3 * 32 + g3 * 4 + b2;
+    pulse FB_PLOT;
+}
+
+// ---- spheres ------------------------------------------------------------------------------
+// Diffuse and specular light on sphere s at P; leaves the colour in cr, cg, cb
+// and the unit normal (Q12) in nx, ny, nz.
+proc light_sphere(byte s, long px, long py, long pz) {
+    long k = skn[s];
+    nx = ((px - scx[s]) * k) >> 8;
+    ny = ((py - scy[s]) * k) >> 8;
+    nz = ((pz - scz[s]) * k) >> 8;
+    int n7x = int(nx >> 5);
+    int n7y = int(ny >> 5);
+    int n7z = int(nz >> 5);
+    word lr = AMB;  word lg = AMB;  word lb = AMB;
+    word spr = 0;   word spg = 0;   word spb = 0;
+    byte l;
+    for (l = 0; l < 2; l++) {
+        byte i = s * 2 + l;
+        int ndl = n7x * ldx[i] + n7y * ldy[i] + n7z * ldz[i];         // Q14
+        if (ndl > 0) {
+            word dif = word(ndl >> 6);                                // 0..256
+            lr += (dif * word(lcr[l])) >> 8;
+            lg += (dif * word(lcg[l])) >> 8;
+            lb += (dif * word(lcb[l])) >> 8;
+            int ndh = n7x * hvx[i] + n7y * hvy[i] + n7z * hvz[i];
+            if (ndh > 0) {
+                word sp = word(ndh >> 6);
+                if (sp > 255) { sp = 255; }
+                sp = (sp * sp) >> 8;                                  // a power of 32
+                sp = (sp * sp) >> 8;
+                sp = (sp * sp) >> 8;
+                sp = (sp * sp) >> 8;
+                sp = (sp * sp) >> 8;
+                spr += (sp * word(lcr[l])) >> 8;
+                spg += (sp * word(lcg[l])) >> 8;
+                spb += (sp * word(lcb[l])) >> 8;
+            }
+        }
+    }
+    if (lr > 255) { lr = 255; }
+    if (lg > 255) { lg = 255; }
+    if (lb > 255) { lb = 255; }
+    cr = int((word(scr[s]) * lr) >> 8) + int(spr);
+    cg = int((word(scg[s]) * lg) >> 8) + int(spg);
+    cb = int((word(scb[s]) * lb) >> 8) + int(spb);
+}
+
+// The colour seen along a reflected ray from P on sphere skip (direction Q12, a = its length squared Q8).
+proc reflection(byte skip, long px, long py, long pz, long qx, long qy, long qz, long a) {
+    byte hit = 255;
+    long best = 2000000000;
+    byte s;
+    for (s = 0; s < NS; s++) {
+        if (s != skip) {
+            long ocx = px - scx[s];
+            long ocy = py - scy[s];
+            long ocz = pz - scz[s];
+            long b = (ocx * qx + ocy * qy + ocz * qz) >> 12;
+            if (b < 0) {
+                long c = (ocx * ocx + ocy * ocy + ocz * ocz - srr[s]) >> 8;
+                long disc = b * b - a * c;
+                if (disc > 0) {
+                    long t = ((-b - isqrt(disc)) << 8) / a;
+                    if (t > 0 && t < best) { best = t; hit = s; }
+                }
+            }
+        }
+    }
+    if (hit != 255) {
+        light_sphere(hit, px + ((best * qx) >> 12), py + ((best * qy) >> 12), pz + ((best * qz) >> 12));
+    } else if (qy < 0) {
+        long tf = ((-py) << 12) / qy;
+        if (tf > FAR) {
+            cr = 190; cg = 200; cb = 225;
+        } else {
+            long hx = px + ((tf * qx) >> 12);
+            long hz = pz + ((tf * qz) >> 12);
+            floor_colour(int(hx >> 6), int(hz >> 6));
+        }
+    } else {
+        sky(qy);
+    }
+}
+
+// ---- setting up ---------------------------------------------------------------------------
+proc sphere(byte s, long x, long y, long z, long r, long kn, int red, int green, int blue, int refl) {
+    scx[s] = x; scy[s] = y; scz[s] = z;
+    srad[s] = r; srr[s] = r * r; skn[s] = kn;
+    scr[s] = red; scg[s] = green; scb[s] = blue; sref[s] = refl;
+}
+
+proc lamp(byte l, long x, long y, long z, int red, int green, int blue) {
+    lpx[l] = x; lpy[l] = y; lpz[l] = z;
+    lcr[l] = red; lcg[l] = green; lcb[l] = blue;
+}
+
+// Directions from each sphere to each lamp, and each sphere's shadow band.
+proc prepare_lights() {
+    byte s;
+    for (s = 0; s < NS; s++) {
+        byte l;
+        for (l = 0; l < 2; l++) {
+            byte i = s * 2 + l;
+            long vx = lpx[l] - scx[s];
+            long vy = lpy[l] - scy[s];
+            long vz = lpz[l] - scz[s];
+            long len = isqrt(vx * vx + vy * vy + vz * vz);
+            ldx[i] = int((vx * 128) / len);
+            ldy[i] = int((vy * 128) / len);
+            ldz[i] = int((vz * 128) / len);
+        }
+        // a line passing closer than 0.85 r to the centre is in full shadow, beyond
+        // 1.15 r fully lit, and in between partly: a soft edge
+        long rin = (srad[s] * 218) >> 8;
+        long rout = (srad[s] * 294) >> 8;
+        shin[s] = rin * rin;
+        shout[s] = rout * rout;
+    }
+}
+
+// The floor's light map, drawn as a top-down view while it is worked out.
+proc build_light_map() {
+    byte iz;
+    for (iz = 0; iz < 64; iz++) {
+        FB_X = 32;
+        FB_Y = iz;
+        byte ix;
+        for (ix = 0; ix < 64; ix++) {
+            long px = (long(ix) - 32) * 64 + 32;
+            long pz = (long(iz) - 32) * 64 + 32;
+            word lr = AMB;  word lg = AMB;  word lb = AMB;
+            byte l;
+            for (l = 0; l < 2; l++) {
+                long vx = lpx[l] - px;
+                long vy = lpy[l];
+                long vz = lpz[l] - pz;
+                long d2 = vx * vx + vy * vy + vz * vz;              // Q16
+                long dist = isqrt(d2);                              // Q8
+                long cosq = (vy << 8) / dist;                       // Q8
+                long inten = (cosq * LS) / d2;                      // falls off with the square of the distance
+                long wx = (vx << 8) / dist;                         // unit vector to the lamp, Q8
+                long wy = (vy << 8) / dist;
+                long wz = (vz << 8) / dist;
+                // shadows: how close does the line to the lamp pass each sphere's centre?
+                byte s;
+                for (s = 0; s < NS; s++) {
+                    long ocx = scx[s] - px;
+                    long ocy = scy[s];
+                    long ocz = scz[s] - pz;
+                    long along = (ocx * wx + ocy * wy + ocz * wz) >> 8;     // Q8
+                    if (along > 0 && along < dist) {
+                        long m2 = ocx * ocx + ocy * ocy + ocz * ocz - along * along;   // Q16
+                        if (m2 < shin[s]) {
+                            inten = 0;
+                        } else if (m2 < shout[s]) {
+                            inten = (inten * (((m2 - shin[s]) << 8) / (shout[s] - shin[s]))) >> 8;
+                        }
+                    }
+                }
+                if (inten > 255) { inten = 255; }                  // keeps w * colour within a word
+                word w = word(inten);
+                lr += (w * word(lcr[l])) >> 8;
+                lg += (w * word(lcg[l])) >> 8;
+                lb += (w * word(lcb[l])) >> 8;
+            }
+            if (lr > 255) { lr = 255; }
+            if (lg > 255) { lg = 255; }
+            if (lb > 255) { lb = 255; }
+            word tr = 40;  word tg = 42;  word tb = 52;              // dark tile
+            if (((ix >> 2) ^ (iz >> 2)) & 1) { tr = 235; tg = 230; tb = 220; }
+            word i = (word(iz) * 64 + word(ix)) * 3;
+            cr = int((tr * lr) >> 8);
+            cg = int((tg * lg) >> 8);
+            cb = int((tb * lb) >> 8);
+            lmap[i] = byte(cr);
+            lmap[i + 1] = byte(cg);
+            lmap[i + 2] = byte(cb);
+            put(ix, iz);
+        }
+    }
+}
+
+// Camera on its circle at angle ang, looking at the middle of the scene.
+proc place_camera(word ang) {
+    long sn = sin1024(ang);
+    long cs = sin1024(ang + 90);
+    ox = (sn * ORBIT) / 1024;
+    oy = CAMY;
+    oz = (cs * ORBIT) / 1024;
+    long vx = -ox;
+    long vy = TY - oy;
+    long vz = -oz;
+    long len = isqrt(vx * vx + vy * vy + vz * vz);
+    fx = (vx * 4096) / len;
+    fy = (vy * 4096) / len;
+    fz = (vz * 4096) / len;
+    long hl = isqrt(fx * fx + fz * fz);
+    rx = (-fz * 4096) / hl;
+    rz = (fx * 4096) / hl;
+    ux = (-rz * fy) >> 12;                  // up = right x forward
+    uy = (rz * fx - rx * fz) >> 12;
+    uz = (rx * fy) >> 12;
+    dux = (rx * PIX) >> 12;
+    duz = (rz * PIX) >> 12;
+    dvx = (-ux * PIX) >> 12;
+    dvy = (-uy * PIX) >> 12;
+    dvz = (-uz * PIX) >> 12;
+    d0x = fx - dux * 64 - dvx * 32;
+    d0y = fy - dvy * 32;
+    d0z = fz - duz * 64 - dvz * 32;
+
+    // highlights: half way between the way to each lamp and the way back to the camera
+    int f7x = int(fx >> 5);
+    int f7y = int(fy >> 5);
+    int f7z = int(fz >> 5);
+    byte i;
+    for (i = 0; i < 8; i++) {
+        long hx = ldx[i] - f7x;
+        long hy = ldy[i] - f7y;
+        long hz = ldz[i] - f7z;
+        long hlen = isqrt(hx * hx + hy * hy + hz * hz);
+        hvx[i] = int((hx * 128) / hlen);
+        hvy[i] = int((hy * 128) / hlen);
+        hvz[i] = int((hz * 128) / hlen);
+    }
+
+    // per sphere: the constant part of the hit test, and a screen box around it
+    byte s;
+    for (s = 0; s < NS; s++) {
+        long ocx = ox - scx[s];
+        long ocy = oy - scy[s];
+        long ocz = oz - scz[s];
+        sc[s] = (ocx * ocx + ocy * ocy + ocz * ocz - srr[s]) >> 8;
+        socdu[s] = ocx * dux + ocz * duz;
+        socdv[s] = ocx * dvx + ocy * dvy + ocz * dvz;
+        socd0[s] = ocx * d0x + ocy * d0y + ocz * d0z;
+        long zc = -((ocx * fx + ocy * fy + ocz * fz) >> 12);
+        long xc = -((ocx * rx + ocz * rz) >> 12);
+        long yc = -((ocx * ux + ocy * uy + ocz * uz) >> 12);
+        bvis[s] = 0;
+        if (zc > srad[s] + 64) {
+            long cxp = 64 + (xc * 4096) / (zc * PIX);
+            long cyp = 32 - (yc * 4096) / (zc * PIX);
+            long rp = (srad[s] * 4096) / ((zc - srad[s]) * PIX) + 2;
+            long x0 = cxp - rp;  long x1 = cxp + rp;
+            long y0 = cyp - rp;  long y1 = cyp + rp;
+            if (x1 >= 0 && x0 < W && y1 >= 0 && y0 < H) {
+                if (x0 < 0) { x0 = 0; }
+                if (x1 >= W) { x1 = W - 1; }
+                if (y0 < 0) { y0 = 0; }
+                if (y1 >= H) { y1 = H - 1; }
+                bvis[s] = 1;
+                bx0[s] = byte(x0); bx1[s] = byte(x1);
+                by0[s] = byte(y0); by1[s] = byte(y1);
+            }
+        }
+    }
+}
+
+// One pixel of a lamp's glow, if it is on the screen.
+proc glow(long x, long y, byte colour) {
+    if (x >= 0 && x < W && y >= 0 && y < H) {
+        FB_X = byte(x);
+        FB_Y = byte(y);
+        FB_COLOR = colour;
+        pulse FB_PLOT;
+    }
+}
+
+// Where each lamp appears on the screen this frame (lvis 0 when it is out of view).
+long lsx[2];  long lsy[2];  byte lvis[2];
+proc locate_lamps() {
+    byte l;
+    for (l = 0; l < 2; l++) {
+        lvis[l] = 0;
+        long vx = lpx[l] - ox;
+        long vy = lpy[l] - oy;
+        long vz = lpz[l] - oz;
+        long zc = (vx * fx + vy * fy + vz * fz) >> 12;
+        if (zc > 128) {
+            long xc = (vx * rx + vz * rz) >> 12;
+            long yc = (vx * ux + vy * uy + vz * uz) >> 12;
+            lsx[l] = 64 + (xc * 4096) / (zc * PIX);
+            lsy[l] = 32 - (yc * 4096) / (zc * PIX);
+            if (lsx[l] > -3 && lsx[l] < W + 2 && lsy[l] > -3 && lsy[l] < H + 2) { lvis[l] = 1; }
+        }
+    }
+}
+
+// A lamp as a small glowing star, drawn over the picture.
+proc draw_lamp(byte l) {
+    long sx = lsx[l];
+    long sy = lsy[l];
+    byte halo = 0xF9;                           // warm: (7, 6, 1)
+    byte ring = 0xD4;                           //       (6, 5, 0)
+    if (l == 1) { halo = 0xBF; ring = 0x6F; }   // cool: (5, 7, 3), (3, 3, 3)
+    glow(sx - 2, sy, ring); glow(sx + 2, sy, ring);
+    glow(sx, sy - 2, ring); glow(sx, sy + 2, ring);
+    glow(sx - 1, sy - 1, ring); glow(sx + 1, sy - 1, ring);
+    glow(sx - 1, sy + 1, ring); glow(sx + 1, sy + 1, ring);
+    glow(sx - 1, sy, halo); glow(sx + 1, sy, halo);
+    glow(sx, sy - 1, halo); glow(sx, sy + 1, halo);
+    glow(sx, sy, 0xFF);
+}
+
+// ---- one frame ----------------------------------------------------------------------------
+proc render() {
+    locate_lamps();
+    long du2 = dux * dux + duz * duz;           // Q24
+    byte y;
+    for (y = 0; y < H; y++) {
+        FB_X = 0;                               // a lamp drawn on the last row moved the cursor
+        FB_Y = y;
+        // the ray at the start of this row, and the quantities that step along it
+        long dx = d0x + long(y) * dvx;
+        long dy = d0y + long(y) * dvy;          // constant along the row
+        long dz = d0z + long(y) * dvz;
+        long aa = dx * dx + dy * dy + dz * dz;  // |d|^2, Q24
+        long dd = dx * dux + dz * duz;          // d . du
+        byte any = 0;
+        byte s;
+        for (s = 0; s < NS; s++) {
+            brow[s] = socd0[s] + long(y) * socdv[s];
+            if (bvis[s] && y >= by0[s] && y <= by1[s]) { any = 1; }
+        }
+        // the floor along this row: one division, then steps
+        byte floor = 0;
+        long hxr = 0;  long hzr = 0;  long stx = 0;  long stz = 0;
+        int fog = 128;
+        if (dy < 0) {
+            long tf = ((-oy) << 12) / dy;
+            if (tf < FAR) {
+                floor = 1;
+                hxr = (ox << 12) + tf * dx;     // Q20
+                hzr = (oz << 12) + tf * dz;
+                stx = tf * dux;
+                stz = tf * duz;
+                long f = (tf - 1536) / 70;
+                if (f < 0) { f = 0; }
+                if (f > 128) { f = 128; }
+                fog = int(f);
+            }
+        }
+        byte x;
+        for (x = 0; x < W; x++) {
+            byte hit = 255;
+            long best = 2000000000;
+            if (any) {
+                long a = aa >> 16;              // Q8
+                for (s = 0; s < NS; s++) {
+                    if (bvis[s] && x >= bx0[s] && x <= bx1[s] && y >= by0[s] && y <= by1[s]) {
+                        long b = (brow[s] + long(x) * socdu[s]) >> 12;
+                        if (b < 0) {
+                            long disc = b * b - a * sc[s];
+                            if (disc > 0) {
+                                long t = ((-b - isqrt(disc)) << 8) / a;
+                                if (t > 0 && t < best) { best = t; hit = s; }
+                            }
+                        }
+                    }
+                }
+                if (hit != 255) {
+                    long px = ox + ((best * dx) >> 12);
+                    long py = oy + ((best * dy) >> 12);
+                    long pz = oz + ((best * dz) >> 12);
+                    light_sphere(hit, px, py, pz);
+                    int own_r = cr;  int own_g = cg;  int own_b = cb;
+                    // reflect the ray about the normal and see what it meets
+                    long dn = (dx * nx + dy * ny + dz * nz) >> 12;
+                    long qx = dx - ((dn * nx) >> 11);
+                    long qy = dy - ((dn * ny) >> 11);
+                    long qz = dz - ((dn * nz) >> 11);
+                    reflection(hit, px, py, pz, qx, qy, qz, a);
+                    int k = sref[hit];
+                    cr = own_r + (((cr - own_r) * k) >> 7);
+                    cg = own_g + (((cg - own_g) * k) >> 7);
+                    cb = own_b + (((cb - own_b) * k) >> 7);
+                }
+            }
+            if (hit == 255) {
+                if (floor) {
+                    floor_colour(int(hxr >> 18), int(hzr >> 18));
+                    haze(fog);
+                } else if (dy < 0) {
+                    cr = 190; cg = 200; cb = 225;
+                } else {
+                    sky(dy);
+                }
+            }
+            put(x, y);
+            // step to the next pixel
+            aa = aa + dd + dd + du2;
+            dd = dd + du2;
+            dx = dx + dux;
+            dz = dz + duz;
+            hxr = hxr + stx;
+            hzr = hzr + stz;
+        }
+        // a lamp is drawn as soon as the rows under it are done, so it stays on screen
+        byte l;
+        for (l = 0; l < 2; l++) {
+            if (lvis[l] && (lsy[l] + 2 == y || (y == H - 1 && lsy[l] + 2 >= H))) { draw_lamp(l); }
+        }
+    }
+}
+
+// ---- run ----------------------------------------------------------------------------------
+byte b0;
+for (b0 = 0; b0 < 16; b0++) {
+    // 4 x 4 Bayer matrix: 0 8 2 10 / 12 4 14 6 / 3 11 1 9 / 15 7 13 5
+    byte row = b0 >> 2;
+    byte col = b0 & 3;
+    byte v = ((col ^ row) & 1) * 8 + (row & 1) * 4 + ((col ^ row) >> 1 & 1) * 2 + (row >> 1);
+    bayer[b0] = v;
+}
+
+//      sphere  x      y     z     r     normal scale  colour          reflectivity
+sphere(0,       0,     256, -102,  256,  4096,         200, 200, 210,  100);    // chrome
+sphere(1,       410,   154,  230,  154,  6809,         220,  40,  40,   50);    // red
+sphere(2,      -384,   179,  256,  179,  5858,         230, 170,  50,   64);    // gold
+sphere(3,       256,   115, -563,  115,  9118,          60, 100, 230,   56);    // blue
+//    lamp  x     y     z      colour
+lamp(0,    -563,  717,  512,   255, 220, 170);    // warm, front left, 2.8 units up
+lamp(1,     666,  614, -460,   140, 170, 255);    // cool, back right, 2.4 units up
+
+print "BFL raytracer: ", NS, " reflective spheres, 2 lamps, a checkerboard floor.\n";
+print "Working out the floor's light map (shown from above)...\n";
+dword t0 = millis();
+prepare_lights();
+build_light_map();
+print "light map: ", millis() - t0, " ms\n";
+
+word ang = 30;
+word frame = 0;
+while (1) {
+    t0 = millis();
+    place_camera(ang);
+    render();
+    print "frame ", frame, " at ", ang, " degrees: ", millis() - t0, " ms\n";
+    frame++;
+    ang = (ang + STEP) % 360;
+}

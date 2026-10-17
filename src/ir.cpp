@@ -254,10 +254,16 @@ Program compile(const std::string& src, bool optimise) {
     Code lit = parse(src, false, p.raw_ops, p.error);
     if (!p.error.empty()) return p;
     if (!fix_targets(lit, p.error)) return p;
-    p.literal = lit;
-    if (!optimise) { p.code = std::move(lit); return p; }
+    if (!optimise) { p.literal = lit; p.code = std::move(lit); return p; }
     size_t raw = 0;
     Code c = parse(src, true, raw, p.error);
+    // For the device-window slow path the literal program may fold runs of '<' / '>'
+    // into one move: moving touches no cell, so devices see exactly the same accesses,
+    // and slow-path entries and exits are block starts, which begin a run.  Without
+    // this, a loop copying a value into a register one unit at a time walks the
+    // pointer between RAM and the window cell by cell on every turn.
+    p.literal = c;
+    if (!fix_targets(p.literal, p.error)) return p;
     c = canonicalise(c);
     for (int iter = 0; iter < 32 && optimise_once(c); iter++) {}
     if (!fix_targets(c, p.error)) return p;

@@ -667,8 +667,48 @@ struct Gen {
         releaseN(b, n); releaseN(h, n);
         if (sgn) { if_nonzero(s, [&] { add(w + n - 1, 128); }); release(s); }
     }
-    // dst += a * b (mod 2^8n); a and b consumed
-    void mulN(int64_t a, int64_t b, int64_t dst, int n) {
+    // w shifted by m whole bytes (left, or right with the sign copied when sgn): byte moves, no bit loops
+    void shift_bytes(int64_t w, int n, int m, bool left, bool sgn) {
+        int64_t s = -1;
+        if (!left && sgn) { s = tmp(); sign_flag(w + n - 1, s); }
+        int64_t t = tmpN(n);
+        moveN(w, t, n);
+        for (int k = 0; k < n; k++) {
+            int src = left ? k - m : k + m;
+            if (src >= 0 && src < n) move(t + src, {{w + k, 1}});
+        }
+        releaseN(t, n);                                // the bytes shifted out are cleared here
+        if (s >= 0) {
+            if_nonzero(s, [&] { for (int k = std::max(n - m, 0); k < n; k++) add(w + k, 255); });
+            release(s);
+        }
+    }
+    // dst += a * b (mod 2^8n); a and b consumed.  The loop runs once per bit of the
+    // multiplier b up to its highest set bit, so the operands are first arranged to
+    // make b small: for signed values both are negated when that leaves a smaller
+    // non-negative multiplier (the product is unchanged), and the smaller one is b.
+    void mulN(int64_t a, int64_t b, int64_t dst, int n, bool sgn = false) {
+        if (n > 1) {
+            if (sgn) {
+                int64_t s = tmp(); sign_flag(b + n - 1, s);
+                if_nonzero(s, [&] { negN(a, n); negN(b, n); });          // now b >= 0
+                release(s);
+            }
+            int64_t s = tmp();
+            if (sgn) sign_flag(a + n - 1, s);
+            int64_t m = tmpN(n); copyN(a, m, n);                         // m = |a| (for signed)
+            if (sgn) { int64_t s2 = tmp(); copy(s, s2); if_nonzero(s2, [&] { negN(m, n); }); release(s2); }
+            int64_t lt = tmp(); ltN_cells(m, b, n, lt, 1);
+            if_nonzero(lt, [&] {
+                if (sgn) if_nonzero(s, [&] { negN(a, n); negN(b, n); });
+                int64_t t = tmpN(n);
+                moveN(a, t, n); moveN(b, a, n); moveN(t, b, n);
+                releaseN(t, n);
+            });
+            release(lt);
+            releaseN(m, n);
+            release(s);
+        }
         int64_t f = tmp();
         nonzeroN(b, f, n);
         open(f);
@@ -709,6 +749,20 @@ struct Gen {
         if_nonzero(z, [&] { moveN(a, r, n); clear(f); });
         if_nonzero(f, [&] {
             int64_t cnt = tmp(); set(cnt, 8 * n);
+            // While the remainder is still 0, the dividend's leading zero bits only shift
+            // it along: skip whole zero bytes with byte moves instead of 8 steps each.
+            if (n > 1) {
+                int64_t go = tmp(); set(go, 1);
+                for (int j = 0; j < n - 1; j++) {
+                    int64_t nz = tmp(); copy(a + n - 1, nz);
+                    if_nonzero(nz, [&] { clear(go); });
+                    release(nz);
+                    int64_t g = tmp(); copy(go, g);
+                    if_nonzero(g, [&] { shift_bytes(a, n, 1, true, false); add(cnt, -8); });
+                    release(g);
+                }
+                release(go);
+            }
             open(cnt);
             {
                 add(cnt, -1);
@@ -1490,7 +1544,7 @@ struct Gen {
             if (k) { int64_t x = tmpN(n); eval_into(*var, x, t); mul_constN(x, *k, dst, n); releaseN(x, n); return; }
             int64_t x = tmpN(n); eval_into(a, x, t);
             int64_t y = tmpN(n); eval_into(b, y, t);
-            mulN(x, y, dst, n);
+            mulN(x, y, dst, n, t->is_signed);
             releaseN(y, n); releaseN(x, n);
             return;
         }
@@ -1507,8 +1561,12 @@ struct Gen {
             bool left = o == "<<";
             if (auto k = fold(b, true)) {
                 eval_into(a, dst, t);
-                if (*k >= 8 * n) { if (left || !t->is_signed) clearN(dst, n); else for (int i = 0; i < 8 * n; i++) shrN(dst, n, true); }
-                else for (int64_t i = 0; i < *k; i++) { if (left) shlN(dst, n); else shrN(dst, n, t->is_signed); }
+                if (*k >= 8 * n) { if (left || !t->is_signed) clearN(dst, n); else shift_bytes(dst, n, n, false, true); }
+                else {
+                    int m = (int)(*k / 8);                       // whole bytes first, then single bits
+                    if (m) shift_bytes(dst, n, m, left, t->is_signed);
+                    for (int64_t i = 0; i < *k % 8; i++) { if (left) shlN(dst, n); else shrN(dst, n, t->is_signed); }
+                }
                 return;
             }
             int64_t c = tmp(); eval8(b, c);

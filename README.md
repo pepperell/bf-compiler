@@ -185,7 +185,9 @@ window (Ctrl+F, or automatically on the first plot). `programs/serial_echo.b` an
 Readable registers are latches: they read back what was last written, which is what makes
 the normal brainfuck copy idiom `[>+<-]` work on a register. Optimised code never executes
 against device registers: every compiled program keeps a literal one-instruction-per-command
-copy, and whenever a block of optimised code could reach the device window the executor
+copy (only runs of `<` and `>` are merged into one move, since moving touches no cell, so
+a loop that copies a value into a register unit by unit does not walk the pointer cell by
+cell on every turn), and whenever a block of optimised code could reach the device window the executor
 runs the literal copy from the same source position until the pointer is back in RAM at a
 point where the optimised code can resume. So a trigger written inside a loop fires once
 per iteration exactly as the source says, in the JIT, the interpreter and the debugger.

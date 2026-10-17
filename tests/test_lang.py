@@ -243,6 +243,12 @@ def typed_grid(name, typ, values, ops, shift_counts=(0, 1, 3, 7, 15, 31)):
                 lines.append(f"k = in; r = a {op} k; print r, \" \";")
                 stdin += bytes([k])
                 exp += str(typed_op(op, a, k, bits, signed)) + " "
+            # constant counts: whole bytes are moved, the rest shifted bit by bit
+            for k in (8, 9, 16, 17, 24, 31, bits):
+                if k > bits:
+                    continue
+                lines.append(f'r = a {op} {k}; print r, " ";')
+                exp += str(typed_op(op, a, k, bits, signed)) + " "
         lines.append('out "\\n";')
         exp += "\n"
     return check(name, "\n".join(lines), exp.encode(), stdin)

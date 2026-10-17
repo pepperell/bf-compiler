@@ -121,8 +121,9 @@ TALKING TO HARDWARE
 OPTIMISATION AND DEVICES
   Loops such as [>+<-] are compiled into single multiply-add instructions.
   That never changes what a device sees: whenever the pointer can reach the
-  device window the executor runs the literal program, one command at a time,
-  so a trigger inside a loop fires once per iteration exactly as written.)";
+  device window the executor runs the literal program, one command at a time
+  (only runs of < and > are merged, since moving touches no cell), so a
+  trigger inside a loop fires once per iteration exactly as written.)";
 
 const wchar_t* MEMORY_TEXT = LR"(MEMORY MAP
 
