@@ -1,0 +1,6 @@
+out/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
