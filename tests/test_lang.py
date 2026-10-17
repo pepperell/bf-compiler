@@ -506,11 +506,56 @@ def golden(update):
     return ok
 
 
+def samples(update):
+    """programs/samples/*.bfl must compile without warnings and print tests/samples/<name>.out
+    (fed tests/samples/<name>.in when present).  A file without a .out is a module: it must compile.
+    --update-golden also rewrites the .out files.  Returns (checked, failures)."""
+    root = os.path.join(os.path.dirname(__file__), "..")
+    sdir = os.path.join(root, "programs", "samples")
+    edir = os.path.join(root, "tests", "samples")
+    checked = fails = 0
+    for name in sorted(os.listdir(sdir)):
+        if not name.endswith(".bfl"):
+            continue
+        checked += 1
+        base = name[:-4]
+        src = os.path.join(sdir, name)
+        want_path = os.path.join(edir, base + ".out")
+        in_path = os.path.join(edir, base + ".in")
+        stdin = open(in_path, "rb").read() if os.path.exists(in_path) else b""
+        if not os.path.exists(want_path) and not update:
+            r = subprocess.run([BF, "--warn", "--emit", os.path.join(TMP, base + ".b"), src], capture_output=True, timeout=120)
+            ok = r.returncode == 0 and b"warning" not in r.stderr
+            print(("PASS " if ok else "FAIL ") + f"sample-{name} (module, compiles)")
+            if not ok:
+                print("   " + r.stderr.decode("latin-1").strip())
+                fails += 1
+            continue
+        r = subprocess.run([BF, "--warn", "--quiet-devices", src], input=stdin, capture_output=True, timeout=300)
+        err = r.stderr.decode("latin-1").strip()
+        if update and r.returncode == 0 and not err and r.stdout:
+            os.makedirs(edir, exist_ok=True)
+            open(want_path, "wb").write(r.stdout)
+            print(f"UPDATED {want_path}")
+            continue
+        want = open(want_path, "rb").read() if os.path.exists(want_path) else None
+        ok = r.returncode == 0 and not err and r.stdout == want
+        print(("PASS " if ok else "FAIL ") + f"sample-{name}")
+        if not ok:
+            print(f"   rc={r.returncode} stderr={err!r}")
+            if r.stdout != want:
+                print("   output differs from " + want_path)
+            fails += 1
+    return checked, fails
+
+
 def main():
     update = "--update-golden" in sys.argv
     fails = 0
     if not golden(update):
         fails += 1
+    n_samples, f_samples = samples(update)
+    fails += f_samples
     for name, src, expected, stdin, extra, files in CASES:
         EXTRA_FILES.clear(); EXTRA_FILES.update(files)
         if not check(name, src, expected, stdin, extra):
@@ -552,7 +597,7 @@ def main():
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1
-    total = len(CASES) + 3 + len(errors) + len(DIAGS) + len(GRIDS)
+    total = len(CASES) + 3 + len(errors) + len(DIAGS) + len(GRIDS) + n_samples
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

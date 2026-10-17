@@ -1,0 +1,50 @@
+// mergesort.bfl - merge sort of signed numbers.
+//
+// Shows: a rec proc with a local array (each call gets a fresh, zeroed copy
+// taken from the top of the heap and given back on return), an array
+// parameter, and signed int comparisons.
+//
+//     bf programs\samples\mergesort.bfl
+
+const COUNT = 16;
+
+heap int data[16];
+
+// Sort a[lo .. hi] (inclusive).
+rec proc msort(ref int a[], byte lo, byte hi) {
+    if (lo >= hi) { return; }
+    byte mid = (lo + hi) / 2;
+    msort(a, lo, mid);
+    msort(a, mid + 1, hi);
+
+    int tmp[16];                    // this call's scratch space, in the heap
+    byte i = lo;
+    byte j = mid + 1;
+    byte k = 0;
+    while (i <= mid && j <= hi) {
+        if (a[i] <= a[j]) { tmp[k] = a[i]; i++; } else { tmp[k] = a[j]; j++; }
+        k++;
+    }
+    while (i <= mid) { tmp[k] = a[i]; i++; k++; }
+    while (j <= hi)  { tmp[k] = a[j]; j++; k++; }
+    byte m;
+    for (m = 0; m < k; m++) { a[lo + m] = tmp[m]; }
+}
+
+proc show(string title) {
+    print title;
+    byte s;
+    for (s = 0; s < COUNT; s++) { print " ", data[s]; }
+    out '\n';
+}
+
+// Fill with a spread of positive and negative values.
+int v = 1234;
+byte n;
+for (n = 0; n < COUNT; n++) {
+    v = v * 37 + 11;
+    data[n] = v % 1000;
+}
+show("before:");
+msort(data, 0, COUNT - 1);
+show("after: ");

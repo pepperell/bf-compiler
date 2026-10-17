@@ -1,0 +1,83 @@
+// life.bfl - Conway's Game of Life in the terminal.
+//
+// Shows: two heap grids swapped by exchanging pointers, ANSI escape codes
+// (cursor home, colours) on the VT100 terminal, and the TICKS clock for a
+// frame delay.  The board wraps around at the edges.
+//
+//     bf programs\samples\life.bfl           (or open it in bfui and press F5)
+
+const W = 40;
+const H = 16;
+const GENERATIONS = 60;
+const DELAY_MS = 60;
+
+heap byte a[640];             // W * H
+heap byte b[640];
+
+byte* cur = a;
+byte* nxt = b;
+
+proc put(byte x, byte y) { cur[word(y) * W + x] = 1; }
+
+// Wait about ms milliseconds using the millisecond counter.
+proc wait(byte ms) {
+    pulse TICK_LATCH;
+    byte t0 = TICKS0;
+    byte gone = 0;
+    while (gone < ms) {
+        pulse TICK_LATCH;
+        gone = TICKS0 - t0;
+    }
+}
+
+proc draw(word gen) {
+    out "\e[H";                                   // cursor to the top left
+    print "\e[1mGeneration ", gen, "\e[0m   \n";
+    byte y;
+    for (y = 0; y < H; y++) {
+        byte x;
+        for (x = 0; x < W; x++) {
+            if (cur[word(y) * W + x]) { out "\e[32m#\e[0m"; } else { out '.'; }
+        }
+        out '\n';
+    }
+}
+
+proc step() {
+    byte y;
+    for (y = 0; y < H; y++) {
+        byte up = y - 1;
+        if (y == 0) { up = H - 1; }
+        byte down = y + 1;
+        if (down == H) { down = 0; }
+        byte x;
+        for (x = 0; x < W; x++) {
+            byte left = x - 1;
+            if (x == 0) { left = W - 1; }
+            byte right = x + 1;
+            if (right == W) { right = 0; }
+            byte* r0 = cur + word(up) * W;
+            byte* r1 = cur + word(y) * W;
+            byte* r2 = cur + word(down) * W;
+            byte n = r0[left] + r0[x] + r0[right] + r1[left] + r1[right] + r2[left] + r2[x] + r2[right];
+            byte alive = r1[x];
+            nxt[word(y) * W + x] = n == 3 || (alive && n == 2);
+        }
+    }
+    byte* t = cur;          // the new generation becomes the current one
+    cur = nxt;
+    nxt = t;
+}
+
+// A glider, a blinker and an R-pentomino.
+put(1, 0); put(2, 1); put(0, 2); put(1, 2); put(2, 2);
+put(30, 3); put(31, 3); put(32, 3);
+put(20, 8); put(21, 8); put(19, 9); put(20, 9); put(20, 10);
+
+out "\e[2J";                                      // clear the screen
+word g;
+for (g = 0; g <= GENERATIONS; g++) {
+    draw(g);
+    step();
+    wait(DELAY_MS);
+}

@@ -1,0 +1,6 @@
+sorted: apple banana cherry date fig pear
+that is 41 characters; the first 'b' is at 14, there is no 'z' (-1)
+shouted backwards: DLROW ,OLLEH
+atol("-123456") * 3 + 1 = -370367
+as unsigned: 4294596929
+strcmp("abc", "abd") = -1

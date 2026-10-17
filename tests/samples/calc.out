@@ -1,0 +1,17 @@
+BFL calculator: + - * / % ( ) on 32-bit integers.  An empty line quits.
+> 12 * (3 + 4) - -5
+= 89
+> 100 / 7
+= 14
+> -100 % 7
+= -2
+> -(2 * 3) * 4
+= -24
+> (2+3
+      ^ syntax error
+> 5/0
+division by zero
+> 1000000 * 1000
+= 1000000000
+> 
+bye

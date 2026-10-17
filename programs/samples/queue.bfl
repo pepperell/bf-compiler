@@ -1,0 +1,50 @@
+// queue.bfl - a first-in first-out queue of words in the heap.
+//
+// A module: maze.bfl brings it in with  import "queue.bfl";  (the file is found
+// next to the importing one).  Debug maze.bfl in the UI and step into push or
+// pop to see this file open read-only in the editor's place.
+
+struct Queue {
+    word* data;         // cap words, allocated by queue_init
+    word  cap;
+    word  head;         // next to pop
+    word  tail;         // next free slot
+    word  size;
+}
+
+// Allocate room for cap words.  Returns 0 when the heap is full.
+proc byte queue_init(ref Queue q, word cap) {
+    q.data = new word[cap];
+    q.cap = cap;
+    q.head = 0;
+    q.tail = 0;
+    q.size = 0;
+    return q.data != null;
+}
+
+proc byte queue_empty(ref Queue q) { return q.size == 0; }
+
+// Add v at the back.  Returns 0 (and drops v) when the queue is full.
+proc byte push(ref Queue q, word v) {
+    if (q.size == q.cap) { return 0; }
+    q.data[q.tail] = v;
+    q.tail++;
+    if (q.tail == q.cap) { q.tail = 0; }
+    q.size++;
+    return 1;
+}
+
+// Take the value at the front (0 when empty).
+proc word pop(ref Queue q) {
+    if (q.size == 0) { return 0; }
+    word v = q.data[q.head];
+    q.head++;
+    if (q.head == q.cap) { q.head = 0; }
+    q.size--;
+    return v;
+}
+
+proc queue_free(ref Queue q) {
+    free(q.data);
+    q.data = null;
+}

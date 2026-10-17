@@ -1,0 +1,67 @@
+// numbers.bfl - the integer types at work.
+//
+// Shows: sbyte, int, dword and long; wrap-around; signed division and
+// remainder; casts; math.bfl (gcd, isqrt, pow, abs, clamp).
+//
+//     bf programs\samples\numbers.bfl
+
+import "math.bfl";
+
+// Factorials grow fast: 12! is the largest that fits a dword.
+print "factorials:\n";
+dword f = 1;
+byte i;
+for (i = 1; i <= 13; i++) {
+    f *= i;
+    print "  ", i, "! = ", f;
+    if (i == 13) { print "   (wrapped: 13! does not fit 32 bits)"; }
+    out '\n';
+}
+
+// Fibonacci numbers in a signed long, up to the largest that fits.
+long a = 0;
+long b = 1;
+byte steps = 0;
+while (b > 0) {
+    long c = a + b;
+    a = b;
+    b = c;
+    steps++;
+}
+print "the largest Fibonacci number in a long is ", a, " (", steps, " steps; the next one wraps to ", b, ")\n";
+
+// Division truncates towards zero and % takes the dividend's sign, as in C.
+print "division:  7/2=", 7 / 2, "  -7/2=", -7 / 2, "  7/-2=", 7 / -2, "  -7%2=", -7 % 2, "  7%-2=", 7 % -2, "\n";
+
+// Wrap-around in each width.
+sbyte s = 127;
+s++;
+int w = 32767;
+w++;
+byte u = 0;
+u--;
+print "wrap: sbyte 127+1=", s, "  int 32767+1=", w, "  byte 0-1=", u, "\n";
+
+// Casts keep or extend the bits.
+int neg = -2;
+print "casts: int -2 as word=", word(neg), "  as byte=", byte(neg), "  sbyte -3 to int=", int(sbyte(-3)), "\n";
+
+// Shifts: >> copies the sign bit for signed types.
+int m = -64;
+word um = 0xFFC0;
+print "shifts: int -64>>2=", m >> 2, "  word 0xFFC0>>2=", um >> 2, "  1<<15=", word(1) << 15, "\n";
+
+// The math library.
+print "gcd(1071, 462)=", gcd(1071, 462), "  isqrt(1000000)=", isqrt(1000000), "  pow(3, 20)=", pow(3, 20), "\n";
+print "abs(-42)=", abs(-42), "  clamp(500, -10, 100)=", clamp(500, -10, 100), "  min(-3, 2)=", min(-3, 2), "\n";
+
+// Collatz: how long does 27 take to reach 1, and how high does it climb?
+dword x = 27;
+word len = 0;
+dword top = 27;
+while (x != 1) {
+    if (x & 1) { x = 3 * x + 1; } else { x = x / 2; }
+    if (x > top) { top = x; }
+    len++;
+}
+print "collatz(27): ", len, " steps, peak ", top, "\n";

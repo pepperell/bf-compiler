@@ -1,0 +1,85 @@
+// text.bfl - working with strings from the standard library.
+//
+// Shows: import, string literals as byte* in the heap, strings.bfl
+// (strlen strcpy strcat strcmp strchr strdup utoa ltoa atol), an array of
+// string pointers, building text in a heap buffer, strdup and free.
+//
+//     bf programs\samples\text.bfl
+
+import "strings.bfl";
+
+heap byte buf[96];
+heap byte num[12];
+
+// Sort an array of string pointers alphabetically (bubble sort).
+string words[6];
+proc sort_words() {
+    byte pass;
+    for (pass = 0; pass < 5; pass++) {
+        byte i;
+        for (i = 0; i < 5 - pass; i++) {
+            if (strcmp(words[i], words[i + 1]) > 0) {
+                string t = words[i];
+                words[i] = words[i + 1];
+                words[i + 1] = t;
+            }
+        }
+    }
+}
+
+// Upper-case a string in place.
+proc upcase(string s) {
+    word i = 0;
+    while (s[i]) {
+        if (s[i] >= 'a' && s[i] <= 'z') { s[i] = s[i] - 32; }
+        i++;
+    }
+}
+
+// Reverse a string in place.
+proc reverse(string s) {
+    word n = strlen(s);
+    if (n < 2) { return; }
+    word i = 0;
+    word j = n - 1;
+    while (i < j) {
+        byte t = s[i];
+        s[i] = s[j];
+        s[j] = t;
+        i++;
+        j--;
+    }
+}
+
+words[0] = "pear";
+words[1] = "apple";
+words[2] = "fig";
+words[3] = "banana";
+words[4] = "cherry";
+words[5] = "date";
+sort_words();
+
+// Join them into one sentence in buf.
+strcpy(buf, "sorted:");
+byte k;
+for (k = 0; k < 6; k++) {
+    strcat(buf, " ");
+    strcat(buf, words[k]);
+}
+print buf, "\n";
+print "that is ", strlen(buf), " characters; the first 'b' is at ", strchr(buf, 'b'), ", there is no 'z' (", strchr(buf, 'z'), ")\n";
+
+// strdup makes a copy we may change; the literal stays as it was.
+string shout = strdup("hello, world");
+upcase(shout);
+reverse(shout);
+print "shouted backwards: ", shout, "\n";
+free(shout);
+
+// Numbers to text and back.
+long n = atol("-123456");
+n = n * 3 + 1;
+print "atol(\"-123456\") * 3 + 1 = ", ltoa(n, num), "\n";
+print "as unsigned: ", utoa(dword(n), num), "\n";
+strcpy(buf, "abc");
+print "strcmp(\"abc\", \"abd\") = ", strcmp(buf, "abd"), "\n";

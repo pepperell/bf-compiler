@@ -1,0 +1,124 @@
+// linked_list.bfl - a sorted singly linked list in the heap.
+//
+// Shows: structs, pointers and ->, new and free, null, signed int values,
+// and the allocator reusing freed blocks (memory.bfl's heap_unused).
+//
+//     bf programs\samples\linked_list.bfl
+
+import "memory.bfl";
+
+struct Node {
+    int   val;
+    Node* next;
+}
+
+Node* head = null;
+
+// Insert v so the list stays sorted, smallest first.
+proc insert_sorted(int v) {
+    Node* n = new Node;
+    n->val = v;
+    if (head == null || v < head->val) {
+        n->next = head;
+        head = n;
+        return;
+    }
+    Node* p = head;
+    while (p->next != null && p->next->val <= v) { p = p->next; }
+    n->next = p->next;
+    p->next = n;
+}
+
+proc show(string title) {
+    print title, ": [";
+    Node* p = head;
+    while (p != null) {
+        print p->val;
+        p = p->next;
+        if (p != null) { out ", "; }
+    }
+    out "]\n";
+}
+
+proc word length() {
+    word n = 0;
+    Node* p = head;
+    while (p != null) { n++; p = p->next; }
+    return n;
+}
+
+// Turn the list around by flipping every next pointer.
+proc reverse() {
+    Node* prev = null;
+    Node* cur = head;
+    while (cur != null) {
+        Node* after = cur->next;
+        cur->next = prev;
+        prev = cur;
+        cur = after;
+    }
+    head = prev;
+}
+
+// Unlink and free every node with a negative value; returns how many went.
+proc word remove_negative() {
+    word gone = 0;
+    while (head != null && head->val < 0) {
+        Node* d = head;
+        head = head->next;
+        free(d);
+        gone++;
+    }
+    if (head == null) { return gone; }
+    Node* p = head;
+    while (p->next != null) {
+        if (p->next->val < 0) {
+            Node* d2 = p->next;
+            p->next = d2->next;
+            free(d2);
+            gone++;
+        } else {
+            p = p->next;
+        }
+    }
+    return gone;
+}
+
+proc free_all() {
+    while (head != null) {
+        Node* d = head;
+        head = head->next;
+        free(d);
+    }
+}
+
+word fresh = heap_unused();
+
+insert_sorted(42);
+insert_sorted(-7);
+insert_sorted(15);
+insert_sorted(0);
+insert_sorted(-300);
+insert_sorted(1000);
+insert_sorted(8);
+insert_sorted(-1);
+insert_sorted(15);
+show("sorted");
+print "length ", length(), ", each node is ", sizeof(Node), " bytes plus a 2-byte block header\n";
+
+reverse();
+show("reversed");
+
+print "removed ", remove_negative(), " negative values\n";
+show("kept");
+
+word used = fresh - heap_unused();
+print "heap bytes handed out so far: ", used, "\n";
+
+// Freed blocks go on the free list and are handed out again.
+free_all();
+insert_sorted(3);
+insert_sorted(2);
+insert_sorted(1);
+show("rebuilt");
+print "heap bytes handed out now:    ", fresh - heap_unused(), " (freed blocks were reused)\n";

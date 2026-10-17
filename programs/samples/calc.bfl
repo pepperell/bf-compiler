@@ -1,0 +1,122 @@
+// calc.bfl - an interactive calculator with a recursive-descent parser.
+//
+// Shows: mutually recursive procedures (expr -> term -> factor -> expr),
+// signed 32-bit arithmetic, a line buffer in the heap, keyboard input.
+//
+// Type an expression and press Enter; an empty line quits.
+//     12 * (3 + 4) - -5        100 / 7        100 % 7        -(2 * 3) * 4
+//
+// The UI terminal does not echo keys, so this program echoes what it reads.
+// Set ECHO to 0 when you run it in a console, which echoes for you:
+//     bf programs\samples\calc.bfl
+
+const ECHO = 1;
+const SIZE = 80;
+
+heap byte line[80];
+byte pos = 0;
+byte err = 0;           // 0 ok, 1 syntax error, 2 division by zero
+
+// Read a line with echo and backspace; returns its length (0 also at end of input).
+proc byte read_echo() {
+    byte n = 0;
+    byte c = 0;
+    c = in;
+    while (c != 10 && c != 13 && c != 0) {
+        if (c == 8 || c == 127) {
+            if (n > 0) { n--; if (ECHO) { out "\b \b"; } }
+        } else if (n + 1 < SIZE) {
+            line[n] = c;
+            n++;
+            if (ECHO) { out c; }
+        }
+        c = 0;
+        c = in;
+    }
+    line[n] = 0;
+    if (ECHO) { out '\n'; }
+    return n;
+}
+
+proc skip() { while (line[pos] == ' ') { pos++; } }
+
+// factor := number | '-' factor | '(' expr ')'
+rec proc long factor() {
+    skip();
+    byte c = line[pos];
+    if (c == '-') {
+        pos++;
+        long negated = factor();
+        return -negated;
+    }
+    if (c == '(') {
+        pos++;
+        long inner = expr();
+        skip();
+        if (line[pos] == ')') { pos++; } else { err = 1; }
+        return inner;
+    }
+    if (c >= '0' && c <= '9') {
+        long v = 0;
+        while (line[pos] >= '0' && line[pos] <= '9') {
+            v = v * 10 + (line[pos] - '0');
+            pos++;
+        }
+        return v;
+    }
+    err = 1;
+    return 0;
+}
+
+// term := factor { ('*' | '/' | '%') factor }
+rec proc long term() {
+    long acc = factor();
+    while (err == 0) {
+        skip();
+        byte op = line[pos];
+        if (op != '*' && op != '/' && op != '%') { break; }
+        pos++;
+        long rhs = factor();
+        if (op == '*') { acc = acc * rhs; }
+        else if (rhs == 0) { err = 2; }
+        else if (op == '/') { acc = acc / rhs; }
+        else { acc = acc % rhs; }
+    }
+    return acc;
+}
+
+// expr := term { ('+' | '-') term }
+rec proc long expr() {
+    long sum = term();
+    while (err == 0) {
+        skip();
+        byte op2 = line[pos];
+        if (op2 != '+' && op2 != '-') { break; }
+        pos++;
+        long t = term();
+        if (op2 == '+') { sum = sum + t; } else { sum = sum - t; }
+    }
+    return sum;
+}
+
+print "BFL calculator: + - * / % ( ) on 32-bit integers.  An empty line quits.\n";
+while (1) {
+    out "> ";
+    byte len = read_echo();
+    if (len == 0) { break; }
+    pos = 0;
+    err = 0;
+    long result = expr();
+    skip();
+    if (err == 0 && line[pos] != 0) { err = 1; }
+    if (err == 1) {
+        byte col;
+        for (col = 0; col < pos + 2; col++) { out ' '; }
+        print "^ syntax error\n";
+    } else if (err == 2) {
+        print "division by zero\n";
+    } else {
+        print "= ", result, "\n";
+    }
+}
+print "bye\n";

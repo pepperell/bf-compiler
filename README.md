@@ -117,7 +117,11 @@ changes (run it with `--update-golden` after a deliberate codegen change).
 ## Example programs
 
 `programs/` holds small demos for the devices (`leds`, `serial_echo`, `fb`) in
-brainfuck and in BFL. `programs/thirdparty/` holds programs by other authors:
+brainfuck and in BFL. `programs/samples/` holds BFL programs that use the
+language's newer features: a linked list, a binary search tree, a calculator
+with a recursive-descent parser, N queens, merge sort, string handling, the
+integer types, a two-file maze solver and an animated Game of Life; its README
+says what each one shows. `programs/thirdparty/` holds programs by other authors:
 Erik Bosman's `mandelbrot.b`, and 32 programs by Daniel B. Cristofani from
 brainfuck.org (CC BY-SA 4.0) including a self-interpreter, a universal Turing
 machine, Life, tic-tac-toe, quines, sorts and streaming digits of e. Its README

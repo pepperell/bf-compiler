@@ -1,0 +1,52 @@
+// queens.bfl - the N queens puzzle by backtracking.
+//
+// Shows: a rec proc taking an array parameter (passed as a pointer into the
+// heap), inline procedures given the same array, and the save stack.
+//
+//     bf programs\samples\queens.bfl
+
+const N = 6;
+
+heap byte cols[8];      // cols[r] = the column of the queen in row r
+word solutions = 0;
+
+// Can a queen go at (row, c) given the queens in rows 0 .. row-1?
+proc byte safe(ref byte col[], byte row, byte c) {
+    byte r;
+    for (r = 0; r < row; r++) {
+        byte q = col[r];
+        if (q == c) { return 0; }
+        if (q + row == c + r) { return 0; }      // same diagonal
+        if (q + r == c + row) { return 0; }      // same anti-diagonal
+    }
+    return 1;
+}
+
+proc draw(ref byte col[]) {
+    byte r;
+    for (r = 0; r < N; r++) {
+        byte c;
+        for (c = 0; c < N; c++) {
+            if (col[r] == c) { out "Q "; } else { out ". "; }
+        }
+        out '\n';
+    }
+}
+
+rec proc place(ref byte col[], byte row) {
+    if (row == N) {
+        solutions++;
+        if (solutions == 1) { print "first solution:\n"; draw(col); }
+        return;
+    }
+    byte c;
+    for (c = 0; c < N; c++) {
+        if (safe(col, row, c)) {
+            col[row] = c;
+            place(col, row + 1);
+        }
+    }
+}
+
+place(cols, 0);
+print N, " queens: ", solutions, " solutions\n";

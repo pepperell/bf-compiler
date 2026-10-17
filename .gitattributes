@@ -1,0 +1,2 @@
+# Expected outputs and inputs of the BFL samples are compared byte for byte.
+tests/samples/* -text

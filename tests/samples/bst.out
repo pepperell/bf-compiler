@@ -1,0 +1,8 @@
+adding: 12 76 4 53 5 54 21 1 97 5 12 69 95 41 30 89 7 81 80 86 88 70 16 16
+sorted: 1 4 5x2 7 12x2 16x2 21 30 41 53 54 69 70 76 80 81 86 88 89 95 97 
+21 distinct keys, height 8
+10 is not
+20 is not
+30 is in the tree
+40 is not
+50 is not

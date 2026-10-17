@@ -1,0 +1,93 @@
+// maze.bfl - shortest path through a maze by breadth-first search.
+//
+// Shows: a program in two files (queue.bfl is imported from this folder),
+// a struct passed by ref, heap arrays indexed by 16-bit expressions, and
+// string literals as data.
+//
+//     bf programs\samples\maze.bfl
+//
+// In the UI, set a breakpoint on a line of queue.bfl (pick it in the File box
+// on the toolbar, then F9) and debug with Ctrl+F5.
+
+import "queue.bfl";
+
+const W = 21;
+const H = 11;
+const NONE = 0xFFFF;
+
+heap byte grid[231];          // W * H characters
+heap word from[231];          // the cell each cell was reached from
+
+proc set_row(byte r, string s) {
+    byte c;
+    for (c = 0; c < W; c++) { grid[word(r) * W + c] = s[c]; }
+}
+
+set_row(0,  "#####################");
+set_row(1,  "#S    #       #     #");
+set_row(2,  "# ### # ##### # ### #");
+set_row(3,  "#   #   #   #   #   #");
+set_row(4,  "### ##### # ##### # #");
+set_row(5,  "#   #     #     # # #");
+set_row(6,  "# ### ######### # # #");
+set_row(7,  "#   #       #   #   #");
+set_row(8,  "# # ####### # ##### #");
+set_row(9,  "# #         #      E#");
+set_row(10, "#####################");
+
+// Find S and E.
+word start = 0;
+word goal = 0;
+word p;
+for (p = 0; p < W * H; p++) {
+    from[p] = NONE;
+    if (grid[p] == 'S') { start = p; }
+    if (grid[p] == 'E') { goal = p; }
+}
+
+// Breadth first: the first time E comes off the queue, the path is shortest.
+Queue q;
+queue_init(q, 64);
+push(q, start);
+from[start] = start;
+word visited = 0;
+while (!queue_empty(q)) {
+    word cur = pop(q);
+    visited++;
+    if (cur == goal) { break; }
+    // the four neighbours: up, down, left, right
+    word nb[4];
+    nb[0] = cur - W;
+    nb[1] = cur + W;
+    nb[2] = cur - 1;
+    nb[3] = cur + 1;
+    byte d;
+    for (d = 0; d < 4; d++) {
+        word n = nb[d];
+        if (grid[n] != '#' && from[n] == NONE) {
+            from[n] = cur;
+            push(q, n);
+        }
+    }
+}
+queue_free(q);
+
+if (from[goal] == NONE) {
+    print "no way through\n";
+} else {
+    // Walk back from E to S, marking the path.
+    word steps = 0;
+    word at = from[goal];
+    while (at != start) {
+        grid[at] = '.';
+        at = from[at];
+        steps++;
+    }
+    byte r;
+    for (r = 0; r < H; r++) {
+        byte c;
+        for (c = 0; c < W; c++) { out grid[word(r) * W + c]; }
+        out '\n';
+    }
+    print "shortest path: ", steps + 1, " moves (", visited, " cells explored)\n";
+}

@@ -1,0 +1,95 @@
+// bst.bfl - a binary search tree of pseudo-random keys.
+//
+// Shows: recursive procedures (rec proc) walking a pointer structure,
+// structs in the heap, 32-bit arithmetic for the random generator.
+//
+//     bf programs\samples\bst.bfl
+
+struct Tree {
+    word  key;
+    byte  count;        // how many times the key was added
+    Tree* left;
+    Tree* right;
+}
+
+Tree* root = null;
+dword seed = 2024;
+
+// A linear congruential generator (the constants from the C standard's example).
+proc word next_random(word limit) {
+    seed = seed * 1103515245 + 12345;
+    return word(seed >> 16) % limit;
+}
+
+// Insert without recursion: walk down to the empty slot.
+proc add(word k) {
+    if (root == null) {
+        root = new Tree;
+        root->key = k;
+        root->count = 1;
+        return;
+    }
+    Tree* t = root;
+    while (1) {
+        if (k == t->key) { t->count++; return; }
+        if (k < t->key) {
+            if (t->left == null) { t->left = new Tree; t = t->left; break; }
+            t = t->left;
+        } else {
+            if (t->right == null) { t->right = new Tree; t = t->right; break; }
+            t = t->right;
+        }
+    }
+    t->key = k;
+    t->count = 1;
+}
+
+// In-order walk: prints the keys sorted, with a repeat count where needed.
+rec proc walk(Tree* t) {
+    if (t == null) { return; }
+    walk(t->left);
+    print t->key;
+    if (t->count > 1) { print "x", t->count; }
+    out ' ';
+    walk(t->right);
+}
+
+rec proc byte height(Tree* t) {
+    if (t == null) { return 0; }
+    byte hl = height(t->left);
+    byte hr = height(t->right);
+    if (hl > hr) { return hl + 1; }
+    return hr + 1;
+}
+
+rec proc word nodes(Tree* t) {
+    if (t == null) { return 0; }
+    word nl = nodes(t->left);
+    word nr = nodes(t->right);
+    return nl + nr + 1;
+}
+
+// Is k in the tree?  A loop is enough for a search.
+proc byte contains(word k) {
+    Tree* t = root;
+    while (t != null) {
+        if (k == t->key) { return 1; }
+        if (k < t->key) { t = t->left; } else { t = t->right; }
+    }
+    return 0;
+}
+
+byte i;
+out "adding:";
+for (i = 0; i < 24; i++) {
+    word k = next_random(100);
+    print " ", k;
+    add(k);
+}
+out "\nsorted: ";
+walk(root);
+print "\n", nodes(root), " distinct keys, height ", height(root), "\n";
+byte q;
+for (q = 10; q < 60; q += 10) {
+    if (contains(q)) { print q, " is in the tree\n"; } else { print q, " is not\n"; }
+}

@@ -1,0 +1,8 @@
+sorted: [-300, -7, -1, 0, 8, 15, 15, 42, 1000]
+length 9, each node is 4 bytes plus a 2-byte block header
+reversed: [1000, 42, 15, 15, 8, 0, -1, -7, -300]
+removed 3 negative values
+kept: [1000, 42, 15, 15, 8, 0]
+heap bytes handed out so far: 54
+rebuilt: [1, 2, 3]
+heap bytes handed out now:    54 (freed blocks were reused)
