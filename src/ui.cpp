@@ -54,7 +54,7 @@ enum : int {
     ID_MEM_FOCUS, ID_BAUD0, ID_BAUD1, ID_BAUD2, ID_BAUD3, ID_BAUD4,
     ID_TB_SPEED, ID_TB_INTERP,
     ID_WATCHLIST, ID_WATCH_ADD, ID_WATCH_PTR, ID_WATCH_REMOVE, ID_WATCH_DEV,
-    ID_VIEW_FB, ID_LANG, ID_VIEW_GEN, ID_EXPORT_BF, ID_GENEDIT,
+    ID_VIEW_FB, ID_LANG, ID_VIEW_GEN, ID_EXPORT_BF, ID_GENEDIT, ID_GEN_ANNOTATED, ID_GEN_COMPACT, ID_GEN_COPY, ID_GEN_INFO,
     ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400,  // ID_SER_COM_BASE + n = COMn
     ID_HELP_BASE = 700                                             // ID_HELP_BASE + (int)help::Topic
 };
@@ -133,6 +133,8 @@ struct App {
     bool lang = false;
     bfl::Result lr;
     HWND genwnd = nullptr, genedit = nullptr;     // "Generated brainfuck" window
+    HWND gen_annotated = nullptr, gen_compact = nullptr, gen_copy = nullptr, gen_info = nullptr;
+    bool gen_is_compact = false;
     std::vector<std::pair<int32_t, int32_t>> src_pc;   // (source offset, pc) of the debug program, sorted
     std::set<int64_t> auto_watch;                 // watch rows added from the symbol table
 } app;
@@ -476,11 +478,23 @@ void update_title() {
 
 void append_output(const std::string& bytes) { term::feed(app.console, bytes.data(), bytes.size()); }
 
+// Show the generated brainfuck either annotated (one "# Lnn: source" comment per
+// statement, indented by nesting) or compacted to the commands alone.
 void gen_update() {
     if (!app.genedit) return;
     std::wstring w; w.reserve(app.lr.bf.size() + 256);
-    for (char c : app.lr.bf) { if (c == '\n') w += L"\r\n"; else w += (wchar_t)(unsigned char)c; }
+    size_t commands = 0;
+    for (char c : app.lr.bf) if (is_cmd((wchar_t)(unsigned char)c)) commands++;
+    if (app.gen_is_compact) {
+        for (char c : app.lr.bf) if (is_cmd((wchar_t)(unsigned char)c)) w += (wchar_t)c;
+    } else {
+        for (char c : app.lr.bf) { if (c == '\n') w += L"\r\n"; else w += (wchar_t)(unsigned char)c; }
+    }
     SetWindowTextW(app.genedit, w.c_str());
+    wchar_t buf[160];
+    if (app.lr.bf.empty()) wcscpy(buf, app.lang ? L"No program compiled yet." : L"The editor holds brainfuck, not BFL.");
+    else swprintf(buf, 160, L"%zu commands, %zu bytes annotated, %lld cells of variables and temporaries", commands, app.lr.bf.size(), (long long)app.lr.cells_used);
+    if (app.gen_info) SetWindowTextW(app.gen_info, buf);
 }
 
 // Compile the editor contents: BFL -> brainfuck -> IR, or brainfuck -> IR.
@@ -830,7 +844,39 @@ void fb_show(bool show) {
 // ---- generated brainfuck window (BFL mode) ------------------------------------------------------
 LRESULT CALLBACK gen_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case WM_SIZE: if (app.genedit) MoveWindow(app.genedit, 0, 0, LOWORD(l), HIWORD(l), TRUE); return 0;
+    case WM_SIZE: {
+        int cw = LOWORD(l), ch = HIWORD(l), bar = px(30), bh = px(24), y = px(3), x = px(6);
+        MoveWindow(app.gen_annotated, x, y, px(230), bh, TRUE); x += px(236);
+        MoveWindow(app.gen_compact, x, y, px(180), bh, TRUE);   x += px(186);
+        MoveWindow(app.gen_copy, x, y, px(60), bh, TRUE);       x += px(70);
+        MoveWindow(app.gen_info, x, y + px(4), std::max(10, cw - x - px(6)), bh, TRUE);
+        MoveWindow(app.genedit, 0, bar, cw, std::max(10, ch - bar), TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == ID_GEN_ANNOTATED || LOWORD(w) == ID_GEN_COMPACT) {
+            app.gen_is_compact = LOWORD(w) == ID_GEN_COMPACT;
+            SendMessageW(app.gen_annotated, BM_SETCHECK, app.gen_is_compact ? BST_UNCHECKED : BST_CHECKED, 0);
+            SendMessageW(app.gen_compact, BM_SETCHECK, app.gen_is_compact ? BST_CHECKED : BST_UNCHECKED, 0);
+            gen_update();
+        } else if (LOWORD(w) == ID_GEN_COPY) {
+            int n = GetWindowTextLengthW(app.genedit);
+            if (n > 0 && OpenClipboard(h)) {
+                HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, ((size_t)n + 1) * sizeof(wchar_t));
+                if (hg) {
+                    GetWindowTextW(app.genedit, (wchar_t*)GlobalLock(hg), n + 1);
+                    GlobalUnlock(hg);
+                    EmptyClipboard();
+                    SetClipboardData(CF_UNICODETEXT, hg);
+                }
+                CloseClipboard();
+                set_status(L"Generated brainfuck copied to the clipboard.");
+            }
+        }
+        return 0;
+    case WM_CTLCOLORSTATIC:
+        if ((HWND)l == app.genedit) { SetBkColor((HDC)w, RGB(255, 255, 255)); return (LRESULT)GetStockObject(WHITE_BRUSH); }
+        break;
     case WM_SETFOCUS: SetFocus(app.genedit); return 0;
     case WM_CLOSE: ShowWindow(h, SW_HIDE); CheckMenuItem(app.menu, ID_VIEW_GEN, MF_UNCHECKED); return 0;
     }
@@ -842,13 +888,22 @@ void gen_create(HINSTANCE inst) {
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.lpszClassName = L"BfGenerated";
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassW(&wc);
     app.genwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Generated brainfuck", WS_OVERLAPPEDWINDOW,
-                                 CW_USEDEFAULT, CW_USEDEFAULT, px(700), px(600), app.wnd, nullptr, inst, nullptr);
-    app.genedit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOHSCROLL | ES_READONLY,
-                                  0, 0, 10, 10, app.genwnd, (HMENU)(INT_PTR)ID_GENEDIT, inst, nullptr);
-    SendMessageW(app.genedit, WM_SETFONT, (WPARAM)app.mono, TRUE);
+                                 CW_USEDEFAULT, CW_USEDEFAULT, px(760), px(640), app.wnd, nullptr, inst, nullptr);
+    auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, HFONT font) {
+        HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, app.genwnd, (HMENU)(INT_PTR)id, inst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
+        return c;
+    };
+    app.gen_annotated = child(L"BUTTON", L"Annotated (comment per statement)", BS_AUTORADIOBUTTON | WS_GROUP, ID_GEN_ANNOTATED, app.ui_font);
+    app.gen_compact   = child(L"BUTTON", L"Compact (commands only)", BS_AUTORADIOBUTTON, ID_GEN_COMPACT, app.ui_font);
+    app.gen_copy      = child(L"BUTTON", L"Copy", BS_PUSHBUTTON, ID_GEN_COPY, app.ui_font);
+    app.gen_info      = child(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, ID_GEN_INFO, app.ui_font);
+    SendMessageW(app.gen_annotated, BM_SETCHECK, BST_CHECKED, 0);
+    // no ES_AUTOHSCROLL: lines wrap, so the compact form reads as one continuous string
+    app.genedit = child(L"EDIT", L"", WS_VSCROLL | ES_MULTILINE | ES_READONLY, ID_GENEDIT, app.mono);
     SendMessageW(app.genedit, EM_SETLIMITTEXT, 0, 0);
 }
 void gen_show(bool show) {

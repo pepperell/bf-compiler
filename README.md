@@ -78,8 +78,8 @@ Bytes and 16-bit words, arrays with variable index, `if`/`while`/`for`/`break`,
 the usual operators, `out`/`print`/`in`/`input`, `pulse` for trigger registers,
 `asm { }` for raw brainfuck. `bf --emit prog.b prog.bfl` writes the generated
 code (with a `# L12: source` comment before each statement) and a statement map.
-In the UI, Ctrl+B shows the generated brainfuck and the debugger works on the
-source: F11 steps a statement (into calls), F10 steps over, F9 breakpoints by
+In the UI, Ctrl+B shows the generated brainfuck, annotated or compacted to one
+continuous string of commands, and the debugger works on the source: F11 steps a statement (into calls), F10 steps over, F9 breakpoints by
 line, and the watch list is filled with the program's variables by name.
 `programs/leds.bfl`, `serial_echo.bfl`, `fb.bfl` and `primes.bfl` are examples;
 `tests/golden/` holds their generated code, and `tests\test_lang.py` fails if it

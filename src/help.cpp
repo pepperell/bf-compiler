@@ -250,8 +250,10 @@ TESTS AND BUILD
 const wchar_t* LANGUAGE_TEXT = LR"(BFL - A LOW-LEVEL LANGUAGE THAT COMPILES TO BRAINFUCK
 
 Files ending in .bfl are compiled to brainfuck before they run (Run > Source
-is BFL turns this on for other names).  Ctrl+B shows the generated brainfuck;
-File > Export writes it to a .b file.  The debugger steps by statement: F11
+is BFL turns this on for other names).  Ctrl+B shows the generated brainfuck,
+either annotated (a "# L12: source" comment before each statement, indented
+by nesting) or compacted to the commands alone as one continuous string;
+Copy puts the shown form on the clipboard and File > Export writes a .b file.  The debugger steps by statement: F11
 steps into a procedure call, F10 steps over it, F9 sets a breakpoint on the
 statement at the caret, and the watch list is filled with the program's
 global variables.  The full specification is docs/LANG.md in the repository.
