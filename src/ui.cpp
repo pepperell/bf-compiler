@@ -480,8 +480,10 @@ void append_output(const std::string& bytes) { term::feed(app.console, bytes.dat
 
 // Show the generated brainfuck either annotated (one "# Lnn: source" comment per
 // statement, indented by nesting) or compacted to the commands alone.
+// Setting tens of kilobytes into a word-wrapping edit control is slow, so the
+// text is only pushed while the window is visible (gen_show refreshes it).
 void gen_update() {
-    if (!app.genedit) return;
+    if (!app.genedit || !IsWindowVisible(app.genwnd)) return;
     std::wstring w; w.reserve(app.lr.bf.size() + 256);
     size_t commands = 0;
     for (char c : app.lr.bf) if (is_cmd((wchar_t)(unsigned char)c)) commands++;
@@ -495,8 +497,9 @@ void gen_update() {
     if (app.lr.bf.empty()) wcscpy(buf, app.lang ? L"No program compiled yet." : L"The editor holds brainfuck, not BFL.");
     else {
         Program p = compile(app.lr.bf, true);
+        size_t jb = jit_code_size(p);
         swprintf(buf, 200, L"%zu commands (%zu bytes annotated), %lld cells  ->  %zu IR instructions  ->  %zu bytes of x64 code",
-                 commands, app.lr.bf.size(), (long long)app.lr.cells_used, p.code.size(), jit_code_size(p));
+                 commands, app.lr.bf.size(), (long long)app.lr.cells_used, p.code.size(), jb);
     }
     if (app.gen_info) SetWindowTextW(app.gen_info, buf);
 }
@@ -717,7 +720,7 @@ void start_debug() {
     for (int32_t s : app.bps) for (int32_t pc : pcs_for_bp(s, text)) app.dbg->set_breakpoint(pc, true);
     if (app.lang) {
         std::vector<uint8_t> marks(app.prog.code.size(), 0);
-        for (const bfl::StmtRange& r : app.lr.stmts) { int32_t pc = first_pc_in(r.start, r.end); if (pc >= 0) marks[pc] = 1; }
+        for (const bfl::StmtRange& r : app.lr.stmts) { if (r.cont) continue; int32_t pc = first_pc_in(r.start, r.end); if (pc >= 0) marks[pc] = 1; }
         if (!marks.empty()) marks.back() = 1;          // END
         app.dbg->set_statement_marks(marks);
     }
@@ -760,7 +763,10 @@ void debug_step_over() {
     if (app.lang) {
         int s = x.op == END ? -1 : stmt_at(x.src);
         set_mode(Mode::DebugRunning);
-        if (s >= 0) app.dbg->step_statement(app.lr.stmts[s].start, app.lr.stmts[s].end); else app.dbg->step_statement();
+        // with recursion, "over" also waits for the stack pointer to return to its current value
+        int64_t sp = app.lr.sp_cell;
+        int spv = sp >= 0 ? app.machine->bus_read(sp) : 0;
+        if (s >= 0) app.dbg->step_statement(app.lr.stmts[s].start, app.lr.stmts[s].end, sp, spv); else app.dbg->step_statement(-1, -1, sp, spv);
         return;
     }
     if (x.op != JZ) { debug_step(); return; }
@@ -911,9 +917,9 @@ void gen_create(HINSTANCE inst) {
     SendMessageW(app.genedit, EM_SETLIMITTEXT, 0, 0);
 }
 void gen_show(bool show) {
-    if (show && app.lang) compile_editor(true);
     ShowWindow(app.genwnd, show ? SW_SHOWNOACTIVATE : SW_HIDE);
     CheckMenuItem(app.menu, ID_VIEW_GEN, show ? MF_CHECKED : MF_UNCHECKED);
+    if (show) { if (app.lang) compile_editor(true); else gen_update(); }
 }
 
 // ---- serial port selection ------------------------------------------------------------------

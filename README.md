@@ -76,7 +76,10 @@ halt;
 
 Bytes and 16-bit words, arrays with variable index, `if`/`while`/`for`/`break`,
 the usual operators, `out`/`print`/`in`/`input`, `pulse` for trigger registers,
-`asm { }` for raw brainfuck. `bf --emit prog.b prog.bfl` writes the generated
+`asm { }` for raw brainfuck, procedures with return values, and recursion:
+`rec proc` compiles a procedure as a trampoline with an explicit stack array
+(`docs/TRAMPOLINE.md`), so `programs/hanoi.bfl` and `programs/quicksort.bfl`
+are written the way they would be in C. `bf --emit prog.b prog.bfl` writes the generated
 code (with a `# L12: source` comment before each statement) and a statement map.
 In the UI, Ctrl+B shows the generated brainfuck, annotated or compacted to one
 continuous string of commands, and the debugger works on the source: F11 steps a statement (into calls), F10 steps over, F9 breakpoints by

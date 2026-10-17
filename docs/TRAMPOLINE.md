@@ -1,5 +1,14 @@
 # Recursion in BFL: the trampoline design
 
+**Status: implemented** as `rec proc` (see docs/LANG.md, "Procedures and
+recursion"). The compiler follows section 3 below with these choices: the
+dispatcher is a countdown chain over all blocks of all trampolined procedures
+plus the main program; `ref` parameters are copy-in / copy-out; the stack array
+sits just above the device window so variables and temporaries stay adjacent;
+the debugger's step-over waits for the stack pointer to return to its value at
+the call. Measured on `programs/hanoi.bfl` and `programs/quicksort.bfl`:
+quicksort of 16 bytes compiles to 110 000 commands and runs in 6 ms on the JIT.
+
 BFL inlines every procedure because brainfuck has no jump to an address, and
 because the compiler addresses every variable as a fixed cell. This note works
 out how recursion could be added anyway, measures a hand-made version, and

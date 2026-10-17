@@ -53,10 +53,14 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
             else if (c->dbg == 2) reason = 6;
             else if (executed > 0) {
                 if (c->dbg == 1) reason = 1;
-                else if (c->dbg == 3 && c->stmt_mark && c->stmt_mark[pc] &&
-                         !(code[pc].src >= c->skip_lo && code[pc].src < c->skip_hi)) reason = 1;
-                else if (c->bp && c->bp[pc]) reason = 2;
-                else if (pc == c->temp_bp) reason = 3;
+                else if (c->dbg == 3) {
+                    bool inside = code[pc].src >= c->skip_lo && code[pc].src < c->skip_hi;
+                    if (!inside) c->skip_left = 1;
+                    if (c->stmt_mark && c->stmt_mark[pc] && (!inside || c->skip_left) &&
+                        (c->cond_cell < 0 || c->tape[c->cond_cell] == (uint8_t)c->cond_val)) reason = 1;
+                }
+                if (!reason && c->bp && c->bp[pc]) reason = 2;
+                else if (!reason && pc == c->temp_bp) reason = 3;
             }
             if (reason) { c->pause_reason = reason; c->status = (int32_t)Status::Paused; break; }
             c->ptr = c->tape + p;                     // publish the live pointer for the debugger UI

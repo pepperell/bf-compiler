@@ -24,6 +24,7 @@ struct StmtRange {
     int     end_line;       // last source line of the statement
     int32_t start, end;     // [start, end) in the output text
     int     depth;          // nesting level (0 = top level)
+    bool    cont;           // continuation of a statement split by a rec call (no step mark)
 };
 
 struct Symbol {
@@ -41,6 +42,7 @@ struct Result {
     std::vector<Symbol>     symbols;
     std::vector<Error>      errors;      // empty on success
     int64_t                 cells_used = 0;
+    int64_t                 sp_cell = -1;    // trampoline stack pointer cell, -1 if no rec procs are used
     bool ok() const { return errors.empty(); }
 };
 

@@ -18,12 +18,13 @@ struct Expr;
 using ExprP = std::unique_ptr<Expr>;
 
 struct Expr {
-    enum Kind { Num, Str, Name, Index, In, Input, Unary, Binary };
+    enum Kind { Num, Str, Name, Index, In, Input, Unary, Binary, Call };
     Kind        kind;
     Pos         pos;
     int32_t     value = 0;      // Num
-    std::string text;           // Str: contents; Name/Index: identifier; Unary/Binary: operator
+    std::string text;           // Str: contents; Name/Index/Call: identifier; Unary/Binary: operator
     ExprP       a, b;           // Unary: a; Binary: a op b; Index: a = index expression
+    std::vector<ExprP> args;    // Call
 };
 
 struct Stmt;
@@ -36,16 +37,18 @@ struct Param {
 };
 
 struct Stmt {
-    enum Kind { Decl, Const, Assign, IncDec, If, While, For, Break, Continue, Out, Print, Pulse, Halt, Asm, Call, Block, Proc };
+    enum Kind { Decl, Const, Assign, IncDec, If, While, For, Break, Continue, Out, Print, Pulse, Halt, Asm, Call, Block, Proc, Return, Stack };
     Kind        kind;
     Pos         pos, end;           // end: just after the statement's text
     std::string name;               // Decl/Const/Proc/Call/Pulse: identifier
     std::string op;                 // Assign: "=", "+=", ...; IncDec: "++" / "--"
     std::string text;               // Asm: raw brainfuck
     bool        word = false;       // Decl: word type
-    int         count = -1;         // Decl: array length, -1 scalar
+    bool        rec = false;        // Proc: declared "rec proc" (compiled as a trampoline)
+    int         ret = 0;            // Proc: return type 0 none, 1 byte, 2 word
+    int         count = -1;         // Decl: array length, -1 scalar; Stack: size
     ExprP       target;             // Assign/IncDec: Name or Index expression
-    ExprP       e;                  // Decl init, Const value, Assign rhs, If/While/For condition
+    ExprP       e;                  // Decl init, Const value, Assign rhs, If/While/For condition, Return value
     StmtP       init, step;         // For
     std::vector<ExprP> args;        // Out items, Call arguments
     std::vector<StmtP> body, else_body;

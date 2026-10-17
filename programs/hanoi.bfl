@@ -1,0 +1,18 @@
+// Towers of Hanoi, recursively.  "rec proc" compiles the procedure as a
+// trampoline (see docs/TRAMPOLINE.md): the body is cut into blocks at each
+// call, a state cell picks the next block, and a stack array holds the saved
+// frames.  Step through it with F11 and watch n, from, to and __sp.
+
+byte moves = 0;
+
+rec proc hanoi(byte n, byte from, byte to, byte via) {
+    if (n == 0) { return; }
+    hanoi(n - 1, from, via, to);
+    out "move disc ", '0' + n, " from ", from, " to ", to, "\n";
+    moves++;
+    hanoi(n - 1, via, to, from);
+}
+
+hanoi(4, 'A', 'C', 'B');
+print moves, " moves\n";
+NUMBER0 = moves;

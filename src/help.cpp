@@ -285,6 +285,22 @@ STATEMENTS
   halt;                      write HALT
   asm { <<+>> }              raw brainfuck; must leave the pointer where it was
   proc name(byte a, ref word w, ref byte buf[]) { ... }    name(1, w, buf);
+  proc byte sq(byte x) { return x * x; }     y = sq(3) + 1;   return e; / return;
+  rec proc byte fib(byte n) { ... }          a procedure that may call itself
+  stack 64;                  cells of recursion stack (top level; default 128)
+
+PROCEDURES AND RECURSION
+  A plain proc is inlined at every call and cannot call itself.  A rec proc
+  is compiled as a trampoline: its body is cut into blocks at each call, a
+  state cell picks the next block, and a stack array saves the parameters
+  and locals of the current activation around each call.  Everything that
+  calls a rec proc is compiled the same way.  Locals of a rec proc live in
+  fixed cells and appear in the watch list as fib.n; __sp is the stack
+  pointer.  F10 on a recursive call runs until the stack is back at the
+  current depth.  Rules: no arrays inside a rec proc (declare them at the
+  top level), ref parameters are copied in and back out, and variables of
+  code that calls a rec proc need unique names.  A call costs roughly 1000
+  commands plus 70 per cell saved.
 
 EXPRESSIONS
   Operators, loosest first:  ||  &&  |  ^  &  == !=  < <= > >=  << >>  + -  * / %

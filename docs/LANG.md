@@ -15,8 +15,10 @@ bfui prog.bfl                open in the UI: F5 runs, Ctrl+F5 debugs by statemen
 The design rule behind everything: **the compiler always knows where the pointer
 is.** Every variable owns fixed cells, procedures are inlined at each call site,
 and device registers are addressed by name from the register table in
-`src/registers.h`. There is no stack, no recursion and no indirect addressing
-except byte arrays, which use a walking idiom described at the end.
+`src/registers.h`. Recursion is available through `rec proc`, which compiles a
+procedure as a trampoline with an explicit stack array (see "Procedures and
+recursion"). There is no other indirect addressing except byte arrays, which use
+a walking idiom described at the end.
 
 ## Lexical elements
 
@@ -25,8 +27,8 @@ except byte arrays, which use a walking idiom described at the end.
   Character and string escapes: `\n \r \t \0 \e \a \b \\ \' \" \xHH`.
 - Strings `"text"` appear only in `out` and `print`.
 - Identifiers: letters, digits and `_`, case-sensitive. A name may not be a
-  register name or a keyword: `byte word const proc ref if else while for break
-  continue out print pulse halt asm in input`.
+  register name or a keyword: `byte word const proc rec ref return stack if else
+  while for break continue out print pulse halt asm in input`.
 
 ## Types and declarations
 
@@ -63,16 +65,50 @@ pulse TICK_LATCH;               // write 1 to a register once
 halt;                           // write HALT: ends the run with status "halted"
 asm { <<+>> }                   // raw brainfuck; must leave the pointer where it was
 proc name(byte a, ref word w, ref byte buf[]) { ... }
+proc byte sq(byte x) { return x * x; }       // a procedure with a result
 name(a + 1, w, buf);            // call: inlined here
+y = sq(3) + sq(4);              // calls in expressions
+return;  return e;              // leave a procedure (or end the main program)
+rec proc byte fib(byte n) { ... }            // may call itself: see below
+stack 64;                       // cells of recursion stack (default 128, top level)
 { ... }                         // a block with its own scope
 ```
 
-Braces are required around every body. Procedures are declared at the top
-level, may appear after their first use, and may call other procedures but not
-themselves (directly or indirectly). Parameters are passed by value unless
-marked `ref`; a `ref` argument must be a variable of the same type, and an array
-parameter (`ref byte name[]`) must be a byte array. Top-level statements run in
-order; the program ends after the last one.
+Braces are required around every body. Top-level statements run in order; the
+program ends after the last one or at a top-level `return;`.
+
+## Procedures and recursion
+
+Procedures are declared at the top level and may appear after their first use.
+`proc byte f(...)` and `proc word f(...)` return a value with `return e;`; a
+procedure without a result type uses plain `return;`, and a procedure that
+reaches its closing brace returns 0. A call with a result can be used as an
+expression; a call statement discards the result. Parameters are passed by value
+unless marked `ref`; a `ref` argument must be a variable of the same type, and
+an array parameter (`ref byte name[]`) must be a byte array.
+
+A plain `proc` is **inlined** at every call: its body is copied into the caller
+with its own locals, so it cannot call itself. A `rec proc` may call itself and
+other `rec proc`s freely; it is compiled as a **trampoline** (docs/TRAMPOLINE.md):
+
+- Its body is cut into numbered blocks at every call to a `rec proc`. A state
+  cell names the next block and one dispatcher loop runs them. Every procedure
+  that calls a `rec proc`, and the main program when it does, is compiled the
+  same way (the compiler promotes them automatically).
+- The current activation's parameters and locals live in fixed cells, so the
+  watch list shows them by name (`fib.n`). A call saves them to a stack array
+  with the state to resume and a return restores them. `stack N;` at the top
+  level sets the array size in cells (default 128, at most 256); each call uses
+  one cell per parameter and local plus one. Overflow is not checked.
+- Restrictions: a `rec proc` cannot own arrays (declare them at the top level)
+  and cannot take array parameters; its `ref` parameters are copied in at the
+  call and copied back when it returns; variables declared in code that calls a
+  `rec proc` must have names unique within that procedure; the right operand of
+  `&&` / `||` containing such a call is always evaluated.
+- Cost: a call is about 1 000 commands plus 70 per cell saved and restored;
+  see docs/TRAMPOLINE.md for measurements.
+
+A plain `proc` that calls itself without `rec` is a compile error.
 
 `print` of a `word` costs several 16-bit comparisons; `print` of a byte is a
 division by 100 and by 10.
@@ -149,8 +185,9 @@ below) that only reads it.
 
 In the UI a `.bfl` program is debugged by statement. F11 steps to the next
 statement, entering procedure calls; F10 steps over the whole statement (a loop
-runs to completion, a call runs its body); Ctrl+F10 runs to the statement at the
-caret; F9 toggles a breakpoint on the caret's line. The current statement is
+runs to completion, a call runs its body, and a recursive call runs until the
+stack pointer is back at the current depth); Ctrl+F10 runs to the statement at
+the caret; F9 toggles a breakpoint on the caret's line. The current statement is
 highlighted, the status bar shows its line, and the watch list is filled with
 the program's variables by name (arrays up to their first 16 elements).
 `print` and `input` are implemented as library procedures written in BFL; the
@@ -211,8 +248,9 @@ These are the building blocks; knowing them helps read the output and write
 
 ## Limits and non-features
 
-- No recursion, no function values, no signed numbers, no `word` arrays, no
-  array bounds checks for runtime indices (a constant index is checked).
+- No function values, no signed numbers, no `word` arrays, no array bounds
+  checks for runtime indices (a constant index is checked), no stack overflow
+  check for recursion.
 - `asm` blocks are not analysed: they must leave the pointer where it was, and
   the compiler forgets every known cell value after one.
 - The compiler stops at the first error and reports `line:col: message`.

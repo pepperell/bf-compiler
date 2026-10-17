@@ -10,14 +10,24 @@
 // dst, which lets `x += e` and `a + b` reuse one cell.  The known-value map
 // tracks cells holding compile-time constants in straight-line code so that
 // constants and string output are emitted as short deltas.
+//
+// Procedures are inlined.  Recursion ("rec proc") uses a trampoline: the
+// bodies of recursive procedures, of everything that calls them, and of the
+// main program are cut into numbered blocks at every such call; a state cell
+// names the next block and one dispatcher loop runs them.  The current
+// activation's variables live in fixed cells; a call saves them to a stack
+// array together with the state to resume, and the resume block restores them.
+// See docs/TRAMPOLINE.md.
 #include "lang.h"
 #include "ast.h"
 #include "../registers.h"
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace bfl {
 
@@ -70,7 +80,52 @@ struct Var {
     bool owned = true;          // false: ref alias, not cleared at scope exit
 };
 
-struct ProcInfo { const Stmt* decl; bool prelude; };
+struct TProc;
+struct ProcInfo {
+    const Stmt* decl;
+    bool prelude;
+    bool tramp = false;         // compiled as trampoline blocks
+    TProc* tp = nullptr;
+    std::vector<std::string> callees;
+};
+
+// ---- trampoline structures -------------------------------------------------------------
+struct Action {
+    enum Kind { Plain, SetState, IfGoto, Call, Ret, Pop };
+    Kind kind;
+    const Stmt* s = nullptr;        // Plain: statement to generate (original or synthetic)
+    const Stmt* src = nullptr;      // statement for the map
+    ExprP cond;                     // IfGoto
+    int a = -1, b = -1;             // SetState: a; IfGoto: true a, false b; Call: resume block
+    TProc* callee = nullptr;        // Call / Pop
+    std::vector<ExprP> args;        // Call
+    std::string result;             // Pop: hidden variable receiving the callee's result ("" none)
+    std::vector<std::pair<std::string, int>> copy_out;   // Pop: (caller variable, callee param index) for ref params
+    ExprP ret;                      // Ret: value or null
+};
+struct LBlock {
+    int id;
+    TProc* owner;
+    int break_state = -1, cont_state = -1;
+    std::vector<Action> acts;
+};
+struct TProc {
+    std::string name;               // "" for the main program
+    const Stmt* decl = nullptr;     // nullptr for main
+    int entry = 0;
+    int ret = 0;                    // 0 none, 1 byte, 2 word
+    int64_t retval = -1;
+    std::vector<Var> frame;         // params, hoisted locals, hidden temporaries (saved on call unless main)
+    std::vector<Var> consts;
+    int hidden_n = 0;
+    bool is_main() const { return decl == nullptr; }
+    int save_count() const {        // cells pushed on a call (not for main)
+        if (is_main()) return 0;
+        int n = 0;
+        for (const Var& v : frame) n += v.word ? 2 : 1;
+        return n;
+    }
+};
 
 struct Gen {
     const std::string& src;
@@ -83,16 +138,33 @@ struct Gen {
     int64_t next_free, high;
     std::vector<int32_t> line_starts;
 
-    struct Scope { std::unordered_map<std::string, Var> vars; std::vector<std::string> order; int64_t mark; bool top; };
+    struct Scope { std::unordered_map<std::string, Var> vars; std::vector<std::string> order; int64_t mark; bool top; bool frame = false; };
     std::vector<Scope> scopes;
     std::unordered_map<std::string, ProcInfo> procs;
     std::vector<std::string> call_stack;
     std::string cur_proc;
-    struct LoopCtx { int64_t alive = -1, brk = -1; bool needs = false; };
-    std::vector<LoopCtx> loopctx;
+
+    // Exit contexts: what break / continue / return leave.
+    struct ExitCtx {
+        enum Kind { Loop, Proc, Block } kind;
+        int64_t alive = -1, brk = -1;
+        bool needs = false;
+        int64_t retval = -1;        // Proc: result cell(s)
+        int ret = 0;                // Proc: 0 none, 1 byte, 2 word
+        int break_state = -1, cont_state = -1;   // Block
+    };
+    std::vector<ExitCtx> ctxs;
     std::vector<size_t> stmt_stack;
     int prelude_depth = 0;
     Program prelude;
+
+    // trampoline
+    std::vector<std::unique_ptr<TProc>> tprocs;
+    std::vector<LBlock> blocks;
+    std::vector<StmtP> synth;
+    TProc* cur_tp = nullptr;        // generating a trampolined body
+    int64_t state_cell = -1, alive_cell = -1, sp_cell = -1, stack_base = -1;
+    int stack_size = 128;
 
     Gen(const std::string& s, int64_t ram_start) : src(s), ram(ram_start), out(res.bf), cur(ram_start), next_free(ram_start), high(ram_start) {
         line_starts.push_back(0);
@@ -492,7 +564,7 @@ struct Gen {
     void push_scope(bool top = false) { scopes.push_back(Scope{{}, {}, next_free, top}); }
     void pop_scope() {
         Scope& s = scopes.back();
-        if (!s.top) {
+        if (!s.top && !s.frame) {
             for (size_t i = s.order.size(); i-- > 0;) {
                 const Var& v = s.vars[s.order[i]];
                 if (!v.owned || v.is_const) continue;
@@ -510,6 +582,7 @@ struct Gen {
         s.vars[v.name] = v;
         s.order.push_back(v.name);
     }
+    ProcInfo* find_proc(const std::string& n) { auto it = procs.find(n); return it == procs.end() ? nullptr : &it->second; }
 
     // ---- expression analysis --------------------------------------------------------------------
     int width(const Expr& e) {
@@ -522,6 +595,12 @@ struct Gen {
         }
         case Expr::Index: case Expr::In: return 1;
         case Expr::Input: return 2;
+        case Expr::Call: {
+            ProcInfo* p = find_proc(e.text);
+            if (!p) fail(e.pos, "'" + e.text + "' is not a procedure");
+            if (!p->decl->ret) fail(e.pos, "'" + e.text + "' returns nothing and cannot be used in an expression");
+            return p->decl->ret;
+        }
         case Expr::Unary:
             if (e.text == "!") return 1;
             if (e.text == "word") return 2;
@@ -618,6 +697,7 @@ struct Gen {
         }
         case Expr::Unary: return touches(*e.a, lo, hi);
         case Expr::Binary: return touches(*e.a, lo, hi) || touches(*e.b, lo, hi);
+        case Expr::Call: return true;      // a procedure body may touch anything
         default: return false;
         }
     }
@@ -690,6 +770,14 @@ struct Gen {
             eval16_fresh(e, t);
             move(t, {{dst, sign}});
             release2(t);
+            return;
+        }
+        case Expr::Call: {
+            int w = width(e);
+            if (w == 2) { int64_t t = tmp2(); eval16_fresh(e, t); move(t, {{dst, sign}}); release2(t); return; }
+            std::vector<const Expr*> args; for (auto& a : e.args) args.push_back(a.get());
+            if (sign == 1) { call_user(e.text, args, e.pos, dst); return; }
+            int64_t t = tmp(); call_user(e.text, args, e.pos, t); move(t, {{dst, sign}}); release(t);
             return;
         }
         case Expr::Unary: {
@@ -867,7 +955,12 @@ struct Gen {
         case Expr::Index: case Expr::In: eval8(e, dst); return;
         case Expr::Input: {
             Var w; w.name = "w"; w.cell = dst; w.word = true; w.owned = false;
-            call_proc("__read_word", {w}, e.pos);
+            call_proc("__read_word", {w}, e.pos, -1);
+            return;
+        }
+        case Expr::Call: {
+            std::vector<const Expr*> args; for (auto& a : e.args) args.push_back(a.get());
+            call_user(e.text, args, e.pos, dst);      // byte results land in the low cell
             return;
         }
         case Expr::Unary: {
@@ -938,7 +1031,7 @@ struct Gen {
 
     // ---- statement map ----------------------------------------------------------------------------------
     bool mapping() const { return prelude_depth == 0; }
-    void begin_stmt(const Stmt& s) {
+    void begin_stmt(const Stmt& s, bool cont = false) {
         if (!mapping()) return;
         int line = s.pos.line;
         size_t a = (size_t)s.pos.off, b = a;
@@ -948,9 +1041,9 @@ struct Gen {
         while (!text.empty() && isspace((unsigned char)text.back())) text.pop_back();
         out += '\n';
         out.append(stmt_stack.size() * 2, ' ');
-        out += "# L" + std::to_string(line) + ": " + text + "\n";
+        out += "# L" + std::to_string(line) + (cont ? " (continued): " : ": ") + text + "\n";
         out.append(stmt_stack.size() * 2, ' ');
-        StmtRange r{line, s.pos.col, line_of(std::max(s.pos.off, s.end.off - 1)), (int32_t)out.size(), 0, (int)stmt_stack.size()};
+        StmtRange r{line, s.pos.col, line_of(std::max(s.pos.off, s.end.off - 1)), (int32_t)out.size(), 0, (int)stmt_stack.size(), cont};
         stmt_stack.push_back(res.stmts.size());
         res.stmts.push_back(r);
     }
@@ -960,23 +1053,34 @@ struct Gen {
         stmt_stack.pop_back();
     }
 
-    // ---- statements -------------------------------------------------------------------------------------------
+    // ---- control-flow analysis ----------------------------------------------------------------------------
+    static bool contains_return(const Stmt& s) {
+        if (s.kind == Stmt::Return) return true;
+        if (s.kind == Stmt::Proc) return false;
+        for (auto& x : s.body) if (contains_return(*x)) return true;
+        for (auto& x : s.else_body) if (contains_return(*x)) return true;
+        return false;
+    }
+    static bool contains_return(const std::vector<StmtP>& v) { for (auto& x : v) if (contains_return(*x)) return true; return false; }
+    // May executing s leave the innermost enclosing loop / block / procedure early?
     static bool may_exit(const Stmt& s) {
         switch (s.kind) {
-        case Stmt::Break: case Stmt::Continue: return true;
+        case Stmt::Break: case Stmt::Continue: case Stmt::Return: return true;
         case Stmt::If: for (auto& x : s.body) if (may_exit(*x)) return true; for (auto& x : s.else_body) if (may_exit(*x)) return true; return false;
         case Stmt::Block: for (auto& x : s.body) if (may_exit(*x)) return true; return false;
+        case Stmt::While: case Stmt::For: return contains_return(s.body);
         default: return false;
         }
     }
-    static bool has_break(const std::vector<StmtP>& v) { for (auto& x : v) if (may_exit(*x)) return true; return false; }
+    static bool has_exit(const std::vector<StmtP>& v) { for (auto& x : v) if (may_exit(*x)) return true; return false; }
 
+    // ---- statements -------------------------------------------------------------------------------------------
     void gen_stmts(const std::vector<StmtP>& v, size_t from = 0) {
         for (size_t i = from; i < v.size(); i++) {
             gen_stmt(*v[i]);
-            if (i + 1 < v.size() && !loopctx.empty() && loopctx.back().needs && may_exit(*v[i])) {
+            if (i + 1 < v.size() && !ctxs.empty() && ctxs.back().needs && may_exit(*v[i])) {
                 int64_t t = tmp();
-                copy(loopctx.back().alive, t);
+                copy(ctxs.back().alive, t);
                 if_nonzero(t, [&] { gen_stmts(v, i + 1); });
                 release(t);
                 return;
@@ -1022,6 +1126,7 @@ struct Gen {
         c->kind = e.kind; c->pos = e.pos; c->value = e.value; c->text = e.text;
         if (e.a) c->a = clone(*e.a);
         if (e.b) c->b = clone(*e.b);
+        for (auto& x : e.args) c->args.push_back(clone(*x));
         return c;
     }
 
@@ -1136,9 +1241,19 @@ struct Gen {
         if (mapping()) res.symbols.push_back(sym);
     }
 
+    // Clear the alive flags from the innermost context down to (and including) index stop_at;
+    // loops strictly inside get their break flag so they exit.
+    void unwind_to(size_t stop_at) {
+        for (size_t i = ctxs.size(); i-- > stop_at;) {
+            ExitCtx& c = ctxs[i];
+            if (c.needs && c.alive >= 0) clear(c.alive);
+            if (c.kind == ExitCtx::Loop && c.needs && i != stop_at) set(c.brk, 1);
+        }
+    }
+
     void gen_while(const Stmt& s, const Expr* cond, const std::vector<StmtP>& body, const Stmt* step) {
-        bool needs = has_break(body);
-        LoopCtx lc; lc.needs = needs;
+        bool needs = has_exit(body);
+        ExitCtx lc; lc.kind = ExitCtx::Loop; lc.needs = needs;
         if (needs) { lc.alive = tmp(); lc.brk = tmp(); }
         std::optional<int64_t> folded = cond ? fold(*cond) : std::optional<int64_t>(1);
         if (folded && *folded == 0) { if (needs) { release(lc.brk); release(lc.alive); } return; }
@@ -1147,9 +1262,9 @@ struct Gen {
         if (r && !needs) {
             // loop directly on the register: tests only, never writes it
             open(r->addr);
-            loopctx.push_back(lc);
+            ctxs.push_back(lc);
             gen_scope(body);
-            loopctx.pop_back();
+            ctxs.pop_back();
             if (step) gen_stmt(*step);
             close();
             return;
@@ -1159,9 +1274,9 @@ struct Gen {
         open(c);
         {
             if (needs) set(lc.alive, 1);
-            loopctx.push_back(lc);
+            ctxs.push_back(lc);
             gen_scope(body);
-            loopctx.pop_back();
+            ctxs.pop_back();
             if (step) gen_stmt(*step);
             if (!folded) { clear(c); eval_cond(*cond, c); }
             if (needs) { int64_t t = tmp(); copy(lc.brk, t); if_nonzero(t, [&] { clear(c); }); release(t); }
@@ -1215,7 +1330,7 @@ struct Gen {
     void gen_print(const Stmt& s) {
         for (const ExprP& ap : s.args) {
             if (ap->kind == Expr::Str) { Stmt o; o.kind = Stmt::Out; o.args.push_back(clone(*ap)); gen_out(o); continue; }
-            call_user(width(*ap) == 2 ? "__print_word" : "__print_byte", {ap.get()}, s.pos);
+            call_user(width(*ap) == 2 ? "__print_word" : "__print_byte", {ap.get()}, s.pos, -1);
         }
     }
 
@@ -1226,32 +1341,66 @@ struct Gen {
         go(r->addr); out += '+';
     }
 
-    // Inline a procedure with its parameters already bound to cells.
-    void call_proc(const std::string& name, const std::vector<Var>& bound, Pos p) {
+    // return [e];  inside an inlined procedure, the main program, or a trampolined body.
+    void gen_return(const Stmt& s) {
+        if (cur_tp) { gen_tramp_return(s.e.get(), s.pos); return; }
+        size_t p = ctxs.size();
+        while (p-- > 0) if (ctxs[p].kind == ExitCtx::Proc) break;
+        if (p == (size_t)-1) fail(s.pos, "'return' outside a procedure");
+        ExitCtx& pc = ctxs[p];
+        if (pc.ret && !s.e) fail(s.pos, "this procedure returns a value");
+        if (!pc.ret && s.e) fail(s.pos, "this procedure returns nothing");
+        if (s.e) {
+            if (pc.ret == 2) { clear16(pc.retval); eval16_fresh(*s.e, pc.retval); }
+            else { clear(pc.retval); eval8(*s.e, pc.retval); }
+        }
+        unwind_to(p);
+    }
+
+    // Inline a procedure with its parameters already bound to cells.  result_cell
+    // receives the return value (-1 discards it).
+    void call_proc(const std::string& name, const std::vector<Var>& bound, Pos p, int64_t result_cell) {
         auto it = procs.find(name);
         if (it == procs.end()) fail(p, "'" + name + "' is not a procedure");
         const Stmt& proc = *it->second.decl;
-        if (std::find(call_stack.begin(), call_stack.end(), name) != call_stack.end()) fail(p, "'" + name + "' calls itself; procedures are inlined and cannot recurse");
+        if (it->second.tramp) fail(p, "'" + name + "' is recursive and cannot be inlined here");
+        if (std::find(call_stack.begin(), call_stack.end(), name) != call_stack.end()) fail(p, "'" + name + "' calls itself; declare it 'rec proc'");
         if (bound.size() != proc.params.size()) fail(p, "'" + name + "' takes " + std::to_string(proc.params.size()) + " argument(s)");
         if (it->second.prelude) prelude_depth++;
         std::string saved_proc = cur_proc; cur_proc = name;
-        std::vector<LoopCtx> saved_loops; saved_loops.swap(loopctx);
+        std::vector<ExitCtx> saved_ctxs; saved_ctxs.swap(ctxs);
+        TProc* saved_tp = cur_tp; cur_tp = nullptr;
         call_stack.push_back(name);
+        ExitCtx pc; pc.kind = ExitCtx::Proc; pc.ret = proc.ret; pc.needs = contains_return(proc.body);
+        int64_t mark = next_free;
+        if (proc.ret) pc.retval = proc.ret == 2 ? tmp2() : tmp();
+        if (pc.needs) { pc.alive = tmp(); set(pc.alive, 1); }
+        ctxs.push_back(pc);
         push_scope();
         for (size_t i = 0; i < bound.size(); i++) { Var v = bound[i]; v.name = proc.params[i].name; declare(v, proc.params[i].pos); }
         gen_stmts(proc.body);
         pop_scope();
+        ctxs.pop_back();
+        if (pc.needs) release(pc.alive);
+        if (proc.ret && result_cell >= 0) {
+            move(pc.retval, {{result_cell, 1}});
+            if (proc.ret == 2) move(pc.retval + 1, {{result_cell + 1, 1}});
+        }
+        if (proc.ret) { if (proc.ret == 2) release2(pc.retval); else release(pc.retval); }
+        if (next_free != mark) internal("call frame not released");
         call_stack.pop_back();
-        loopctx.swap(saved_loops);
+        cur_tp = saved_tp;
+        ctxs.swap(saved_ctxs);
         cur_proc = saved_proc;
         if (it->second.prelude) prelude_depth--;
     }
 
-    // Evaluate arguments and inline.
-    void call_user(const std::string& name, const std::vector<const Expr*>& args, Pos p) {
+    // Evaluate arguments and inline.  result_cell: where the value goes (added), -1 to discard.
+    void call_user(const std::string& name, const std::vector<const Expr*>& args, Pos p, int64_t result_cell) {
         auto it = procs.find(name);
         if (it == procs.end()) fail(p, "'" + name + "' is not a procedure");
         const Stmt& proc = *it->second.decl;
+        if (it->second.tramp) fail(p, "'" + name + "' is recursive; it can only be called from the main program or from procedures compiled with it");
         if (args.size() != proc.params.size()) fail(p, "'" + name + "' takes " + std::to_string(proc.params.size()) + " argument(s), " + std::to_string(args.size()) + " given");
         int64_t mark = next_free;
         std::vector<Var> bound;
@@ -1275,7 +1424,7 @@ struct Gen {
             }
             bound.push_back(v);
         }
-        call_proc(name, bound, p);
+        call_proc(name, bound, p, proc.ret ? result_cell : -1);
         next_free = mark;        // value parameters were cleared by pop_scope
     }
 
@@ -1284,6 +1433,9 @@ struct Gen {
         case Stmt::Proc:
             if (scopes.size() > 1 || !call_stack.empty()) fail(s.pos, "procedures must be declared at the top level");
             return;                                  // registered up front
+        case Stmt::Stack:
+            if (scopes.size() > 1 || !call_stack.empty()) fail(s.pos, "'stack' must appear at the top level");
+            return;                                  // read up front
         case Stmt::Const: {
             auto k = fold(*s.e);
             if (!k) fail(s.e->pos, "constant '" + s.name + "' needs a constant expression");
@@ -1308,13 +1460,23 @@ struct Gen {
             break;
         }
         case Stmt::Break: case Stmt::Continue: {
-            if (loopctx.empty()) fail(s.pos, std::string(s.kind == Stmt::Break ? "'break'" : "'continue'") + " outside a loop");
-            LoopCtx& lc = loopctx.back();
+            size_t i = ctxs.size();
+            while (i-- > 0) if (ctxs[i].kind != ExitCtx::Proc) break;
+            if (i == (size_t)-1) fail(s.pos, std::string(s.kind == Stmt::Break ? "'break'" : "'continue'") + " outside a loop");
+            ExitCtx& lc = ctxs[i];
+            if (lc.kind == ExitCtx::Block) {
+                int target = s.kind == Stmt::Break ? lc.break_state : lc.cont_state;
+                if (target < 0) fail(s.pos, std::string(s.kind == Stmt::Break ? "'break'" : "'continue'") + " outside a loop");
+                set(state_cell, target);
+                unwind_to(i);
+                break;
+            }
             if (!lc.needs) internal("loop without break support");
-            clear(lc.alive);
+            unwind_to(i);
             if (s.kind == Stmt::Break) set(lc.brk, 1);
             break;
         }
+        case Stmt::Return: gen_return(s); break;
         case Stmt::Out:    gen_out(s); break;
         case Stmt::Print:  gen_print(s); break;
         case Stmt::Pulse:  gen_pulse(s.name, s.pos); break;
@@ -1323,7 +1485,7 @@ struct Gen {
         case Stmt::Call: {
             std::vector<const Expr*> args;
             for (auto& a : s.args) args.push_back(a.get());
-            call_user(s.name, args, s.pos);
+            call_user(s.name, args, s.pos, -1);
             break;
         }
         case Stmt::Block:  gen_scope(s.body); break;
@@ -1332,14 +1494,543 @@ struct Gen {
         end_stmt();
     }
 
+    // ---- procedures: registration and call graph --------------------------------------------------------
+    void collect_calls(const Expr& e, std::vector<std::string>& v) {
+        if (e.kind == Expr::Call) v.push_back(e.text);
+        if (e.a) collect_calls(*e.a, v);
+        if (e.b) collect_calls(*e.b, v);
+        for (auto& x : e.args) collect_calls(*x, v);
+    }
+    void collect_calls(const Stmt& s, std::vector<std::string>& v) {
+        if (s.kind == Stmt::Call) v.push_back(s.name);
+        if (s.target) collect_calls(*s.target, v);
+        if (s.e) collect_calls(*s.e, v);
+        if (s.init) collect_calls(*s.init, v);
+        if (s.step) collect_calls(*s.step, v);
+        for (auto& x : s.args) collect_calls(*x, v);
+        for (auto& x : s.body) collect_calls(*x, v);
+        for (auto& x : s.else_body) collect_calls(*x, v);
+    }
     void register_procs(const Program& p, bool is_prelude) {
         for (const StmtP& s : p.items) {
             if (s->kind != Stmt::Proc) continue;
             if (procs.count(s->name)) fail(s->pos, "procedure '" + s->name + "' is already defined");
             for (size_t i = 0; i < s->params.size(); i++)
                 for (size_t j = 0; j < i; j++) if (s->params[i].name == s->params[j].name) fail(s->params[i].pos, "duplicate parameter '" + s->params[i].name + "'");
-            procs[s->name] = ProcInfo{s.get(), is_prelude};
+            ProcInfo pi{s.get(), is_prelude};
+            for (auto& x : s->body) collect_calls(*x, pi.callees);
+            procs[s->name] = pi;
         }
+    }
+    // Decide which procedures are trampolined: those declared rec, and everything that calls one.
+    // A cycle without 'rec' is an error.  Returns true if the main program calls a trampolined procedure.
+    bool plan_trampolines(const Program& prog) {
+        for (auto& kv : procs) {
+            for (const std::string& c : kv.second.callees)
+                if (!procs.count(c)) fail(kv.second.decl->pos, "'" + c + "' is not a procedure");
+            if (kv.second.decl->rec) kv.second.tramp = true;
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (auto& kv : procs) {
+                if (kv.second.tramp) continue;
+                for (const std::string& c : kv.second.callees) if (procs[c].tramp) { kv.second.tramp = true; changed = true; break; }
+            }
+        }
+        // cycle check among the non-rec procedures (trampolined ones may recurse freely)
+        for (auto& kv : procs) {
+            if (kv.second.tramp) continue;
+            std::vector<std::string> stack{kv.first};
+            std::unordered_set<std::string> seen;
+            while (!stack.empty()) {
+                std::string n = stack.back(); stack.pop_back();
+                for (const std::string& c : procs[n].callees) {
+                    if (c == kv.first) fail(kv.second.decl->pos, "'" + kv.first + "' is recursive; declare it 'rec proc'");
+                    if (seen.insert(c).second) stack.push_back(c);
+                }
+            }
+        }
+        std::vector<std::string> main_calls;
+        for (auto& x : prog.items) if (x->kind != Stmt::Proc) collect_calls(*x, main_calls);
+        for (const std::string& c : main_calls) { auto it = procs.find(c); if (it != procs.end() && it->second.tramp) return true; }
+        return false;
+    }
+
+    // ---- trampoline: lowering ------------------------------------------------------------------------------
+    struct LowCtx { TProc* p; int block; int break_state = -1, cont_state = -1; };
+
+    bool is_tramp_call(const std::string& n) { ProcInfo* p = find_proc(n); return p && p->tramp; }
+    bool calls_tramp(const Expr& e) {
+        if (e.kind == Expr::Call && is_tramp_call(e.text)) return true;
+        if (e.a && calls_tramp(*e.a)) return true;
+        if (e.b && calls_tramp(*e.b)) return true;
+        for (auto& x : e.args) if (calls_tramp(*x)) return true;
+        return false;
+    }
+    bool calls_tramp(const Stmt& s) {
+        if (s.kind == Stmt::Call && is_tramp_call(s.name)) return true;
+        if (s.target && calls_tramp(*s.target)) return true;
+        if (s.e && calls_tramp(*s.e)) return true;
+        if (s.init && calls_tramp(*s.init)) return true;
+        if (s.step && calls_tramp(*s.step)) return true;
+        for (auto& x : s.args) if (calls_tramp(*x)) return true;
+        for (auto& x : s.body) if (calls_tramp(*x)) return true;
+        for (auto& x : s.else_body) if (calls_tramp(*x)) return true;
+        return false;
+    }
+
+    int new_block(TProc* p, const LowCtx& L) {
+        LBlock b; b.id = (int)blocks.size() + 1; b.owner = p; b.break_state = L.break_state; b.cont_state = L.cont_state;
+        blocks.push_back(std::move(b));
+        return blocks.back().id;
+    }
+    LBlock& B(int id) { return blocks[(size_t)id - 1]; }
+    Action& act(LowCtx& L, Action::Kind k, const Stmt* from) { Action a; a.kind = k; a.src = from; B(L.block).acts.push_back(std::move(a)); return B(L.block).acts.back(); }
+
+    void frame_add(TProc* p, Var v, Pos pos) {
+        for (const Var& f : p->frame) if (f.name == v.name) fail(pos, "'" + v.name + "' is declared twice in " + (p->is_main() ? "the main program" : "'" + p->name + "'") + "; variables of code that calls a rec proc need unique names");
+        for (const Var& f : p->consts) if (f.name == v.name) fail(pos, "'" + v.name + "' is already a constant");
+        p->frame.push_back(v);
+    }
+    std::string hidden(TProc* p, bool word) {
+        Var v; v.name = "__h" + std::to_string(p->hidden_n++); v.word = word;
+        p->frame.push_back(v);
+        return v.name;
+    }
+
+    // Clone e, replacing calls to trampolined procedures by hidden variables that
+    // receive their results (each call becomes a Call action and a new resume block).
+    ExprP hoist(const Expr& e, LowCtx& L, const Stmt& from) {
+        if (e.kind == Expr::Call && is_tramp_call(e.text)) {
+            ProcInfo* pi = find_proc(e.text);
+            if (!pi->decl->ret) fail(e.pos, "'" + e.text + "' returns nothing and cannot be used in an expression");
+            std::vector<ExprP> args;
+            for (auto& a : e.args) args.push_back(hoist(*a, L, from));
+            std::string h = hidden(L.p, pi->decl->ret == 2);
+            emit_call(L, pi->tp, std::move(args), e.pos, from, h);
+            auto n = std::make_unique<Expr>(); n->kind = Expr::Name; n->pos = e.pos; n->text = h;
+            return n;
+        }
+        auto c = std::make_unique<Expr>();
+        c->kind = e.kind; c->pos = e.pos; c->value = e.value; c->text = e.text;
+        if (e.a) c->a = hoist(*e.a, L, from);
+        if (e.b) c->b = hoist(*e.b, L, from);
+        for (auto& x : e.args) c->args.push_back(hoist(*x, L, from));
+        return c;
+    }
+
+    // A call to a trampolined procedure: ends the current block, resumes in a new one.
+    void emit_call(LowCtx& L, TProc* callee, std::vector<ExprP> args, Pos pos, const Stmt& from, const std::string& result) {
+        const Stmt& decl = *callee->decl;
+        if (args.size() != decl.params.size()) fail(pos, "'" + callee->name + "' takes " + std::to_string(decl.params.size()) + " argument(s), " + std::to_string(args.size()) + " given");
+        std::vector<std::pair<std::string, int>> copy_out;
+        for (size_t i = 0; i < args.size(); i++) {
+            if (!decl.params[i].ref) continue;
+            if (args[i]->kind != Expr::Name) fail(args[i]->pos, "argument for 'ref " + decl.params[i].name + "' must be a variable");
+            copy_out.emplace_back(args[i]->text, (int)i);
+        }
+        int resume = new_block(L.p, L);
+        Action& a = act(L, Action::Call, &from);
+        a.callee = callee; a.args = std::move(args); a.a = resume;
+        L.block = resume;
+        Action& p = act(L, Action::Pop, &from);
+        p.callee = callee; p.result = result; p.copy_out = copy_out;
+    }
+
+    void set_state(LowCtx& L, int target, const Stmt* from) { Action& a = act(L, Action::SetState, from); a.a = target; }
+
+    StmtP mk_assign(const Stmt& from, const std::string& name, ExprP value) {
+        auto s = std::make_unique<Stmt>();
+        s->kind = Stmt::Assign; s->op = "="; s->pos = from.pos; s->end = from.end;
+        s->target = std::make_unique<Expr>(); s->target->kind = Expr::Name; s->target->pos = from.pos; s->target->text = name;
+        s->e = std::move(value);
+        return s;
+    }
+    ExprP mk_num(Pos p, int64_t v) { auto e = std::make_unique<Expr>(); e->kind = Expr::Num; e->pos = p; e->value = (int32_t)v; return e; }
+
+    void plain(LowCtx& L, const Stmt& s) { Action& a = act(L, Action::Plain, &s); a.s = &s; }
+    void synth_plain(LowCtx& L, StmtP s, const Stmt& from) { Action& a = act(L, Action::Plain, &from); a.s = s.get(); synth.push_back(std::move(s)); }
+
+    void lower_stmts(const std::vector<StmtP>& v, LowCtx& L) { for (auto& s : v) lower_stmt(*s, L); }
+
+    void lower_stmt(const Stmt& s, LowCtx& L) {
+        TProc* p = L.p;
+        switch (s.kind) {
+        case Stmt::Proc: case Stmt::Stack: return;
+        case Stmt::Const: {
+            Var v; v.name = s.name; v.is_const = true; v.owned = false;
+            auto k = fold_const_only(*s.e, p);
+            if (!k) fail(s.e->pos, "constant '" + s.name + "' needs a constant expression");
+            v.cval = *k;
+            for (const Var& f : p->consts) if (f.name == v.name) fail(s.pos, "'" + v.name + "' is already declared");
+            p->consts.push_back(v);
+            return;
+        }
+        case Stmt::Decl: {
+            Var v; v.name = s.name; v.word = s.word; v.count = s.count;
+            if (s.count >= 0 && !p->is_main()) fail(s.pos, "arrays cannot be local to a rec proc; declare '" + s.name + "' at the top level");
+            if (s.count >= 0 && s.word) fail(s.pos, "word arrays are not supported; use two byte arrays");
+            frame_add(p, v, s.pos);
+            if (s.count >= 0) return;                      // global array: zero from the start
+            ExprP init = s.e ? hoist(*s.e, L, s) : mk_num(s.pos, 0);
+            synth_plain(L, mk_assign(s, s.name, std::move(init)), s);
+            return;
+        }
+        default: break;
+        }
+        if (!calls_tramp(s)) { plain(L, s); return; }
+        switch (s.kind) {
+        case Stmt::Assign: {
+            auto t = std::make_unique<Stmt>();
+            t->kind = Stmt::Assign; t->op = s.op; t->pos = s.pos; t->end = s.end;
+            t->target = hoist(*s.target, L, s);
+            t->e = hoist(*s.e, L, s);
+            synth_plain(L, std::move(t), s);
+            return;
+        }
+        case Stmt::IncDec: {
+            auto t = std::make_unique<Stmt>();
+            t->kind = Stmt::IncDec; t->op = s.op; t->pos = s.pos; t->end = s.end; t->target = hoist(*s.target, L, s);
+            synth_plain(L, std::move(t), s);
+            return;
+        }
+        case Stmt::Out: case Stmt::Print: {
+            auto t = std::make_unique<Stmt>();
+            t->kind = s.kind; t->pos = s.pos; t->end = s.end;
+            for (auto& a : s.args) t->args.push_back(hoist(*a, L, s));
+            synth_plain(L, std::move(t), s);
+            return;
+        }
+        case Stmt::Call: {
+            ProcInfo* pi = find_proc(s.name);
+            if (!pi) fail(s.pos, "'" + s.name + "' is not a procedure");
+            std::vector<ExprP> args;
+            for (auto& a : s.args) args.push_back(hoist(*a, L, s));
+            if (pi->tramp) emit_call(L, pi->tp, std::move(args), s.pos, s, "");
+            else {
+                auto t = std::make_unique<Stmt>();
+                t->kind = Stmt::Call; t->name = s.name; t->pos = s.pos; t->end = s.end; t->args = std::move(args);
+                synth_plain(L, std::move(t), s);
+            }
+            return;
+        }
+        case Stmt::Return: {
+            ExprP v = s.e ? hoist(*s.e, L, s) : nullptr;
+            Action& a = act(L, Action::Ret, &s);
+            a.ret = std::move(v);
+            return;
+        }
+        case Stmt::Block: lower_stmts(s.body, L); return;
+        case Stmt::If: {
+            ExprP cond = hoist(*s.e, L, s);
+            int then_b = new_block(p, L), join = new_block(p, L);
+            int else_b = s.else_body.empty() ? join : new_block(p, L);
+            { Action& a = act(L, Action::IfGoto, &s); a.cond = std::move(cond); a.a = then_b; a.b = else_b; }
+            L.block = then_b; lower_stmts(s.body, L); set_state(L, join, &s);
+            if (!s.else_body.empty()) { L.block = else_b; lower_stmts(s.else_body, L); set_state(L, join, &s); }
+            L.block = join;
+            return;
+        }
+        case Stmt::While: case Stmt::For: {
+            if (s.init) lower_stmt(*s.init, L);
+            int cond_b = new_block(p, L);
+            set_state(L, cond_b, &s);
+            L.block = cond_b;
+            int body_b = new_block(p, L), exit_b = new_block(p, L), step_b = -1;
+            if (s.e) {
+                ExprP cond = hoist(*s.e, L, s);
+                Action& a = act(L, Action::IfGoto, &s); a.cond = std::move(cond); a.a = body_b; a.b = exit_b;
+            } else set_state(L, body_b, &s);
+            LowCtx inner = L;
+            inner.break_state = exit_b;
+            inner.cont_state = cond_b;
+            if (s.step) { step_b = new_block(p, inner); inner.cont_state = step_b; }
+            B(body_b).break_state = inner.break_state; B(body_b).cont_state = inner.cont_state;
+            inner.block = body_b;
+            lower_stmts(s.body, inner);
+            if (s.step) {
+                set_state(inner, step_b, &s);
+                inner.block = step_b;
+                lower_stmt(*s.step, inner);
+            }
+            set_state(inner, cond_b, &s);
+            L.block = exit_b;
+            return;
+        }
+        default: fail(s.pos, "a call to a rec proc cannot appear here");
+        }
+    }
+
+    // Constants visible while lowering: the procedure's own and the main program's.
+    std::optional<int64_t> fold_const_only(const Expr& e, TProc* p) {
+        if (e.kind == Expr::Num) return e.value;
+        if (e.kind == Expr::Name) {
+            for (const Var& c : p->consts) if (c.name == e.text) return c.cval;
+            if (!tprocs.empty() && tprocs.front().get() != p) for (const Var& c : tprocs.front()->consts) if (c.name == e.text) return c.cval;
+            return std::nullopt;
+        }
+        if (e.kind == Expr::Unary) {
+            auto a = fold_const_only(*e.a, p);
+            if (!a) return std::nullopt;
+            if (e.text == "-") return (-*a) & 0xFFFF;
+            if (e.text == "!") return *a == 0 ? 1 : 0;
+            if (e.text == "~") return (~*a) & 0xFFFF;
+            return *a;
+        }
+        if (e.kind == Expr::Binary) {
+            auto a = fold_const_only(*e.a, p), b = fold_const_only(*e.b, p);
+            if (!a || !b) return std::nullopt;
+            const std::string& o = e.text;
+            if (o == "+") return (*a + *b) & 0xFFFF;
+            if (o == "-") return (*a - *b) & 0xFFFF;
+            if (o == "*") return (*a * *b) & 0xFFFF;
+            if (o == "/") return *b ? std::optional<int64_t>(*a / *b) : std::nullopt;
+            if (o == "%") return *b ? std::optional<int64_t>(*a % *b) : std::nullopt;
+            if (o == "<<") return (*a << *b) & 0xFFFF;
+            if (o == ">>") return *a >> *b;
+            if (o == "&") return *a & *b;
+            if (o == "|") return *a | *b;
+            if (o == "^") return *a ^ *b;
+        }
+        return std::nullopt;
+    }
+
+    // Lower one trampolined procedure (or main) into blocks.
+    void lower_proc(TProc* p, const std::vector<StmtP>& body) {
+        LowCtx L{p, 0};
+        L.block = new_block(p, L);
+        p->entry = L.block;
+        if (p->decl) {
+            for (const Param& prm : p->decl->params) {
+                if (prm.array) fail(prm.pos, "rec procs cannot take array parameters; use a top-level array");
+                Var v; v.name = prm.name; v.word = prm.word;
+                frame_add(p, v, prm.pos);
+            }
+        }
+        lower_stmts(body, L);
+        act(L, Action::Ret, nullptr);      // implicit return at the end
+    }
+
+    // ---- trampoline: generation ------------------------------------------------------------------------------
+    void push_frame_scope(TProc* p) {
+        push_scope();
+        scopes.back().frame = true;
+        for (const Var& v : p->consts) scopes.back().vars[v.name] = v;
+        for (const Var& v : p->frame) { scopes.back().vars[v.name] = v; scopes.back().order.push_back(v.name); }
+    }
+
+    // idx = sp + off into a temporary
+    int64_t stack_index(int off) { int64_t i = tmp(); copy(sp_cell, i); add(i, off); return i; }
+    void stack_store(int off, int64_t cell) { int64_t i = stack_index(off); int64_t v = tmp(); copy(cell, v); array_write(stack_base, i, v); drop(v); drop(i); }
+    void stack_load(int off, int64_t cell) { int64_t i = stack_index(off); clear(cell); array_read(stack_base, i, cell); drop(i); }
+
+    void gen_tramp_return(const Expr* value, Pos pos) {
+        TProc* p = cur_tp;
+        if (p->ret && !value) fail(pos, "'" + p->name + "' returns a value");
+        if (!p->ret && value) fail(pos, p->is_main() ? "the main program returns nothing" : "'" + p->name + "' returns nothing");
+        if (value) {
+            if (p->ret == 2) { clear16(p->retval); eval16_fresh(*value, p->retval); }
+            else { clear(p->retval); eval8(*value, p->retval); }
+        }
+        if (p->is_main()) set(state_cell, 0);
+        else { int64_t i = stack_index(-1); clear(state_cell); array_read(stack_base, i, state_cell); drop(i); }
+        size_t b = ctxs.size();
+        while (b-- > 0) if (ctxs[b].kind == ExitCtx::Block) break;
+        if (b == (size_t)-1) internal("return outside a block");
+        unwind_to(b);
+    }
+
+    void gen_action(Action& a, LBlock& blk) {
+        switch (a.kind) {
+        case Action::Plain:
+            gen_stmt(*a.s);
+            return;
+        case Action::SetState:
+            set(state_cell, a.a);
+            return;
+        case Action::IfGoto: {
+            if (a.src) begin_stmt(*a.src);
+            int64_t c = tmp(); eval_cond(*a.cond, c);
+            int64_t f = tmp(); set(f, 1);
+            if_nonzero(c, [&] { set(state_cell, a.a); clear(f); });
+            if_nonzero(f, [&] { set(state_cell, a.b); });
+            release(f); release(c);
+            if (a.src) end_stmt();
+            return;
+        }
+        case Action::Call: {
+            TProc* callee = a.callee;
+            const Stmt& decl = *callee->decl;
+            if (a.src) begin_stmt(*a.src);
+            // arguments first (they may read the caller's frame)
+            int64_t mark = next_free;
+            std::vector<int64_t> vals;
+            for (size_t i = 0; i < a.args.size(); i++) {
+                bool w = decl.params[i].word;
+                int64_t t = w ? tmp2() : tmp();
+                if (w) eval16_fresh(*a.args[i], t); else eval8(*a.args[i], t);
+                vals.push_back(t);
+            }
+            // save the caller's frame and the resume state
+            TProc* me = blk.owner;
+            int off = 0;
+            if (!me->is_main()) for (const Var& v : me->frame) {
+                stack_store(off++, v.cell);
+                if (v.word) stack_store(off++, v.cell + 1);
+            }
+            { int64_t r = tmp(); set(r, a.a); int64_t i = stack_index(off); array_write(stack_base, i, r); drop(i); drop(r); }
+            add(sp_cell, off + 1);
+            // load the callee's parameters
+            for (size_t i = 0; i < vals.size(); i++) {
+                const Var& prm = callee->frame[i];
+                clear(prm.cell); move(vals[i], {{prm.cell, 1}});
+                if (prm.word) { clear(prm.cell + 1); move(vals[i] + 1, {{prm.cell + 1, 1}}); }
+            }
+            next_free = mark;
+            set(state_cell, callee->entry);
+            if (a.src) end_stmt();
+            return;
+        }
+        case Action::Pop: {
+            TProc* me = blk.owner;
+            if (a.src) begin_stmt(*a.src, true);
+            // ref parameters: take the callee's final values before the pop may overwrite them (self-recursion)
+            int64_t mark = next_free;
+            std::vector<int64_t> saved;
+            for (auto& co : a.copy_out) {
+                const Var& prm = a.callee->frame[(size_t)co.second];
+                int64_t t = prm.word ? tmp2() : tmp();
+                copy(prm.cell, t);
+                if (prm.word) copy(prm.cell + 1, t + 1);
+                saved.push_back(t);
+            }
+            int n = me->save_count();
+            add(sp_cell, -(n + 1));
+            int off = 0;
+            if (!me->is_main()) for (const Var& v : me->frame) {
+                stack_load(off++, v.cell);
+                if (v.word) stack_load(off++, v.cell + 1);
+            }
+            for (size_t i = 0; i < a.copy_out.size(); i++) {
+                auto& co = a.copy_out[i];
+                Var* dst = find_var(co.first);
+                if (!dst || dst->is_const || dst->count >= 0) fail(a.src ? a.src->pos : Pos{}, "argument for a ref parameter must be a variable");
+                const Var& prm = a.callee->frame[(size_t)co.second];
+                if (dst->word != prm.word) fail(a.src ? a.src->pos : Pos{}, "'" + co.first + "' has the wrong type for 'ref " + prm.name + "'");
+                clear(dst->cell); move(saved[i], {{dst->cell, 1}});
+                if (prm.word) { clear(dst->cell + 1); move(saved[i] + 1, {{dst->cell + 1, 1}}); }
+            }
+            next_free = mark;
+            if (!a.result.empty()) {
+                Var* h = find_var(a.result);
+                if (!h) internal("hidden result variable missing");
+                clear(h->cell); copy(a.callee->retval, h->cell);
+                if (h->word) { clear(h->cell + 1); if (a.callee->ret == 2) copy(a.callee->retval + 1, h->cell + 1); }
+            }
+            if (a.src) end_stmt();
+            return;
+        }
+        case Action::Ret: {
+            if (a.src) begin_stmt(*a.src);
+            gen_tramp_return(a.ret.get(), a.src ? a.src->pos : Pos{});
+            if (a.src) end_stmt();
+            return;
+        }
+        }
+    }
+
+    static bool action_may_exit(const Action& a) {
+        if (a.kind == Action::Plain) return may_exit(*a.s);
+        return a.kind == Action::Ret;
+    }
+    void gen_actions(std::vector<Action>& acts, LBlock& blk, size_t from = 0) {
+        for (size_t i = from; i < acts.size(); i++) {
+            gen_action(acts[i], blk);
+            if (i + 1 < acts.size() && action_may_exit(acts[i])) {
+                int64_t t = tmp();
+                copy(alive_cell, t);
+                if_nonzero(t, [&] { gen_actions(acts, blk, i + 1); });
+                release(t);
+                return;
+            }
+        }
+    }
+
+    void gen_block(LBlock& blk) {
+        TProc* p = blk.owner;
+        set(alive_cell, 1);
+        cur_tp = p;
+        cur_proc = p->name;
+        push_frame_scope(p);
+        ExitCtx bc; bc.kind = ExitCtx::Block; bc.needs = true; bc.alive = alive_cell; bc.break_state = blk.break_state; bc.cont_state = blk.cont_state;
+        ctxs.push_back(bc);
+        gen_actions(blk.acts, blk);
+        ctxs.pop_back();
+        pop_scope();
+        cur_tp = nullptr;
+        cur_proc.clear();
+    }
+
+    // Dispatch by countdown: level k runs block k when cnt (= state - k) is 0, else
+    // decrements and tries the next level.  About ten commands per level passed.
+    void gen_dispatch(int64_t cnt, size_t k) {
+        if (k > blocks.size()) return;
+        int64_t f = tmp(); set(f, 1);
+        open(cnt);
+        {
+            clear(f);
+            add(cnt, -1);
+            gen_dispatch(cnt, k + 1);
+        }
+        close();
+        if_nonzero(f, [&] { gen_block(blocks[k - 1]); });
+        release(f);
+    }
+
+    void gen_trampoline(const Program& prog) {
+        tprocs.push_back(std::make_unique<TProc>());          // main is tprocs[0]
+        for (auto& kv : procs) {
+            if (!kv.second.tramp) continue;
+            auto tp = std::make_unique<TProc>();
+            tp->name = kv.first; tp->decl = kv.second.decl; tp->ret = kv.second.decl->ret;
+            kv.second.tp = tp.get();
+            tprocs.push_back(std::move(tp));
+        }
+        for (auto& x : prog.items) if (x->kind == Stmt::Stack) stack_size = x->count;
+        lower_proc(tprocs[0].get(), prog.items);               // main first: its consts are visible to the others
+        for (size_t i = 1; i < tprocs.size(); i++) lower_proc(tprocs[i].get(), tprocs[i]->decl->body);
+        if (blocks.size() > 254) fail(Pos{}, "too many trampoline blocks (" + std::to_string(blocks.size()) + "); the state cell holds 254");
+
+        stack_base = alloc((int)array_cells(stack_size));     // lowest: variables and temporaries stay close together above it
+        state_cell = alloc(1); alive_cell = alloc(1); sp_cell = alloc(1);
+        res.symbols.push_back(Symbol{"__state", state_cell, 1, 'b', 1, ""});
+        res.symbols.push_back(Symbol{"__sp", sp_cell, 1, 'b', 1, ""});
+        res.sp_cell = sp_cell;
+        for (auto& tp : tprocs) {
+            for (Var& v : tp->frame) {
+                int cells = v.count >= 0 ? (int)array_cells(v.count) : (v.word ? 2 : 1);
+                v.cell = alloc(cells);
+                if (v.name.rfind("__h", 0) != 0)
+                    res.symbols.push_back(Symbol{tp->is_main() ? v.name : tp->name + "." + v.name, v.cell, cells, v.count >= 0 ? 'a' : (v.word ? 'w' : 'b'), v.count >= 0 ? v.count : 1, ""});
+            }
+            if (tp->ret) tp->retval = alloc(tp->ret == 2 ? 2 : 1);
+        }
+
+        out += "\n# trampoline: stack of " + std::to_string(stack_size) + " cells and " + std::to_string(blocks.size()) + " blocks\n";
+        push_frame_scope(tprocs[0].get());
+        scopes.back().top = true;
+        set(state_cell, tprocs[0]->entry);
+        open(state_cell);
+        {
+            int64_t cnt = tmp();
+            copy(state_cell, cnt);
+            add(cnt, -1);
+            gen_dispatch(cnt, 1);
+            release(cnt);
+        }
+        close();
+        pop_scope();
     }
 
     void run(const Program& prog) {
@@ -1347,8 +2038,14 @@ struct Gen {
         register_procs(prelude, true);
         register_procs(prog, false);
         out += "# compiled by bfl\n";
+        bool tramp = plan_trampolines(prog);
+        if (tramp) { gen_trampoline(prog); res.cells_used = high - ram; return; }
         push_scope(true);
+        ExitCtx mc; mc.kind = ExitCtx::Proc; mc.needs = contains_return(prog.items);
+        if (mc.needs) { mc.alive = tmp(); set(mc.alive, 1); }
+        ctxs.push_back(mc);
         gen_stmts(prog.items);
+        ctxs.pop_back();
         pop_scope();
         res.cells_used = high - ram;
     }
@@ -1371,11 +2068,12 @@ Result compile(const std::string& source, uint32_t ram_start) {
 }
 
 std::string describe(const Result& r) {
-    std::string s = "# statement map: S line col end_line start end depth\n";
+    std::string s = "# statement map: S line col end_line start end depth cont\n";
     char buf[256];
-    for (const StmtRange& m : r.stmts) { snprintf(buf, sizeof buf, "S %d %d %d %d %d %d\n", m.line, m.col, m.end_line, m.start, m.end, m.depth); s += buf; }
+    for (const StmtRange& m : r.stmts) { snprintf(buf, sizeof buf, "S %d %d %d %d %d %d %d\n", m.line, m.col, m.end_line, m.start, m.end, m.depth, m.cont ? 1 : 0); s += buf; }
     s += "# symbols: V name kind cell cells count scope\n";
     for (const Symbol& v : r.symbols) { snprintf(buf, sizeof buf, "V %s %c 0x%llX %d %d %s\n", v.name.c_str(), v.kind, (long long)v.cell, v.cells, v.count, v.scope.c_str()); s += buf; }
+    if (r.sp_cell >= 0) { snprintf(buf, sizeof buf, "# trampoline stack pointer cell 0x%llX\n", (long long)r.sp_cell); s += buf; }
     return s;
 }
 

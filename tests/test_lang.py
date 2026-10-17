@@ -205,6 +205,30 @@ case("deep-expr", "byte a = in; byte b = in; byte r = (a + b) * (a - b) / (a % b
 case("else-if-chain", "byte x = in; if (x < 3) { out 'a'; } else if (x < 6) { out 'b'; } else if (x < 9) { out 'c'; } else { out 'd'; }", b"c", b"\x07")
 case("while-register-loop", "byte n = 0; while (KEY_STATUS) { pulse KEY_STATUS; n++; } print n;", b"4", b"abcd")
 
+# ---- procedures with return values (inlined) ----
+case("proc-return-value", "proc byte sq(byte x) { return x * x; } proc word big(byte a) { return word(a) * 300; } print sq(7), \" \", big(3), \" \", sq(2) + sq(3);", b"49 900 13")
+case("proc-return-early", "proc byte firstdiv(byte n) { byte d; for (d = 2; d < n; d++) { if (n % d == 0) { return d; } } return n; } print firstdiv(91), \" \", firstdiv(97), \" \", firstdiv(8);", b"7 97 2")
+case("proc-return-nested-loops", "proc byte find(byte t) { byte i; byte j; for (i = 0; i < 5; i++) { for (j = 0; j < 5; j++) { if (i * j == t) { return i * 10 + j; } } } return 255; } print find(12), \" \", find(6), \" \", find(11);", b"34 23 255")
+case("main-return", "out 'a'; byte i; for (i = 0; i < 9; i++) { if (i == 3) { return; } out '0' + i; } out 'z';", b"a012")
+case("proc-call-stmt-discard", "byte n = 0; proc byte bump() { n++; return n; } bump(); bump(); print bump();", b"3")
+# ---- recursion (trampoline) ----
+case("rec-fib", "rec proc byte fib(byte n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } byte i; for (i = 0; i < 13; i++) { print fib(i), \" \"; }", b"0 1 1 2 3 5 8 13 21 34 55 89 144 ")
+case("rec-fact-word", "rec proc word fact(byte n) { if (n == 0) { return 1; } return fact(n - 1) * n; } print fact(8), \" \", fact(0), \" \", fact(5);", b"40320 1 120")
+case("rec-mutual", "rec proc byte odd(byte n) { if (n == 0) { return 0; } return even(n - 1); } rec proc byte even(byte n) { if (n == 0) { return 1; } return odd(n - 1); } print even(10), odd(10), even(7), odd(7);", b"1001")
+case("rec-call-in-while", "rec proc byte sum(byte n) { byte s = 0; while (n) { s += sum(n - 1) + 1; n--; } return s; } print sum(0), \" \", sum(1), \" \", sum(4);", b"0 1 15")
+case("rec-call-in-for-and-if", "rec proc byte count(byte d) { byte c = 1; byte i; if (d == 0) { return 1; } for (i = 0; i < 2; i++) { if (i == 1) { c += count(d - 1); } else { c += count(d - 1) * 2; } } return c; } print count(0), \" \", count(1), \" \", count(3);", b"1 4 40")
+case("rec-two-calls-expr", "rec proc byte f(byte n) { if (n == 0) { return 1; } return f(n - 1) * 2 + f(n - 1); } print f(0), \" \", f(1), \" \", f(3);", b"1 3 27")
+case("rec-ref-copy-out", "rec proc bump(ref byte x, byte n) { if (n == 0) { return; } x++; bump(x, n - 1); } byte v = 5; bump(v, 4); print v;", b"9")
+case("rec-void-proc-output", "rec proc hanoi(byte n, byte a, byte b, byte c) { if (n == 0) { return; } hanoi(n - 1, a, c, b); out a, b, ' '; hanoi(n - 1, c, b, a); } hanoi(3, 'A', 'C', 'B');", b"AC AB CB AC BA BC AC ")
+case("rec-ackermann", "rec proc byte ack(byte m, byte n) { if (m == 0) { return n + 1; } if (n == 0) { return ack(m - 1, 1); } return ack(m - 1, ack(m, n - 1)); } print ack(1, 2), \" \", ack(2, 2), \" \", ack(2, 3);", b"4 7 9")
+case("rec-tree-array", "byte tree[15]; byte i; for (i = 0; i < 15; i++) { tree[i] = i + 1; } rec proc word sumtree(byte k) { if (k >= 15) { return 0; } return word(tree[k]) + sumtree(k * 2 + 1) + sumtree(k * 2 + 2); } print sumtree(0);", b"120")
+case("rec-promoted-caller", "rec proc byte fib(byte n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } proc show(byte k) { print \"fib \", k, \" = \", fib(k), \"\\n\"; } show(5); show(10);", b"fib 5 = 5\nfib 10 = 55\n")
+case("rec-break-continue-in-lowered-loop", "rec proc byte f(byte n) { return n; } byte i; byte t = 0; for (i = 0; i < 10; i++) { if (i == 2) { continue; } if (i == 6) { break; } t += f(i); } print t;", b"13")
+case("rec-globals-and-locals", "byte g = 0; rec proc word depth(byte n) { byte local = n * 2; g++; if (n == 0) { return local; } return depth(n - 1) + local; } print depth(5), \" \", g;", b"30 6")
+case("rec-word-param", "rec proc word pw(word b, byte e) { if (e == 0) { return 1; } return pw(b, e - 1) * b; } print pw(3, 7), \" \", pw(2, 10);", b"2187 1024")
+case("rec-stack-size", "stack 32; rec proc byte d(byte n) { if (n == 0) { return 0; } return d(n - 1) + 1; } print d(6);", b"6")
+case("rec-print-inside", "rec proc walk(byte n) { if (n == 0) { return; } print n, \" \"; walk(n - 1); print n, \" \"; } walk(3);", b"3 2 1 1 2 3 ")
+
 
 def golden(update):
     """programs/*.bfl must compile byte-for-byte to tests/golden/<name>.b
@@ -255,7 +279,13 @@ def main():
         ("err-byte-range", "byte x = 300;", "does not fit a byte"),
         ("err-write-only-read", "byte x = HALT;", "write-only"),
         ("err-status-assign", "KEY_STATUS = 1;", "pulse KEY_STATUS"),
-        ("err-recursion", "proc f() { f(); } f();", "calls itself"),
+        ("err-recursion", "proc f() { f(); } f();", "declare it 'rec proc'"),
+        ("err-rec-array-local", "rec proc f(byte n) { byte a[3]; } f(1);", "cannot be local to a rec proc"),
+        ("err-rec-array-param", "rec proc f(ref byte a[]) { } byte b[2]; f(b);", "array parameters"),
+        ("err-return-value-void", "proc f() { return 1; } f();", "returns nothing"),
+        ("err-return-missing-value", "proc byte f() { return; } byte x = f();", "returns a value"),
+        ("err-void-in-expr", "proc f() { } byte x = f();", "cannot be used in an expression"),
+        ("err-rec-duplicate-local", "rec proc byte f(byte n) { return n; } byte x = f(1); if (x) { byte x = f(2); }", "declared twice"),
         ("err-break-outside", "break;", "outside a loop"),
         ("err-index-range", "byte a[3]; a[3] = 1;", "outside"),
         ("err-arg-count", "proc f(byte a) { } f(1, 2);", "takes 1 argument"),

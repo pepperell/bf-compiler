@@ -50,6 +50,7 @@ struct Debugger::Impl {
         ctx.temp_bp = -1;
         ctx.watch_hit = -1;
         ctx.skip_lo = ctx.skip_hi = -1;
+        ctx.cond_cell = -1;
         m.protect_ram(true);
         m.ctx_ = &ctx;
         m.running_ = true;
@@ -87,6 +88,7 @@ struct Debugger::Impl {
             pc = at;
             ctx.temp_bp = -1;
             ctx.skip_lo = ctx.skip_hi = -1;
+            ctx.cond_cell = -1;
             running = false;
             if (ctx.status == (int32_t)Status::Paused) {
                 last = Break{(Reason)ctx.pause_reason, ctx.pause_reason == (int)Reason::Watch ? ctx.watch_hit : -1};
@@ -124,9 +126,10 @@ void Debugger::set_statement_marks(const std::vector<uint8_t>& marks) {
     impl_->marks.resize(impl_->prog.code.size(), 0);
     impl_->ctx.stmt_mark = impl_->marks.data();
 }
-void Debugger::step_statement(int32_t skip_lo, int32_t skip_hi) {
+void Debugger::step_statement(int32_t skip_lo, int32_t skip_hi, int64_t cond_cell, int cond_val) {
     if (impl_->running || impl_->finished) return;
-    impl_->ctx.skip_lo = skip_lo; impl_->ctx.skip_hi = skip_hi;
+    impl_->ctx.skip_lo = skip_lo; impl_->ctx.skip_hi = skip_hi; impl_->ctx.skip_left = 0;
+    impl_->ctx.cond_cell = cond_cell; impl_->ctx.cond_val = cond_val;
     impl_->post(Impl::StepStmt);
 }
 void Debugger::run_to(int32_t pc) { if (!impl_->running && !impl_->finished) { impl_->ctx.temp_bp = pc; impl_->post(Impl::Cont); } }

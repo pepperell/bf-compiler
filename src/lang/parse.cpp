@@ -145,8 +145,8 @@ struct Parser {
         std::string n = tok.text; advance(); return n;
     }
     static bool is_keyword(const std::string& w) {
-        static const char* kws[] = {"byte", "word", "const", "proc", "ref", "if", "else", "while", "for", "break", "continue",
-                                    "out", "print", "pulse", "halt", "asm", "in", "input", nullptr};
+        static const char* kws[] = {"byte", "word", "const", "proc", "rec", "ref", "if", "else", "while", "for", "break", "continue",
+                                    "out", "print", "pulse", "halt", "asm", "in", "input", "return", "stack", nullptr};
         for (const char** k = kws; *k; k++) if (w == *k) return true;
         return false;
     }
@@ -169,6 +169,12 @@ struct Parser {
             if (is_keyword(tok.text)) fail("'" + tok.text + "' cannot be used in an expression");
             std::string n = ident();
             if (accept("[")) { auto e = mk(Expr::Index, p); e->text = n; e->a = expr(); expect("]"); return e; }
+            if (accept("(")) {
+                auto e = mk(Expr::Call, p); e->text = n;
+                if (!is_punct(")")) do e->args.push_back(expr()); while (accept(","));
+                expect(")");
+                return e;
+            }
             auto e = mk(Expr::Name, p); e->text = n; return e;
         }
         if (tok.type == T::End) fail("unexpected end of file in expression");
@@ -269,8 +275,12 @@ struct Parser {
             auto s = mks(Stmt::Const, p); advance(); s->name = ident(); expect("="); s->e = expr(); expect(";");
             return finish(std::move(s));
         }
-        if (is_ident("proc")) {
-            auto s = mks(Stmt::Proc, p); advance(); s->name = ident(); expect("(");
+        if (is_ident("rec") || is_ident("proc")) {
+            auto s = mks(Stmt::Proc, p);
+            if (is_ident("rec")) { s->rec = true; advance(); if (!is_ident("proc")) fail("expected 'proc' after 'rec'"); }
+            advance();
+            if (is_ident("byte")) { s->ret = 1; advance(); } else if (is_ident("word")) { s->ret = 2; advance(); }
+            s->name = ident(); expect("(");
             if (!is_punct(")")) do {
                 Param prm; prm.pos = tok.pos;
                 if (is_ident("ref")) { prm.ref = true; advance(); }
@@ -307,6 +317,19 @@ struct Parser {
             if (!is_punct(")")) s->step = simple(tok.pos);
             expect(")");
             s->body = block();
+            return finish(std::move(s));
+        }
+        if (is_ident("return")) {
+            auto s = mks(Stmt::Return, p); advance();
+            if (!is_punct(";")) s->e = expr();
+            expect(";");
+            return finish(std::move(s));
+        }
+        if (is_ident("stack")) {
+            auto s = mks(Stmt::Stack, p); advance();
+            if (tok.type != T::Num) fail("expected the stack size in cells after 'stack'");
+            s->count = tok.value; advance(); expect(";");
+            if (s->count < 4 || s->count > 256) fail("stack size must be 4..256 cells");
             return finish(std::move(s));
         }
         if (is_ident("break"))    { advance(); expect(";"); return finish(mks(Stmt::Break, p)); }

@@ -1,0 +1,33 @@
+// Quicksort on a byte array with a recursive procedure.  Arrays live at the
+// top level (a rec proc cannot own one); the procedure works on indices.
+
+const N = 16;
+byte a[16];                                   // array lengths must be literal
+
+rec proc quicksort(byte lo, byte hi) {          // sorts a[lo..hi], hi inclusive
+    if (lo >= hi) { return; }
+    byte pivot = a[hi];
+    byte i = lo;
+    byte j;
+    for (j = lo; j < hi; j++) {
+        if (a[j] < pivot) {
+            byte t = a[i]; a[i] = a[j]; a[j] = t;
+            i++;
+        }
+    }
+    byte u = a[i]; a[i] = a[hi]; a[hi] = u;    // pivot into place
+    if (i > lo) { quicksort(lo, i - 1); }
+    quicksort(i + 1, hi);
+}
+
+proc show() {
+    byte k;
+    for (k = 0; k < N; k++) { print a[k], " "; }
+    out "\n";
+}
+
+byte k;
+for (k = 0; k < N; k++) { pulse ROLL; a[k] = RANDOM % 100; }
+out "before: "; show();
+quicksort(0, N - 1);
+out "after:  "; show();
