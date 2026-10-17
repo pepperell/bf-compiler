@@ -221,16 +221,12 @@ def golden(update):
             print(f"FAIL golden-{name}: {r.stderr.decode('latin-1').strip()}")
             ok = False
             continue
-        got = open(out, "rb").read().replace(b"
-", b"
-")
+        got = open(out, "rb").read().replace(b"\r\n", b"\n")
         if update:
             open(gold, "wb").write(got)
             print(f"UPDATED {gold}")
             continue
-        want = open(gold, "rb").read().replace(b"
-", b"
-") if os.path.exists(gold) else None
+        want = open(gold, "rb").read().replace(b"\r\n", b"\n") if os.path.exists(gold) else None
         same = got == want
         print(("PASS " if same else "FAIL ") + f"golden-{name}")
         if not same:
