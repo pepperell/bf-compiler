@@ -33,12 +33,18 @@ a walking idiom described at the end.
 ## Types and declarations
 
 ```
-byte x;              // one cell, 0..255, wraps; zero unless initialised
-byte y = 7;
-word w = 1000;       // two cells (low byte first), 0..65535, wraps
+byte x;              // one cell, 0..255; zero unless initialised
+sbyte s = -5;        // one cell, -128..127
+word w = 1000;       // two cells (low byte first), 0..65535
+int i = -300;        // two cells, -32768..32767
+dword d = 4000000000;   // four cells, 0..4294967295
+long l = -100000;    // four cells, -2147483648..2147483647
 byte buf[16];        // byte array; the index may be any expression
 const MAX = 10;      // compile-time constant, occupies no cell
 ```
+
+All integer types wrap on overflow (two's complement). Signed values are stored
+in two's complement, so a `sbyte` holding -1 is the byte 255.
 
 Variables are allocated upward from the first RAM cell (0x100). A variable
 declared inside `{ }` exists until the closing brace and is cleared there, so a
@@ -133,23 +139,36 @@ Operators, loosest binding first:
 | 8 | `<<` `>>` |
 | 9 | `+` `-` |
 | 10 | `*` `/` `%` |
-| unary | `-` `!` `~` `byte(e)` `word(e)` |
+| unary | `-` `!` `~` and the casts `byte(e)` `sbyte(e)` `word(e)` `int(e)` `dword(e)` `long(e)` or `(T) e` |
 
 Rules:
 
-- Everything is unsigned. An expression is a **word** if any operand is a word
-  variable, `input`, a `word(...)` cast or a constant above 255; otherwise it is
-  a **byte**. `byte + byte` wraps at 256: write `word(a) + b` for a 16-bit sum.
-  Assigning a word to a byte keeps the low byte; assigning a byte to a word
-  zero-extends.
-- Comparisons, `!`, `&&` and `||` give 0 or 1. Any non-zero value is true.
-  `&&` and `||` evaluate their right operand only when needed.
-- `/` and `%` by zero give 0 and the dividend respectively. Shifts by 8 or
-  more (16 or more for words) give 0.
-- `in` reads one byte; `input` reads a decimal number. Both have side effects
-  and are evaluated where they appear.
-- Constant expressions are folded at compile time. A constant that does not fit
-  the target (`byte x = 300;`) is an error.
+- **Operand types.** The two operands of an arithmetic or comparison operator
+  are converted to a common type: the wider of the two; at equal width, signed
+  only if both are signed (mixing signed and unsigned of the same width is
+  unsigned and gives a warning). A constant takes the type of the other
+  operand when its value fits, so `s < -1` compares signed bytes and `w + 1`
+  stays a `word`. `byte + byte` wraps at 256: write `word(a) + b` for a 16-bit sum.
+- **Shifts** have the type of their left operand. `>>` is arithmetic (copies the
+  sign bit) on signed types and logical on unsigned ones. Shifting by the width
+  or more gives 0, or -1 for a negative signed value shifted right.
+- **Division** truncates towards zero, and `%` takes the sign of the dividend,
+  as in C: `-7 / 2` is -3 and `-7 % 2` is -1. Division by zero gives 0 and the
+  remainder is the dividend.
+- **Conversions.** Widening a signed value copies its sign (`sbyte` -3 becomes
+  `int` -3, or `word` 65533); widening an unsigned value fills with zeros.
+  Narrowing keeps the low bytes and gives a warning unless written as a cast.
+  Casts convert between any integer types.
+- **Constants.** Numbers are typed by value: the smallest of `byte`, `word`,
+  `dword` that holds them, or `sbyte`, `int`, `long` when negative; an `L`
+  suffix (`5L`) makes a `long`. Constant expressions are folded at compile time.
+  A constant must fit its target: `int i = 40000;` is an error, while an unsigned
+  target also accepts a negative constant (`byte x = -1;` is 255).
+- Comparisons, `!`, `&&` and `||` give 0 or 1 (a `byte`). Any non-zero value is
+  true. `&&` and `||` evaluate their right operand only when needed.
+- `in` reads one byte; `input` reads a decimal number as a `word`. Both have
+  side effects and are evaluated where they appear.
+- `print` writes any integer type in decimal, with a `-` for negative values.
 
 ## Registers
 

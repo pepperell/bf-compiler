@@ -1,28 +1,35 @@
-// codegen.cpp - BFL code generator: syntax tree -> brainfuck text.
+// codegen.cpp - BFL code generator: annotated syntax tree -> brainfuck text.
 //
 // Model: the pointer position is known at every point of the output.  Every
-// variable owns fixed cells; temporaries come from a LIFO pool just above the
-// variables and are always returned to zero, so a freshly allocated cell is
-// known to hold 0.  Loops keep the invariant "pointer on the same cell at '['
-// and ']'" by construction: close() moves back to the loop cell.
+// variable owns fixed cells; a value of type T occupies sizeof(T) consecutive
+// cells, least significant byte first.  Temporaries come from a LIFO pool just
+// above the variables and are always returned to zero, so a freshly allocated
+// cell is known to hold 0.  Loops keep the invariant "pointer on the same cell
+// at '[' and ']'" by construction: close() moves back to the loop cell.
 //
-// Expression evaluation is accumulating: eval8(e, dst, sign) adds sign*e to
-// dst, which lets `x += e` and `a + b` reuse one cell.  The known-value map
-// tracks cells holding compile-time constants in straight-line code so that
-// constants and string output are emitted as short deltas.
+// The semantic pass (sema.cpp) has already checked the program and given every
+// expression its type; this file only generates code.
+//
+// Byte expressions use an accumulating evaluator, eval8(e, dst, sign), which
+// adds sign*e to dst; it computes the low byte of any expression, directly when
+// the low byte depends only on the operands' low bytes.  Wider values use the
+// N-byte routines.  The known-value map tracks cells holding compile-time
+// constants in straight-line code so that constants are emitted as short deltas.
+//
+// Storage: variables in cells; arrays in cells use the walking layout of three
+// cells per byte (docs/LANG.md), one such array ("plane") per byte of the
+// element; the heap uses the walking layout of docs/HEAP.md.
 //
 // Procedures are inlined.  Recursion ("rec proc") uses a trampoline: the
 // bodies of recursive procedures, of everything that calls them, and of the
 // main program are cut into numbered blocks at every such call; a state cell
-// names the next block and one dispatcher loop runs them.  The current
-// activation's variables live in fixed cells; a call saves them to a stack
-// array together with the state to resume, and the resume block restores them.
-// See docs/TRAMPOLINE.md.
+// names the next block and one dispatcher loop runs them.  See docs/TRAMPOLINE.md.
 #include "lang.h"
 #include "ast.h"
 #include "sema.h"
 #include "../registers.h"
 #include <algorithm>
+#include <climits>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -46,6 +53,9 @@ proc __print_byte(byte v) {
     if (h || t) { out t + '0'; }
     out u + '0';
 }
+proc __print_sbyte(sbyte v) {
+    if (v < 0) { out '-'; __print_byte(byte(-v)); } else { __print_byte(byte(v)); }
+}
 proc __pw_digit(ref word v, word d, ref byte started) {
     byte q = 0;
     while (v >= d) { v -= d; q++; }
@@ -59,6 +69,30 @@ proc __print_word(word v) {
     __pw_digit(v, 10, started);
     out v + '0';
 }
+proc __print_int(int v) {
+    if (v < 0) { out '-'; __print_word(word(-v)); } else { __print_word(word(v)); }
+}
+proc __pd_digit(ref dword v, dword d, ref byte started) {
+    byte q = 0;
+    while (v >= d) { v -= d; q++; }
+    if (q || started) { out q + '0'; started = 1; }
+}
+proc __print_dword(dword v) {
+    byte started = 0;
+    __pd_digit(v, 1000000000, started);
+    __pd_digit(v, 100000000, started);
+    __pd_digit(v, 10000000, started);
+    __pd_digit(v, 1000000, started);
+    __pd_digit(v, 100000, started);
+    __pd_digit(v, 10000, started);
+    __pd_digit(v, 1000, started);
+    __pd_digit(v, 100, started);
+    __pd_digit(v, 10, started);
+    out byte(v) + '0';
+}
+proc __print_long(long v) {
+    if (v < 0) { out '-'; __print_dword(dword(-v)); } else { __print_dword(dword(v)); }
+}
 proc __read_word(ref word w) {
     w = 0;
     byte c = in;
@@ -69,30 +103,35 @@ proc __read_word(ref word w) {
 }
 )";
 
+// Heap walking layout (docs/HEAP.md): HK cells per byte, coarse hops of HOP bytes.
+constexpr int HK = 5, HOP = 16;
+constexpr int HC = 0, HH = 1, HL = 2, HV = 3, HD = 4;
+
 struct Fail { Pos pos; std::string msg; };
 
 struct Var {
     std::string name;
     int64_t cell = 0;
-    bool word = false;
-    int count = -1;             // array length, -1 = scalar
-    bool is_const = false;
+    const Type* type = nullptr;  // value type; for arrays the element type
+    int count = -1;              // array length, -1 = scalar
+    bool is_const = false;       // constants and heap arrays (cval = address)
     int64_t cval = 0;
-    bool owned = true;          // false: ref alias, not cleared at scope exit
+    bool owned = true;           // false: ref alias, not cleared at scope exit
+    int size() const { return type ? std::max(type->size, 1) : 1; }
+    bool cell_array() const { return count >= 0 && !is_const; }
 };
 
 struct TProc;
 struct ProcInfo {
     const Stmt* decl;
     bool prelude;
-    bool tramp = false;         // compiled as trampoline blocks
+    bool tramp = false;          // compiled as trampoline blocks
     TProc* tp = nullptr;
-    std::vector<std::string> callees;
 };
 
 // ---- trampoline structures -------------------------------------------------------------
 struct Action {
-    enum Kind { Plain, SetState, IfGoto, Call, Ret, Pop };
+    enum Kind { Plain, SetState, IfGoto, Call, Ret, Pop, Clear };
     Kind kind;
     const Stmt* s = nullptr;        // Plain: statement to generate (original or synthetic)
     const Stmt* src = nullptr;      // statement for the map
@@ -100,8 +139,8 @@ struct Action {
     int a = -1, b = -1;             // SetState: a; IfGoto: true a, false b; Call: resume block
     TProc* callee = nullptr;        // Call / Pop
     std::vector<ExprP> args;        // Call
-    std::string result;             // Pop: hidden variable receiving the callee's result ("" none)
-    std::vector<std::pair<std::string, int>> copy_out;   // Pop: (caller variable, callee param index) for ref params
+    std::string result;             // Pop: hidden variable receiving the callee's result ("" none); Clear: variable
+    std::vector<std::pair<const Expr*, int>> copy_out;   // Pop: (caller lvalue, callee param index) for ref params
     ExprP ret;                      // Ret: value or null
 };
 struct LBlock {
@@ -114,7 +153,7 @@ struct TProc {
     std::string name;               // "" for the main program
     const Stmt* decl = nullptr;     // nullptr for main
     int entry = 0;
-    int ret = 0;                    // 0 none, 1 byte, 2 word
+    const Type* ret = nullptr;      // result type or null
     int64_t retval = -1;
     std::vector<Var> frame;         // params, hoisted locals, hidden temporaries (saved on call unless main)
     std::vector<Var> consts;
@@ -123,9 +162,27 @@ struct TProc {
     int save_count() const {        // cells pushed on a call (not for main)
         if (is_main()) return 0;
         int n = 0;
-        for (const Var& v : frame) n += v.word ? 2 : 1;
+        for (const Var& v : frame) n += v.size();
         return n;
     }
+};
+
+// A storage location an expression denotes.
+struct LV {
+    enum Kind { Cells, Elem, Heap, Reg } kind = Cells;
+    const Type* type = nullptr;
+    int64_t cell = 0;                       // Cells: first cell
+    const Var* arr = nullptr;               // Elem: the array variable
+    const Expr* index = nullptr;            // Elem: runtime index (null: cidx)
+    int64_t cidx = -1;                      // Elem: constant index
+    int boff = 0;                           // Elem: byte offset within the element
+    const Expr* ptr = nullptr;              // Heap: pointer-valued expression (null: none)
+    int64_t base = 0;                       // Heap: constant address part (includes constant offsets)
+    const Expr* hidx = nullptr;             // Heap: runtime index, scaled by esize
+    int esize = 1;
+    const bf::RegisterInfo* reg = nullptr;  // Reg
+    int size() const { return std::max(type->size, 1); }
+    bool const_addr() const { return kind == Heap && !ptr && !hidx; }
 };
 
 struct Gen {
@@ -135,9 +192,16 @@ struct Gen {
     std::string& out;
     int64_t cur;
     std::vector<int64_t> loops;
-    std::unordered_map<int64_t, int> known;      // cell -> constant value (RAM cells only)
+    std::unordered_map<int64_t, int> known;      // cell -> constant value (RAM cells below the heap only)
     int64_t next_free, high;
     std::vector<int32_t> line_starts;
+    Types* T = nullptr;
+    Options opt;
+    const SemaResult* sr = nullptr;
+
+    // heap: element 0 starts at heap_elem0; a guard of HOP elements before it
+    int64_t heap_lo = INT64_MAX, heap_elem0 = 0;
+    int heap_size = 0;
 
     struct Scope { std::unordered_map<std::string, Var> vars; std::vector<std::string> order; int64_t mark; bool top; bool frame = false; };
     std::vector<Scope> scopes;
@@ -151,7 +215,7 @@ struct Gen {
         int64_t alive = -1, brk = -1;
         bool needs = false;
         int64_t retval = -1;        // Proc: result cell(s)
-        int ret = 0;                // Proc: 0 none, 1 byte, 2 word
+        const Type* ret = nullptr;  // Proc: result type or null
         int break_state = -1, cont_state = -1;   // Block
     };
     std::vector<ExitCtx> ctxs;
@@ -163,6 +227,7 @@ struct Gen {
     std::vector<std::unique_ptr<TProc>> tprocs;
     std::vector<LBlock> blocks;
     std::vector<StmtP> synth;
+    std::vector<ExprP> synth_exprs;
     TProc* cur_tp = nullptr;        // generating a trampolined body
     int64_t state_cell = -1, alive_cell = -1, sp_cell = -1, stack_base = -1;
     int stack_size = 128;
@@ -173,10 +238,8 @@ struct Gen {
     }
 
     [[noreturn]] void fail(Pos p, const std::string& m) { throw Fail{p, m}; }
-    static int ret_of(const Stmt* d) { return d->vtype ? d->vtype->size : 0; }
-    static bool pw(const Param& p) { return p.type && p.type->size == 2; }
-    static bool dw(const Stmt& s) { return s.vtype && s.vtype->size == 2; }
-    [[noreturn]] void internal(const std::string& m) { throw Fail{Pos{0, 0, 0}, "internal compiler error: " + m}; }
+    [[noreturn]] void internal(const std::string& m) { throw Fail{Pos{0, 0, 0, 0}, "internal compiler error: " + m}; }
+    static const Type* ret_of(const Stmt* d) { return d->vtype; }
 
     int line_of(int32_t off) const {
         auto it = std::upper_bound(line_starts.begin(), line_starts.end(), off);
@@ -191,6 +254,7 @@ struct Gen {
     static bool reg_readable(const bf::RegisterInfo& r) { return r.kind != bf::REG_TRIGGER; }
 
     // ---- emission primitives ------------------------------------------------------------
+    bool trackable(int64_t c) const { return c >= ram && c < heap_lo; }
     void rep(char c, int64_t n) { if (n > 0) out.append((size_t)n, c); }
     void go(int64_t c) { if (c > cur) rep('>', c - cur); else rep('<', cur - c); cur = c; }
     void open(int64_t c) { go(c); out += '['; loops.push_back(c); known.clear(); }
@@ -198,7 +262,7 @@ struct Gen {
         int64_t c = loops.back(); loops.pop_back();
         go(c); out += ']';
         known.clear();
-        if (c >= ram) known[c] = 0;
+        if (trackable(c)) known[c] = 0;
     }
     bool known_is(int64_t c, int v) const { auto it = known.find(c); return it != known.end() && it->second == v; }
     std::optional<int> known_val(int64_t c) const { auto it = known.find(c); if (it == known.end()) return std::nullopt; return it->second; }
@@ -217,26 +281,30 @@ struct Gen {
         clear(c);
         add(c, v);
     }
-    void set16(int64_t lo, int64_t v) { set(lo, v & 255); set(lo + 1, (v >> 8) & 255); }
+    void setN(int64_t c, int n, int64_t v) { for (int k = 0; k < n; k++) set(c + k, (v >> (8 * k)) & 255); }
+    void clearN(int64_t c, int n) { for (int k = 0; k < n; k++) clear(c + k); }
 
     // ---- cells ----------------------------------------------------------------------------
     int64_t alloc(int n) {
         int64_t c = next_free;
         next_free += n;
         if (next_free > high) high = next_free;
+        if (next_free > heap_lo) internal("variables collide with the heap");
         for (int i = 0; i < n; i++) known[c + i] = 0;
         return c;
     }
     int64_t tmp() { return alloc(1); }
     int64_t tmp2() { return alloc(2); }
+    int64_t tmpN(int n) { return alloc(n); }
     void release(int64_t c) {          // temp must be the most recent allocation; leaves it zero
         if (c != next_free - 1) internal("temporary released out of order");
         clear(c);
         next_free = c;
     }
-    void release2(int64_t c) {
-        if (c != next_free - 2) internal("temporary pair released out of order");
-        clear(c + 1); clear(c);
+    void release2(int64_t c) { releaseN(c, 2); }
+    void releaseN(int64_t c, int n) {
+        if (c != next_free - n) internal("temporary group released out of order");
+        for (int k = n - 1; k >= 0; k--) clear(c + k);
         next_free = c;
     }
     void drop(int64_t c, int n = 1) {  // free cells the caller knows are zero
@@ -260,7 +328,7 @@ struct Gen {
     }
     // dst += sign*src, src preserved.
     void copy(int64_t from, int64_t dst, int sign = 1) {
-        if (from >= ram) if (auto k = known_val(from)) { add(dst, sign * *k); return; }
+        if (trackable(from)) if (auto k = known_val(from)) { add(dst, sign * *k); return; }
         int64_t t = tmp();
         move(from, {{dst, sign}, {t, 1}});
         move(t, {{from, 1}});
@@ -298,7 +366,7 @@ struct Gen {
         release(P); release(M);
     }
 
-    // ---- byte arrays (see docs/LANG.md for the layout) --------------------------------------
+    // ---- arrays in cells (see docs/LANG.md for the layout) ------------------------------------
     void array_read(int64_t base, int64_t idx, int64_t dst) {     // idx consumed; dst += a[idx]
         int64_t C0 = base + 3, V0 = base + 4;
         move(idx, {{C0, 1}});
@@ -316,10 +384,83 @@ struct Gen {
         cur = base; known.clear();
     }
     static int64_t array_cells(int count) { return 3 * ((int64_t)count + 1); }
+    // Cells of a whole array variable: one byte array per byte of the element.
+    static int64_t array_total(const Var& v) { return array_cells(v.count) * v.size(); }
+    static int64_t plane(const Var& v, int byte) { return v.cell + array_cells(v.count) * byte; }
+
+    // ---- the heap (docs/HEAP.md) --------------------------------------------------------------
+    int64_t heap_cell(int64_t addr, int field) const { return heap_elem0 + HK * addr + field; }
+    static std::string rel(int64_t n) { return n > 0 ? std::string((size_t)n, '>') : std::string((size_t)-n, '<'); }
+    static std::string carry(int f, int steps, int at) {    // move field f forward `steps` elements, standing at field `at`
+        int64_t dist = (int64_t)steps * HK;
+        return rel(f - at) + "[-" + std::string((size_t)dist, '>') + "+" + std::string((size_t)dist, '<') + "]" + rel(at - f);
+    }
+    static std::string carry_back(int stride, bool fine) {
+        int64_t d = (int64_t)stride * HK;
+        std::string L((size_t)d, '<'), R((size_t)d, '>');
+        std::string mv = rel(HV - HC) + "[-" + L + "+" + R + "]" + rel(HC - HV);
+        std::string s = mv + L + "[-" + mv + L + "]";
+        if (fine) s += rel(HV - HC) + "[-" + R + "+" + L + "]" + rel(HC - HV) + R;
+        return s;
+    }
+    // Walk to the byte at the address held in addr (2 cells, consumed) and read it (dst += value)
+    // or write val (consumed) into it.
+    void heap_walk(int64_t addr, int64_t val, int64_t dst, bool write) {
+        if (opt.check_heap) heap_check(addr);
+        int64_t e0 = heap_elem0;
+        move(addr + 1, {{e0 + HH, 1}});
+        move(addr, {{e0 + HL, 1}});
+        if (write) move(val, {{e0 + HV, 1}});
+        go(e0 + HH);
+        std::string hop((size_t)HOP * HK, '>'), backh((size_t)HOP * HK, '<');
+        std::string body = "-" + rel(HC - HH) + std::string(256 / HOP, '+');
+        std::string step = "-[-" + hop + "+" + backh + "]" + carry(HH, HOP, HC) + carry(HL, HOP, HC);
+        if (write) step += carry(HV, HOP, HC);
+        step += "+" + hop;
+        body += "[" + step + "]" + rel(HH - HC);
+        out += "[" + body + "]";
+        std::string fine = rel(HL - HH) + "[-" + rel(HC - HL) + "+" + rel(HL - HC) + "]" + rel(HC - HL);
+        std::string one((size_t)HK, '>'), back1((size_t)HK, '<');
+        std::string fstep = "-[-" + one + "+" + back1 + "]";
+        if (write) fstep += carry(HV, 1, HC);
+        fstep += "+" + one;
+        out += fine + "[" + fstep + "]";
+        if (write) {
+            out += rel(HD - HC) + "[-]" + rel(HV - HD) + "[-" + rel(HD - HV) + "+" + rel(HV - HD) + "]" + rel(HC - HV);
+            out += back1 + "[-" + back1 + "]" + one;
+            out += backh + "[-" + backh + "]";
+        } else {
+            out += rel(HD - HC) + "[-" + rel(HV - HD) + "+" + rel(HH - HV) + "+" + rel(HD - HH) + "]";
+            out += rel(HH - HD) + "[-" + rel(HD - HH) + "+" + rel(HH - HD) + "]" + rel(HC - HH);
+            out += carry_back(1, true);
+            out += carry_back(HOP, false);
+        }
+        cur = e0 - (int64_t)HOP * HK + HC;
+        known.clear();
+        if (!write) move(e0 - (int64_t)HOP * HK + HV, {{dst, 1}});
+    }
+    // --check-heap: report and halt on a null or out-of-range address (2 cells, preserved).
+    void heap_check(int64_t addr) {
+        int64_t bad = tmp();
+        iszeroN(addr, bad, 2);
+        int64_t lim = tmp2(); setN(lim, 2, heap_size);
+        int64_t lt = tmp(); ltN_cells(addr, lim, 2, lt, 1);
+        int64_t ge = tmp(); not8(lt, ge, 1);
+        if_nonzero(ge, [&] { set(bad, 1); });
+        release(ge); release(lt); release2(lim);
+        if_nonzero(bad, [&] {
+            int64_t t = tmp();
+            for (unsigned char ch : std::string("\nheap access out of range\n")) { set(t, ch); go(t); out += '.'; }
+            release(t);
+            pulse_reg("HALT");
+            clearN(addr, 2);            // carry on harmlessly at address 0 until the halt takes effect
+        });
+        release(bad);
+    }
 
     // ---- 8-bit routines on cells ---------------------------------------------------------------
     void iszero8(int64_t c, int64_t z) {                // z += (c == 0)
-        if (c >= ram) if (auto k = known_val(c)) { add(z, *k == 0 ? 1 : 0); return; }
+        if (trackable(c)) if (auto k = known_val(c)) { add(z, *k == 0 ? 1 : 0); return; }
         int64_t cc = tmp();
         copy(c, cc);
         add(z, 1);
@@ -353,6 +494,15 @@ struct Gen {
         int64_t t2 = tmp(); copy(y, t2);
         lt8_core(t1, t2, dst, sign);
         release(t2); release(t1);
+    }
+    // f += 1 when the byte at c has its top bit set (c preserved)
+    void sign_flag(int64_t c, int64_t f) {
+        int64_t t1 = tmp(); copy(c, t1);
+        int64_t t2 = tmp(); set(t2, 128);
+        int64_t r = tmp();
+        lt8_core(t1, t2, r, 1);
+        not8(r, f, 1);
+        release(r); release(t2); release(t1);
     }
     // q += a / b, r += a % b.  a consumed, b cleared.
     void divmod8(int64_t a, int64_t b, int64_t q, int64_t r) {
@@ -424,137 +574,225 @@ struct Gen {
         clear(ta); clear(tb);
     }
 
-    // ---- 16-bit routines (lo cell, hi = lo + 1) ----------------------------------------------------
-    bool known0_16(int64_t lo) const { return known_is(lo, 0) && known_is(lo + 1, 0); }
-    void clear16(int64_t lo) { clear(lo); clear(lo + 1); }
-    void inc16(int64_t lo) {
-        add(lo, 1);
+    // ---- N-byte routines (least significant byte first) ---------------------------------------------
+    bool known0N(int64_t c, int n) const { for (int k = 0; k < n; k++) if (!known_is(c + k, 0)) return false; return true; }
+    void incN(int64_t c, int n, int from = 0) {        // c += 256^from
+        add(c + from, 1);
+        if (from + 1 >= n) return;
         int64_t z = tmp();
-        iszero8(lo, z);
-        if_nonzero(z, [&] { add(lo + 1, 1); });
+        iszero8(c + from, z);
+        if_nonzero(z, [&] { incN(c, n, from + 1); });
         release(z);
     }
-    void dec16(int64_t lo) {
-        int64_t z = tmp();
-        iszero8(lo, z);
-        if_nonzero(z, [&] { add(lo + 1, -1); });
-        release(z);
-        add(lo, -1);
+    void decN(int64_t c, int n, int from = 0) {        // c -= 256^from
+        if (from + 1 < n) {
+            int64_t z = tmp();
+            iszero8(c + from, z);
+            if_nonzero(z, [&] { decN(c, n, from + 1); });
+            release(z);
+        }
+        add(c + from, -1);
     }
-    void add16(int64_t dst, int64_t s) {                 // dst += s; s consumed
-        if (known0_16(dst)) { move(s, {{dst, 1}}); move(s + 1, {{dst + 1, 1}}); return; }
-        if (!known_is(s, 0)) { open(s); add(s, -1); inc16(dst); close(); }
-        move(s + 1, {{dst + 1, 1}});
+    void moveN(int64_t s, int64_t dst, int n, int sign = 1) { for (int k = 0; k < n; k++) move(s + k, {{dst + k, sign}}); }
+    void addN(int64_t dst, int64_t s, int n) {         // dst += s; s consumed
+        if (known0N(dst, n)) { moveN(s, dst, n); return; }
+        for (int k = 0; k < n - 1; k++) {
+            if (known_is(s + k, 0)) continue;
+            open(s + k); add(s + k, -1); incN(dst, n, k); close();
+        }
+        move(s + n - 1, {{dst + n - 1, 1}});
     }
-    void sub16(int64_t dst, int64_t s) {                 // dst -= s; s consumed
-        if (!known_is(s, 0)) { open(s); add(s, -1); dec16(dst); close(); }
-        move(s + 1, {{dst + 1, -1}});
+    void subN(int64_t dst, int64_t s, int n) {         // dst -= s; s consumed
+        for (int k = 0; k < n - 1; k++) {
+            if (known_is(s + k, 0)) continue;
+            open(s + k); add(s + k, -1); decN(dst, n, k); close();
+        }
+        move(s + n - 1, {{dst + n - 1, -1}});
     }
-    void add16_const(int64_t dst, int64_t v) {
-        v &= 0xFFFF;
-        if (known0_16(dst)) { add(dst, v & 255); add(dst + 1, v >> 8); return; }
-        if (v & 255) {
+    void addN_const(int64_t dst, int n, int64_t v) {
+        if (n == 1) { add(dst, v); return; }
+        uint64_t u = (uint64_t)v & (n >= 8 ? ~0ull : ((1ull << (8 * n)) - 1));
+        if (known0N(dst, n)) { for (int k = 0; k < n; k++) add(dst + k, (u >> (8 * k)) & 255); return; }
+        for (int k = 0; k < n - 1; k++) {
+            int b = (int)((u >> (8 * k)) & 255);
+            if (!b) continue;
             int64_t t = tmp();
-            set(t, v & 255);
-            open(t); add(t, -1); inc16(dst); close();
+            set(t, b);
+            open(t); add(t, -1); incN(dst, n, k); close();
             release(t);
         }
-        add(dst + 1, v >> 8);
+        add(dst + n - 1, (u >> (8 * (n - 1))) & 255);
     }
-    void copy16(int64_t s, int64_t dst) {                // dst += s; s preserved
-        if (known0_16(dst)) { copy(s, dst); copy(s + 1, dst + 1); return; }
-        int64_t t = tmp2();
-        copy(s, t); copy(s + 1, t + 1);
-        add16(dst, t);
-        release2(t);
+    void copyN(int64_t s, int64_t dst, int n) {        // dst += s; s preserved
+        if (n == 1) { copy(s, dst); return; }
+        if (known0N(dst, n)) { for (int k = 0; k < n; k++) copy(s + k, dst + k); return; }
+        int64_t t = tmpN(n);
+        for (int k = 0; k < n; k++) copy(s + k, t + k);
+        addN(dst, t, n);
+        releaseN(t, n);
     }
-    void move16(int64_t s, int64_t dst) {                // dst (zero) = s; s consumed
-        move(s, {{dst, 1}}); move(s + 1, {{dst + 1, 1}});
-    }
-    void nonzero16(int64_t w, int64_t f) {              // f += (w != 0)
+    void nonzeroN(int64_t w, int64_t f, int n) {        // f += (w != 0)
+        if (n == 1) { int64_t cc = tmp(); copy(w, cc); if_nonzero(cc, [&] { add(f, 1); }); release(cc); return; }
         int64_t g = tmp(), cc = tmp();
-        copy(w, cc);     if_nonzero(cc, [&] { set(g, 1); });
-        copy(w + 1, cc); if_nonzero(cc, [&] { set(g, 1); });
+        for (int k = 0; k < n; k++) { copy(w + k, cc); if_nonzero(cc, [&] { set(g, 1); }); }
         release(cc);
         move(g, {{f, 1}});
         release(g);
     }
-    void iszero16(int64_t w, int64_t z) {
+    void iszeroN(int64_t w, int64_t z, int n) {
         int64_t g = tmp();
-        nonzero16(w, g);
+        nonzeroN(w, g, n);
         not8(g, z, 1);
         release(g);
     }
-    void mul16(int64_t a, int64_t b, int64_t dst) {       // dst += a*b; a, b consumed
+    void notN(int64_t c, int n) {                      // c = ~c
+        for (int k = 0; k < n; k++) {
+            int64_t t = tmp();
+            move(c + k, {{t, 1}});
+            add(c + k, 255);
+            move(t, {{c + k, -1}});
+            release(t);
+        }
+    }
+    void negN(int64_t c, int n) { notN(c, n); incN(c, n); }
+    // dst += sign*(a == b); preserved
+    void eqN_cells(int64_t a, int64_t b, int n, int64_t dst, int sign) {
+        if (n == 1) { eq8_cells(a, b, dst, sign); return; }
+        int64_t d = tmpN(n);
+        for (int k = 0; k < n; k++) { copy(a + k, d + k); copy(b + k, d + k, -1); }
+        int64_t z = tmp();
+        iszeroN(d, z, n);
+        move(z, {{dst, sign}});
+        release(z);
+        releaseN(d, n);
+    }
+    // dst += sign*(a < b) unsigned; preserved
+    void ltN_cells(int64_t a, int64_t b, int n, int64_t dst, int sign) {
+        int k = n - 1;
+        lt8_cells(a + k, b + k, dst, sign);
+        if (k == 0) return;
+        int64_t e = tmp();
+        eq8_cells(a + k, b + k, e, 1);
+        if_nonzero(e, [&] { ltN_cells(a, b, k, dst, sign); });
+        release(e);
+    }
+    // dst += sign*(a < b) for two's complement values; preserved
+    void sltN_cells(int64_t a, int64_t b, int n, int64_t dst, int sign) {
+        int64_t ta = tmpN(n), tb = tmpN(n);
+        for (int k = 0; k < n; k++) { copy(a + k, ta + k); copy(b + k, tb + k); }
+        add(ta + n - 1, 128); add(tb + n - 1, 128);
+        ltN_cells(ta, tb, n, dst, sign);
+        releaseN(tb, n); releaseN(ta, n);
+    }
+    void shlN(int64_t w, int n) {                      // w <<= 1
+        if (n == 1) { double8(w); return; }
+        int64_t f = tmpN(n - 1);
+        for (int k = 0; k < n - 1; k++) sign_flag(w + k, f + k);
+        for (int k = 0; k < n; k++) double8(w + k);
+        for (int k = 0; k < n - 1; k++) if_nonzero(f + k, [&] { add(w + k + 1, 1); });
+        releaseN(f, n - 1);
+    }
+    // w >>= 1 (arithmetic when sgn); the bit shifted out is added to lowbit when >= 0
+    void shrN(int64_t w, int n, bool sgn, int64_t lowbit = -1) {
+        int64_t s = -1;
+        if (sgn) { s = tmp(); sign_flag(w + n - 1, s); }
+        int64_t h = tmpN(n), b = tmpN(n);
+        for (int k = n - 1; k >= 0; k--) halve_bit(w + k, h + k, b + k);
+        for (int k = 0; k < n; k++) move(h + k, {{w + k, 1}});
+        for (int k = 1; k < n; k++) if_nonzero(b + k, [&] { add(w + k - 1, 128); });
+        if (lowbit >= 0) move(b, {{lowbit, 1}}); else clear(b);
+        releaseN(b, n); releaseN(h, n);
+        if (sgn) { if_nonzero(s, [&] { add(w + n - 1, 128); }); release(s); }
+    }
+    // dst += a * b (mod 2^8n); a and b consumed
+    void mulN(int64_t a, int64_t b, int64_t dst, int n) {
         int64_t f = tmp();
-        nonzero16(b, f);
+        nonzeroN(b, f, n);
         open(f);
         {
-            dec16(b);
-            copy16(a, dst);
             clear(f);
-            nonzero16(b, f);
+            int64_t bit = tmp();
+            shrN(b, n, false, bit);
+            if_nonzero(bit, [&] { copyN(a, dst, n); });
+            release(bit);
+            shlN(a, n);
+            nonzeroN(b, f, n);
         }
         close();
         release(f);
-        clear16(a); clear16(b);
+        clearN(a, n);
     }
-    void mul16_const(int64_t a, int64_t k, int64_t dst) { // dst += a*k (k < 256); a consumed
+    // dst += a * k for a constant k; a consumed
+    void mul_constN(int64_t a, int64_t k, int64_t dst, int n) {
+        uint64_t u = (uint64_t)k & (n >= 8 ? ~0ull : ((1ull << (8 * n)) - 1));
+        if (u == 0) { clearN(a, n); return; }
+        if (u <= 3) {
+            for (uint64_t i = 1; i < u; i++) copyN(a, dst, n);
+            addN(dst, a, n);
+            return;
+        }
+        int top = 63; while (!((u >> top) & 1)) top--;
+        for (int i = 0; i <= top; i++) {
+            if ((u >> i) & 1) { if (i == top) { addN(dst, a, n); break; } copyN(a, dst, n); }
+            shlN(a, n);
+        }
+    }
+    // q += a / b, r += a % b (unsigned; b == 0 gives q = 0, r = a).  a consumed, b cleared; q and r start at zero.
+    void divmodN(int64_t a, int64_t b, int64_t q, int64_t r, int n) {
+        if (n == 1) { divmod8(a, b, q, r); return; }
+        int64_t z = tmp();
+        iszeroN(b, z, n);
+        int64_t f = tmp(); set(f, 1);
+        if_nonzero(z, [&] { moveN(a, r, n); clear(f); });
+        if_nonzero(f, [&] {
+            int64_t cnt = tmp(); set(cnt, 8 * n);
+            open(cnt);
+            {
+                add(cnt, -1);
+                shlN(q, n);
+                int64_t bit = tmp();
+                sign_flag(a + n - 1, bit);
+                shlN(a, n);
+                shlN(r, n);
+                if_nonzero(bit, [&] { add(r, 1); });
+                release(bit);
+                int64_t lt = tmp(); ltN_cells(r, b, n, lt, 1);
+                int64_t ge = tmp(); not8(lt, ge, 1);
+                if_nonzero(ge, [&] {
+                    int64_t t = tmpN(n);
+                    for (int k = 0; k < n; k++) copy(b + k, t + k);
+                    subN(r, t, n);
+                    releaseN(t, n);
+                    add(q, 1);
+                });
+                release(ge); release(lt);
+            }
+            close();
+            release(cnt);
+        });
+        release(f); release(z);
+        clearN(a, n);
+        clearN(b, n);
+    }
+    // signed: the quotient truncates towards zero, the remainder takes the sign of the dividend
+    void sdivmodN(int64_t a, int64_t b, int64_t q, int64_t r, int n) {
+        int64_t sa = tmp(); sign_flag(a + n - 1, sa);
+        int64_t sb = tmp(); sign_flag(b + n - 1, sb);
         int64_t t = tmp();
-        set(t, k);
-        open(t); add(t, -1); copy16(a, dst); close();
+        copy(sa, t); if_nonzero(t, [&] { negN(a, n); });
+        copy(sb, t); if_nonzero(t, [&] { negN(b, n); });
         release(t);
-        clear16(a);
-    }
-    void divmod16(int64_t a, int64_t b, int64_t q, int64_t r) {   // q += a/b, r += a%b; a consumed, b cleared
-        int64_t c = tmp2();
-        copy16(b, c);
-        int64_t f = tmp();
-        nonzero16(a, f);
-        open(f);
-        {
-            dec16(a); inc16(r); dec16(c);
-            int64_t z = tmp();
-            iszero16(c, z);
-            if_nonzero(z, [&] { inc16(q); clear16(r); copy16(b, c); });
-            release(z);
-            clear(f);
-            nonzero16(a, f);
-        }
-        close();
-        release(f);
-        release2(c);
-        clear16(b);
-    }
-    void eq16_cells(int64_t a, int64_t b, int64_t dst, int sign) {  // dst += sign*(a == b); preserved
-        int64_t t = tmp(); eq8_cells(a, b, t, 1);
-        int64_t t2 = tmp(); eq8_cells(a + 1, b + 1, t2, 1);
-        if_nonzero(t, [&] { if_nonzero(t2, [&] { add(dst, sign); }); });
-        release(t2); release(t);
-    }
-    void lt16_cells(int64_t a, int64_t b, int64_t dst, int sign) {  // dst += sign*(a < b); preserved
-        int64_t hl = tmp(); lt8_cells(a + 1, b + 1, hl, 1);
-        int64_t he = tmp(); eq8_cells(a + 1, b + 1, he, 1);
-        int64_t ll = tmp(); lt8_cells(a, b, ll, 1);
-        if_nonzero(hl, [&] { add(dst, sign); });
-        if_nonzero(he, [&] { if_nonzero(ll, [&] { add(dst, sign); }); });
-        release(ll); release(he); release(hl);
-    }
-    void shl16(int64_t w) {
-        int64_t t = tmp2();
-        copy16(w, t);
-        add16(w, t);
-        release2(t);
-    }
-    void shr16(int64_t w) {
-        int64_t hh = tmp(), hb = tmp();
-        halve_bit(w + 1, hh, hb);
-        int64_t lh = tmp(), lb = tmp();
-        halve_bit(w, lh, lb);
-        move(lh, {{w, 1}});
-        if_nonzero(hb, [&] { add(w, 128); });
-        move(hh, {{w + 1, 1}});
-        release(lb); release(lh); release(hb); release(hh);
+        int64_t uq = tmpN(n), ur = tmpN(n);
+        divmodN(a, b, uq, ur, n);
+        int64_t x = tmp();
+        copy(sa, x); copy(sb, x, -1);          // x != 0  <=>  signs differ
+        if_nonzero(x, [&] { negN(uq, n); });
+        release(x);
+        if_nonzero(sa, [&] { negN(ur, n); });
+        clear(sb);
+        moveN(ur, r, n); moveN(uq, q, n);
+        releaseN(ur, n); releaseN(uq, n);
+        release(sb); release(sa);
     }
 
     // ---- symbols ------------------------------------------------------------------------------
@@ -572,8 +810,8 @@ struct Gen {
             for (size_t i = s.order.size(); i-- > 0;) {
                 const Var& v = s.vars[s.order[i]];
                 if (!v.owned || v.is_const) continue;
-                if (v.count >= 0) { for (int k = 0; k < v.count; k++) clear(array_cell(v.cell, k)); }
-                else { clear(v.cell); if (v.word) clear(v.cell + 1); }
+                if (v.count >= 0) { for (int b = 0; b < v.size(); b++) for (int k = 0; k < v.count; k++) clear(array_cell(plane(v, b), k)); }
+                else clearN(v.cell, v.size());
             }
             next_free = s.mark;
         }
@@ -582,104 +820,106 @@ struct Gen {
     void declare(const Var& v, Pos p) {
         Scope& s = scopes.back();
         if (s.vars.count(v.name)) fail(p, "'" + v.name + "' is already declared in this scope");
-        if (find_reg(v.name)) fail(p, "'" + v.name + "' is a register name");
         s.vars[v.name] = v;
         s.order.push_back(v.name);
     }
     ProcInfo* find_proc(const std::string& n) { auto it = procs.find(n); return it == procs.end() ? nullptr : &it->second; }
-
-    // ---- expression analysis --------------------------------------------------------------------
-    int width(const Expr& e) {
-        if (e.type && e.type->is_int()) return e.type->size;
-        switch (e.kind) {
-        case Expr::Num: return e.value > 255 ? 2 : 1;
-        case Expr::Str: fail(e.pos, "a string can only appear in an out statement");
-        case Expr::Name: {
-            if (Var* v = find_var(e.text)) { if (v->is_const) return v->cval > 255 ? 2 : 1; return v->word ? 2 : 1; }
-            return 1;
+    void add_symbol(const std::string& name, int64_t cell, const Type* t, int count, const std::string& scope) {
+        if (!mapping() || !t) return;
+        int es = std::max(t->size, 1);
+        if (count >= 0) {
+            res.symbols.push_back(Symbol{name, cell, (int)(array_cells(count) * es), 'a', count, scope, es, t->is_signed});
+            return;
         }
-        case Expr::Index: case Expr::In: return 1;
-        case Expr::Input: return 2;
-        case Expr::Call: {
-            ProcInfo* p = find_proc(e.text);
-            if (!p) fail(e.pos, "'" + e.text + "' is not a procedure");
-            if (!ret_of(p->decl)) fail(e.pos, "'" + e.text + "' returns nothing and cannot be used in an expression");
-            return ret_of(p->decl);
+        if (t->kind == TK::Struct) {
+            for (const Field& f : t->st->fields) {
+                if (f.type->kind == TK::Array) continue;
+                add_symbol(name + "." + f.name, cell + f.offset, f.type, -1, scope);
+            }
+            return;
         }
-        case Expr::Cast: return e.ts.base == "word" ? 2 : 1;
-        case Expr::Unary:
-            if (e.text == "!") return 1;
-            return width(*e.a);
-        case Expr::Binary: {
-            const std::string& o = e.text;
-            if (o == "==" || o == "!=" || o == "<" || o == "<=" || o == ">" || o == ">=" || o == "&&" || o == "||") return 1;
-            return std::max(width(*e.a), width(*e.b));
-        }
-        }
-        return 1;
+        char kind = es == 1 ? 'b' : es == 2 ? (t->is_ptr() ? 'p' : 'w') : 'l';
+        res.symbols.push_back(Symbol{name, cell, es, kind, 1, scope, es, t->is_signed});
     }
 
-    // Compile-time value of e.  With use_known, variables whose cells hold a
-    // known constant at this point count too (for code generation only).
+    // ---- constant folding with known cell values ---------------------------------------------
+    const Type* conv_type(const Type* t) const { return t->is_ptr() ? T->u16() : t; }
+    std::optional<int64_t> known_int(int64_t c, const Type* t) {
+        int64_t v = 0;
+        for (int k = 0; k < t->size; k++) {
+            if (!trackable(c + k)) return std::nullopt;
+            auto b = known_val(c + k);
+            if (!b) return std::nullopt;
+            v |= (int64_t)*b << (8 * k);
+        }
+        return wrap(v, t);
+    }
+    // Compile-time value of e in its own type.  With use_known, variables whose
+    // cells hold a known constant count too.
     std::optional<int64_t> fold(const Expr& e, bool use_known = false) {
+        const Type* t = e.type;
+        if (!t || !t->is_scalar()) return std::nullopt;
+        if (e.is_const) return wrap(e.cval, conv_type(t));
         switch (e.kind) {
-        case Expr::Num: return e.value;
         case Expr::Name: {
+            if (!use_known) return std::nullopt;
             Var* v = find_var(e.text);
-            if (!v) return std::nullopt;
-            if (v->is_const) return v->cval;
-            if (!use_known || v->count >= 0) return std::nullopt;
-            auto lo = known_val(v->cell);
-            if (!v->word) return lo;
-            auto hi = known_val(v->cell + 1);
-            if (lo && hi) return *lo | (*hi << 8);
-            return std::nullopt;
+            if (!v || v->is_const || v->count >= 0 || !v->type || !v->type->is_scalar()) return std::nullopt;
+            return known_int(v->cell, conv_type(v->type));
         }
         case Expr::Index: {
-            if (!use_known) return std::nullopt;
+            if (!use_known || e.a->kind != Expr::Name) return std::nullopt;
             Var* v = find_var(e.a->text);
-            if (!v || v->count < 0) return std::nullopt;
+            if (!v || !v->cell_array() || v->size() != 1) return std::nullopt;
             auto i = fold(*e.b, true);
             if (!i || *i < 0 || *i >= v->count) return std::nullopt;
-            return known_val(array_cell(v->cell, (int)*i));
-        }
-        case Expr::Unary: {
-            auto a = fold(*e.a, use_known);
-            if (!a) return std::nullopt;
-            int64_t mask = width(e) == 2 ? 0xFFFF : 0xFF;
-            if (e.text == "-") return (-*a) & mask;
-            if (e.text == "!") return *a == 0 ? 1 : 0;
-            if (e.text == "~") return (~*a) & mask;
-            return *a & mask;
+            auto b = known_val(array_cell(v->cell, (int)*i));
+            if (!b) return std::nullopt;
+            return wrap(*b, t);
         }
         case Expr::Cast: {
             auto a = fold(*e.a, use_known);
             if (!a) return std::nullopt;
-            return *a & (width(e) == 2 ? 0xFFFF : 0xFF);
+            return wrap(*a, conv_type(t));
+        }
+        case Expr::Unary: {
+            auto a = fold(*e.a, use_known);
+            if (!a) return std::nullopt;
+            if (e.text == "!") return *a == 0 ? 1 : 0;
+            const Type* at = conv_type(t);
+            if (e.text == "-") return wrap(-*a, at);
+            if (e.text == "~") return wrap(~*a, at);
+            return std::nullopt;
         }
         case Expr::Binary: {
+            const std::string& o = e.text;
+            if (o == "&&" || o == "||") {
+                auto a = fold(*e.a, use_known), b = fold(*e.b, use_known);
+                if (!a || !b) return std::nullopt;
+                return o == "&&" ? ((*a && *b) ? 1 : 0) : ((*a || *b) ? 1 : 0);
+            }
+            if (t->is_ptr() || (e.a->type && e.a->type->is_ptr()) || (e.b->type && e.b->type->is_ptr())) return std::nullopt;
+            const Type* ot = conv_type(e.optype ? e.optype : t);
             auto a = fold(*e.a, use_known), b = fold(*e.b, use_known);
             if (!a || !b) return std::nullopt;
-            int64_t mask = width(e) == 2 ? 0xFFFF : 0xFF;
-            const std::string& o = e.text;
-            if (o == "+") return (*a + *b) & mask;
-            if (o == "-") return (*a - *b) & mask;
-            if (o == "*") return (*a * *b) & mask;
-            if (o == "/") { if (!*b) return std::nullopt; return (*a / *b) & mask; }
-            if (o == "%") { if (!*b) return std::nullopt; return (*a % *b) & mask; }
-            if (o == "<<") return *b >= 16 ? 0 : (*a << *b) & mask;
-            if (o == ">>") return *b >= 16 ? 0 : (*a >> *b) & mask;
-            if (o == "&") return *a & *b;
-            if (o == "|") return *a | *b;
-            if (o == "^") return *a ^ *b;
-            if (o == "==") return *a == *b;
-            if (o == "!=") return *a != *b;
-            if (o == "<") return *a < *b;
-            if (o == "<=") return *a <= *b;
-            if (o == ">") return *a > *b;
-            if (o == ">=") return *a >= *b;
-            if (o == "&&") return (*a && *b) ? 1 : 0;
-            if (o == "||") return (*a || *b) ? 1 : 0;
+            int64_t x = wrap(*a, ot), y = wrap(*b, ot);
+            if (o == "==") return x == y;
+            if (o == "!=") return x != y;
+            if (o == "<") return x < y;
+            if (o == "<=") return x <= y;
+            if (o == ">") return x > y;
+            if (o == ">=") return x >= y;
+            const Type* rt = conv_type(t);
+            if (o == "+") return wrap(x + y, rt);
+            if (o == "-") return wrap(x - y, rt);
+            if (o == "*") return wrap((int64_t)((uint64_t)x * (uint64_t)y), rt);
+            if (o == "/") return y ? wrap(x / y, rt) : 0;
+            if (o == "%") return y ? wrap(x % y, rt) : wrap(x, rt);
+            if (o == "<<") return (y >= 32 || y < 0) ? 0 : wrap(x << y, rt);
+            if (o == ">>") return (y >= 32 || y < 0) ? (x < 0 ? wrap(-1, rt) : 0) : wrap(x >> y, rt);
+            if (o == "&") return wrap(x & y, rt);
+            if (o == "|") return wrap(x | y, rt);
+            if (o == "^") return wrap(x ^ y, rt);
             return std::nullopt;
         }
         default: return std::nullopt;
@@ -693,20 +933,16 @@ struct Gen {
         case Expr::Name: {
             if (Var* v = find_var(e.text)) {
                 if (v->is_const) return false;
-                int64_t n = v->count >= 0 ? array_cells(v->count) : (v->word ? 2 : 1);
+                int64_t n = v->count >= 0 ? array_total(*v) : v->size();
                 return overlap(v->cell, v->cell + n);
             }
             if (const bf::RegisterInfo* r = find_reg(e.text)) return overlap(r->addr, r->addr + 1);
             return false;
         }
-        case Expr::Index: {
-            Var* v = find_var(e.a->text);
-            if (v && v->count >= 0 && overlap(v->cell, v->cell + array_cells(v->count))) return true;
-            return touches(*e.b, lo, hi);
-        }
-        case Expr::Unary: case Expr::Cast: return touches(*e.a, lo, hi);
+        case Expr::Index: return touches(*e.a, lo, hi) || touches(*e.b, lo, hi);
+        case Expr::Field: case Expr::Deref: case Expr::AddrOf: case Expr::Unary: case Expr::Cast: return touches(*e.a, lo, hi);
         case Expr::Binary: return touches(*e.a, lo, hi) || touches(*e.b, lo, hi);
-        case Expr::Call: return true;      // a procedure body may touch anything
+        case Expr::New: case Expr::Call: return true;      // a procedure body may touch anything
         default: return false;
         }
     }
@@ -716,10 +952,178 @@ struct Gen {
         return find_reg(e.text);
     }
 
-    // Flatten a chain of + and - (and unary -) into signed terms plus one constant.
+    // ---- locations ------------------------------------------------------------------------------------
+    LV lvalue(const Expr& t) {
+        LV lv;
+        lv.type = t.type;
+        switch (t.kind) {
+        case Expr::Name: {
+            if (Var* v = find_var(t.text)) {
+                if (v->is_const) fail(t.pos, "'" + t.text + "' is a constant");
+                if (v->count >= 0) fail(t.pos, "array '" + t.text + "' needs an index");
+                lv.kind = LV::Cells; lv.cell = v->cell;
+                return lv;
+            }
+            if (const bf::RegisterInfo* r = find_reg(t.text)) { lv.kind = LV::Reg; lv.cell = r->addr; lv.reg = r; return lv; }
+            fail(t.pos, "'" + t.text + "' is not declared");
+        }
+        case Expr::Index: {
+            const Expr& base = *t.a;
+            if (base.kind == Expr::Name) {
+                Var* v = find_var(base.text);
+                if (v && v->cell_array()) {
+                    lv.kind = LV::Elem; lv.arr = v;
+                    if (auto i = fold(*t.b)) {
+                        if (*i < 0 || *i >= v->count) fail(t.b->pos, "index " + std::to_string(*i) + " is outside '" + base.text + "[" + std::to_string(v->count) + "]'");
+                        lv.cidx = *i;
+                    } else lv.index = t.b.get();
+                    return lv;
+                }
+            }
+            if (base.type && base.type->is_ptr()) {
+                lv.kind = LV::Heap; lv.esize = std::max(t.type->size, 1);
+                if (auto p = fold(base)) lv.base = *p; else lv.ptr = &base;
+                if (auto i = fold(*t.b)) lv.base += *i * lv.esize; else lv.hidx = t.b.get();
+                return lv;
+            }
+            // an array field of a struct: the element sits at a constant or (in the heap) runtime offset
+            LV b = lvalue(base);
+            int es = std::max(t.type->size, 1);
+            auto i = fold(*t.b);
+            if (b.kind == LV::Heap) {
+                if (i) b.base += *i * es;
+                else { if (b.hidx) fail(t.pos, "use a pointer for this second runtime index"); b.hidx = t.b.get(); b.esize = es; }
+            } else {
+                if (!i) fail(t.b->pos, "an array field of a struct held in cells needs a constant index");
+                if (b.kind == LV::Cells) b.cell += *i * es; else if (b.kind == LV::Elem) b.boff += (int)(*i * es);
+                else fail(t.pos, "cannot index this");
+            }
+            b.type = t.type;
+            return b;
+        }
+        case Expr::Field: {
+            LV b;
+            const Type* st;
+            if (t.arrow) {
+                b.kind = LV::Heap;
+                if (auto p = fold(*t.a)) b.base = *p; else b.ptr = t.a.get();
+                st = t.a->type->elem;
+            } else {
+                b = lvalue(*t.a);
+                st = t.a->type;
+            }
+            const Field* f = st->st->field(t.text);
+            if (!f) internal("unknown field");
+            if (b.kind == LV::Cells) b.cell += f->offset;
+            else if (b.kind == LV::Elem) b.boff += f->offset;
+            else if (b.kind == LV::Heap) b.base += f->offset;
+            else fail(t.pos, "a register has no fields");
+            b.type = t.type;
+            return b;
+        }
+        case Expr::Deref: {
+            lv.kind = LV::Heap;
+            if (auto p = fold(*t.a)) lv.base = *p; else lv.ptr = t.a.get();
+            return lv;
+        }
+        default: fail(t.pos, "this cannot be assigned to");
+        }
+    }
+    bool lv_touched(const LV& lv, const Expr& e) {
+        switch (lv.kind) {
+        case LV::Cells: case LV::Reg: return touches(e, lv.cell, lv.cell + lv.size());
+        case LV::Elem: return touches(e, lv.arr->cell, lv.arr->cell + array_total(*lv.arr));
+        case LV::Heap: return true;
+        }
+        return true;
+    }
+    int64_t elem_cell(const LV& lv, int k) const { return array_cell(plane(*lv.arr, lv.boff + k), (int)lv.cidx); }
+    // Heap address of a location into dst (2 cells, known zero).
+    void eval_address(const LV& lv, int64_t dst) {
+        if (lv.ptr) eval_into(*lv.ptr, dst, T->u16());
+        if (lv.hidx) {
+            int64_t t = tmp2();
+            eval_into(*lv.hidx, t, T->u16());
+            if (lv.esize == 1) addN(dst, t, 2);
+            else { int64_t m = tmp2(); mul_constN(t, lv.esize, m, 2); addN(dst, m, 2); release2(m); }
+            release2(t);
+        }
+        if (lv.base) addN_const(dst, 2, lv.base);
+    }
+    // dst (n cells, known zero) = the value at lv
+    void read_lv(const LV& lv, int64_t dst) {
+        int n = lv.size();
+        switch (lv.kind) {
+        case LV::Cells: for (int k = 0; k < n; k++) copy(lv.cell + k, dst + k); return;
+        case LV::Reg:
+            if (lv.reg->kind == bf::REG_TRIGGER) internal("read of a write-only register");
+            if (lv.reg->kind == bf::REG_LATCH) copy(lv.reg->addr, dst); else test_reg(lv.reg->addr, dst);
+            return;
+        case LV::Elem: {
+            const Var& v = *lv.arr;
+            if (!lv.index) { for (int k = 0; k < n; k++) copy(elem_cell(lv, k), dst + k); return; }
+            int64_t i = tmp();
+            eval8(*lv.index, i);
+            if (n == 1) { array_read(plane(v, lv.boff), i, dst); drop(i); return; }
+            for (int k = 0; k < n; k++) { int64_t c = tmp(); copy(i, c); array_read(plane(v, lv.boff + k), c, dst + k); drop(c); }
+            release(i);
+            return;
+        }
+        case LV::Heap: {
+            if (lv.const_addr()) { for (int k = 0; k < n; k++) copy(heap_cell(lv.base + k, HD), dst + k); return; }
+            int64_t a = tmp2();
+            eval_address(lv, a);
+            for (int k = 0; k < n; k++) {
+                int64_t c = tmp2();
+                copyN(a, c, 2);
+                addN_const(c, 2, k);
+                heap_walk(c, -1, dst + k, false);
+                drop(c, 2);
+            }
+            release2(a);
+            return;
+        }
+        }
+    }
+    // the value in src (n cells, consumed) is stored at lv
+    void write_lv(const LV& lv, int64_t val) {
+        int n = lv.size();
+        switch (lv.kind) {
+        case LV::Cells: for (int k = 0; k < n; k++) { clear(lv.cell + k); move(val + k, {{lv.cell + k, 1}}); } return;
+        case LV::Reg: clear(lv.cell); move(val, {{lv.cell, 1}}); return;
+        case LV::Elem: {
+            const Var& v = *lv.arr;
+            if (!lv.index) { for (int k = 0; k < n; k++) { int64_t c = elem_cell(lv, k); clear(c); move(val + k, {{c, 1}}); } return; }
+            int64_t i = tmp();
+            eval8(*lv.index, i);
+            if (n == 1) { array_write(plane(v, lv.boff), i, val); drop(i); return; }
+            for (int k = 0; k < n; k++) { int64_t c = tmp(); copy(i, c); array_write(plane(v, lv.boff + k), c, val + k); drop(c); }
+            release(i);
+            return;
+        }
+        case LV::Heap: {
+            if (lv.const_addr()) { for (int k = 0; k < n; k++) { int64_t c = heap_cell(lv.base + k, HD); clear(c); move(val + k, {{c, 1}}); } return; }
+            int64_t a = tmp2();
+            eval_address(lv, a);
+            for (int k = 0; k < n; k++) {
+                int64_t c = tmp2();
+                copyN(a, c, 2);
+                addN_const(c, 2, k);
+                heap_walk(c, val + k, -1, true);
+                drop(c, 2);
+            }
+            release2(a);
+            return;
+        }
+        }
+    }
+
+    // ---- expressions: byte path -------------------------------------------------------------------
+    // Flatten a chain of + and - (and unary -) on integers into signed terms plus one constant.
     void collect_terms(const Expr& e, int sign, std::vector<std::pair<const Expr*, int>>& terms, int64_t& constant) {
         if (auto v = fold(e, true)) { constant += sign * *v; return; }
-        if (e.kind == Expr::Binary && (e.text == "+" || e.text == "-")) {
+        if (e.kind == Expr::Binary && (e.text == "+" || e.text == "-") && e.type && e.type->is_int()
+            && e.a->type && e.a->type->is_int() && e.b->type && e.b->type->is_int()) {
             collect_terms(*e.a, sign, terms, constant);
             collect_terms(*e.b, e.text == "+" ? sign : -sign, terms, constant);
             return;
@@ -727,14 +1131,14 @@ struct Gen {
         if (e.kind == Expr::Unary && e.text == "-") { collect_terms(*e.a, -sign, terms, constant); return; }
         terms.emplace_back(&e, sign);
     }
+    static bool is_cmp(const std::string& o) { return o == "==" || o == "!=" || o == "<" || o == "<=" || o == ">" || o == ">="; }
+    static int sz(const Expr& e) { return e.type ? std::max(e.type->size, 1) : 1; }
 
-    // ---- expressions: 8-bit --------------------------------------------------------------------------
-    // dst += sign * e  (mod 256)
+    // dst += sign * (low byte of e)
     void eval8(const Expr& e, int64_t dst, int sign = 1) {
         if (auto v = fold(e, true)) { add(dst, sign * (*v & 255)); return; }
         switch (e.kind) {
-        case Expr::Num: return;        // folded
-        case Expr::Str: fail(e.pos, "a string can only appear in an out statement");
+        case Expr::Num: case Expr::Null: case Expr::Sizeof: case Expr::Str: return;    // folded
         case Expr::Name: {
             if (Var* v = find_var(e.text)) {
                 if (v->count >= 0) fail(e.pos, "array '" + e.text + "' needs an index");
@@ -751,21 +1155,25 @@ struct Gen {
             fail(e.pos, "'" + e.text + "' is not declared");
         }
         case Expr::Index: {
-            const std::string& an = e.a->text;
-            Var* v = find_var(an);
-            if (!v) fail(e.pos, "'" + an + "' is not declared");
-            if (v->count < 0) fail(e.pos, "'" + an + "' is not an array");
-            if (auto i = fold(*e.b)) {
-                if (*i < 0 || *i >= v->count) fail(e.b->pos, "index " + std::to_string(*i) + " is outside '" + an + "[" + std::to_string(v->count) + "]'");
-                copy(array_cell(v->cell, (int)*i), dst, sign);
-                return;
+            // byte arrays in cells: the direct path
+            if (e.a->kind == Expr::Name) {
+                Var* v = find_var(e.a->text);
+                if (v && v->cell_array() && v->size() == 1) {
+                    const std::string& an = e.a->text;
+                    if (auto i = fold(*e.b)) {
+                        if (*i < 0 || *i >= v->count) fail(e.b->pos, "index " + std::to_string(*i) + " is outside '" + an + "[" + std::to_string(v->count) + "]'");
+                        copy(array_cell(v->cell, (int)*i), dst, sign);
+                        return;
+                    }
+                    int64_t i = tmp();
+                    eval8(*e.b, i);
+                    if (sign == 1) array_read(v->cell, i, dst);
+                    else { int64_t t = tmp(); array_read(v->cell, i, t); move(t, {{dst, sign}}); release(t); }
+                    drop(i);
+                    return;
+                }
             }
-            int64_t i = tmp();
-            eval8(*e.b, i);
-            if (sign == 1) array_read(v->cell, i, dst);
-            else { int64_t t = tmp(); array_read(v->cell, i, t); move(t, {{dst, sign}}); release(t); }
-            drop(i);
-            return;
+            break;
         }
         case Expr::In: {
             if (sign == 1 && known_is(dst, 0)) { go(dst); out += ','; forget(dst); return; }
@@ -775,20 +1183,14 @@ struct Gen {
             release(t);
             return;
         }
-        case Expr::Input: {
-            int64_t t = tmp2();
-            eval16_fresh(e, t);
-            move(t, {{dst, sign}});
-            release2(t);
-            return;
-        }
         case Expr::Call: {
-            int w = width(e);
-            if (w == 2) { int64_t t = tmp2(); eval16_fresh(e, t); move(t, {{dst, sign}}); release2(t); return; }
-            std::vector<const Expr*> args; for (auto& a : e.args) args.push_back(a.get());
-            if (sign == 1) { call_user(e.text, args, e.pos, dst); return; }
-            int64_t t = tmp(); call_user(e.text, args, e.pos, t); move(t, {{dst, sign}}); release(t);
-            return;
+            if (sz(e) == 1) {
+                std::vector<const Expr*> args; for (auto& a : e.args) args.push_back(a.get());
+                if (sign == 1) { call_user(e.text, args, e.pos, dst); return; }
+                int64_t t = tmp(); call_user(e.text, args, e.pos, t); move(t, {{dst, sign}}); release(t);
+                return;
+            }
+            break;
         }
         case Expr::Unary: {
             if (e.text == "-") { eval8(*e.a, dst, -sign); return; }
@@ -800,73 +1202,105 @@ struct Gen {
                 release(t);
                 return;
             }
-            eval8(*e.a, dst, sign);
+            break;
+        }
+        case Expr::Cast:
+            eval8(*e.a, dst, sign);     // the low byte survives any cast
             return;
-        }
-        case Expr::Cast: {
-            if (e.ts.base == "word") { int64_t t = tmp2(); eval16_fresh(*e.a, t); move(t, {{dst, sign}}); release2(t); return; }
-            eval8(*e.a, dst, sign);     // byte()
-            return;
-        }
-        case Expr::Binary: break;
-        default: fail(e.pos, "not supported here");
-        }
-        const std::string& o = e.text;
-        const Expr& a = *e.a; const Expr& b = *e.b;
-        bool cmp = o == "==" || o == "!=" || o == "<" || o == "<=" || o == ">" || o == ">=";
-        if (width(e) == 2 && (o == "/" || o == "%" || o == ">>")) {
-            int64_t t = tmp2(); eval16_fresh(e, t); move(t, {{dst, sign}}); release2(t);
-            return;
-        }
-        if (cmp && std::max(width(a), width(b)) == 2) { cmp16(o, a, b, dst, sign); return; }
-        if (o == "+" || o == "-") {
-            std::vector<std::pair<const Expr*, int>> terms; int64_t constant = 0;
-            collect_terms(e, sign, terms, constant);
-            for (auto& t : terms) eval8(*t.first, dst, t.second);
-            add(dst, constant);
-            return;
-        }
-        if (o == "*") {
-            const Expr* var = &a; std::optional<int64_t> k = fold(b, true);
-            if (!k) { k = fold(a, true); if (k) var = &b; }
-            if (k) {
-                int64_t t = tmp(); eval8(*var, t);
-                open(t); add(t, -1); add(dst, sign * (*k & 255)); close();
-                release(t);
+        case Expr::Binary: {
+            const std::string& o = e.text;
+            const Expr& a = *e.a; const Expr& b = *e.b;
+            const Type* ot = e.optype ? e.optype : e.type;
+            if (is_cmp(o)) {
+                if (ot->size == 1 && !ot->is_signed) { cmp8(o, a, b, dst, sign); return; }
+                cmp_generic(o, a, b, ot, dst, sign);
                 return;
             }
-            int64_t t1 = tmp(); eval8(a, t1);
-            int64_t t2 = tmp(); eval8(b, t2);
-            open(t1); add(t1, -1); copy(t2, dst, sign); close();
-            release(t2); release(t1);
-            return;
-        }
-        if (o == "/" || o == "%") {
-            int64_t t1 = tmp(); eval8(a, t1);
-            int64_t t2 = tmp(); eval8(b, t2);
-            int64_t q = tmp(), r = tmp();
-            divmod8(t1, t2, q, r);
-            move(o == "/" ? q : r, {{dst, sign}});
-            release(r); release(q); release(t2); release(t1);
-            return;
-        }
-        if (o == "<<" || o == ">>") {
-            bool left = o == "<<";
-            if (auto k = fold(b, true)) {
+            if (o == "&&" || o == "||") { logic8(o, a, b, dst, sign); return; }
+            if (e.type->is_ptr() || (a.type && a.type->is_ptr())) break;
+            bool narrow = e.type->size == 1;
+            if (o == "+" || o == "-") {
+                std::vector<std::pair<const Expr*, int>> terms; int64_t constant = 0;
+                collect_terms(e, sign, terms, constant);
+                for (auto& t : terms) eval8(*t.first, dst, t.second);
+                add(dst, constant);
+                return;
+            }
+            if (o == "*") {
+                const Expr* var = &a; std::optional<int64_t> k = fold(b, true);
+                if (!k) { k = fold(a, true); if (k) var = &b; }
+                if (k) {
+                    int64_t t = tmp(); eval8(*var, t);
+                    open(t); add(t, -1); add(dst, sign * (*k & 255)); close();
+                    release(t);
+                    return;
+                }
+                int64_t t1 = tmp(); eval8(a, t1);
+                int64_t t2 = tmp(); eval8(b, t2);
+                open(t1); add(t1, -1); copy(t2, dst, sign); close();
+                release(t2); release(t1);
+                return;
+            }
+            if ((o == "/" || o == "%") && narrow && !e.type->is_signed) {
+                int64_t t1 = tmp(); eval8(a, t1);
+                int64_t t2 = tmp(); eval8(b, t2);
+                int64_t q = tmp(), r = tmp();
+                divmod8(t1, t2, q, r);
+                move(o == "/" ? q : r, {{dst, sign}});
+                release(r); release(q); release(t2); release(t1);
+                return;
+            }
+            if (o == "<<") {
+                if (auto k = fold(b, true)) {
+                    int64_t t = tmp(); eval8(a, t);
+                    if (*k >= 8) clear(t); else for (int64_t i = 0; i < *k; i++) double8(t);
+                    move(t, {{dst, sign}});
+                    release(t);
+                    return;
+                }
+                int64_t n = tmp(); eval8(b, n);
                 int64_t t = tmp(); eval8(a, t);
-                if (*k >= 8) clear(t); else for (int64_t i = 0; i < *k; i++) { if (left) double8(t); else halve8(t); }
+                open(n); add(n, -1); double8(t); close();
                 move(t, {{dst, sign}});
-                release(t);
+                release(t); release(n);
                 return;
             }
-            int64_t n = tmp(); eval8(b, n);
-            int64_t t = tmp(); eval8(a, t);
-            open(n); add(n, -1); if (left) double8(t); else halve8(t); close();
-            move(t, {{dst, sign}});
-            release(t); release(n);
-            return;
+            if (o == ">>" && narrow && !e.type->is_signed) {
+                if (auto k = fold(b, true)) {
+                    int64_t t = tmp(); eval8(a, t);
+                    if (*k >= 8) clear(t); else for (int64_t i = 0; i < *k; i++) halve8(t);
+                    move(t, {{dst, sign}});
+                    release(t);
+                    return;
+                }
+                int64_t n = tmp(); eval8(b, n);
+                int64_t t = tmp(); eval8(a, t);
+                open(n); add(n, -1); halve8(t); close();
+                move(t, {{dst, sign}});
+                release(t); release(n);
+                return;
+            }
+            if (o == "&" || o == "|" || o == "^") {
+                int64_t ta = tmp(); eval8(a, ta);
+                int64_t tb = tmp(); eval8(b, tb);
+                bitwise_core(o[0], ta, tb, dst, sign);
+                release(tb); release(ta);
+                return;
+            }
+            break;
         }
-        if (cmp) { cmp8(o, a, b, dst, sign); return; }
+        default: break;
+        }
+        // general case: the full value, then its low byte
+        int n = sz(e);
+        int64_t t = tmpN(n);
+        eval_same(e, t);
+        move(t, {{dst, sign}});
+        if (n > 1) clearN(t + 1, n - 1);
+        releaseN(t, n);
+    }
+
+    void logic8(const std::string& o, const Expr& a, const Expr& b, int64_t dst, int sign) {
         if (o == "&&") {
             int64_t t = tmp(); eval_cond(a, t);
             if_nonzero(t, [&] {
@@ -877,26 +1311,15 @@ struct Gen {
             release(t);
             return;
         }
-        if (o == "||") {
-            int64_t t = tmp(); eval_cond(a, t);
-            int64_t f = tmp(); set(f, 1);
-            if_nonzero(t, [&] { add(dst, sign); clear(f); });
-            if_nonzero(f, [&] {
-                int64_t t2 = tmp(); eval_cond(b, t2);
-                if_nonzero(t2, [&] { add(dst, sign); });
-                release(t2);
-            });
-            release(f); release(t);
-            return;
-        }
-        if (o == "&" || o == "|" || o == "^") {
-            int64_t ta = tmp(); eval8(a, ta);
-            int64_t tb = tmp(); eval8(b, tb);
-            bitwise_core(o[0], ta, tb, dst, sign);
-            release(tb); release(ta);
-            return;
-        }
-        fail(e.pos, "unsupported operator '" + o + "'");
+        int64_t t = tmp(); eval_cond(a, t);
+        int64_t f = tmp(); set(f, 1);
+        if_nonzero(t, [&] { add(dst, sign); clear(f); });
+        if_nonzero(f, [&] {
+            int64_t t2 = tmp(); eval_cond(b, t2);
+            if_nonzero(t2, [&] { add(dst, sign); });
+            release(t2);
+        });
+        release(f); release(t);
     }
 
     void cmp8(const std::string& o, const Expr& a, const Expr& b, int64_t dst, int sign) {
@@ -914,21 +1337,25 @@ struct Gen {
         else { int64_t r = tmp(); lt8_core(t1, t2, r, 1); not8(r, dst, sign); release(r); }
         release(t2); release(t1);
     }
-    void cmp16(const std::string& o, const Expr& a, const Expr& b, int64_t dst, int sign) {
-        int64_t ta = tmp2(); eval16_fresh(a, ta);
-        int64_t tb = tmp2(); eval16_fresh(b, tb);
-        if (o == "==") eq16_cells(ta, tb, dst, sign);
-        else if (o == "!=") { int64_t t = tmp(); eq16_cells(ta, tb, t, 1); not8(t, dst, sign); release(t); }
+    // comparison at type ot (any width, signed or not)
+    void cmp_generic(const std::string& o, const Expr& a, const Expr& b, const Type* ot, int64_t dst, int sign) {
+        int n = std::max(ot->size, 1);
+        const Type* ct = conv_type(ot);
+        int64_t ta = tmpN(n); eval_into(a, ta, ct);
+        int64_t tb = tmpN(n); eval_into(b, tb, ct);
+        if (o == "==") eqN_cells(ta, tb, n, dst, sign);
+        else if (o == "!=") { int64_t t = tmp(); eqN_cells(ta, tb, n, t, 1); not8(t, dst, sign); release(t); }
         else {
             bool swap = o == ">" || o == "<=", neg = o == "<=" || o == ">=";
             int64_t x = swap ? tb : ta, y = swap ? ta : tb;
-            if (!neg) lt16_cells(x, y, dst, sign);
-            else { int64_t r = tmp(); lt16_cells(x, y, r, 1); not8(r, dst, sign); release(r); }
+            auto lt = [&](int64_t d, int s) { if (ct->is_signed) sltN_cells(x, y, n, d, s); else ltN_cells(x, y, n, d, s); };
+            if (!neg) lt(dst, sign);
+            else { int64_t r = tmp(); lt(r, 1); not8(r, dst, sign); release(r); }
         }
-        release2(tb); release2(ta);
+        releaseN(tb, n); releaseN(ta, n);
     }
 
-    // c += (e != 0) as 0/1 for word-width e; for byte-width e the value itself (non-zero = true).
+    // c += (e != 0) as 0/1 for wide e; for byte e the value itself (non-zero = true).
     // Registers are tested without being written.
     void eval_cond(const Expr& e, int64_t c) {
         if (auto v = fold(e, true)) { add(c, *v ? 1 : 0); return; }
@@ -937,110 +1364,182 @@ struct Gen {
             test_reg(r->addr, c);
             return;
         }
-        if (width(e) == 2) {
-            int64_t t = tmp2(); eval16_fresh(e, t);
-            nonzero16(t, c);
-            release2(t);
+        int n = sz(e);
+        if (n > 1) {
+            int64_t t = tmpN(n); eval_same(e, t);
+            nonzeroN(t, c, n);
+            releaseN(t, n);
             return;
         }
         eval8(e, c);
     }
 
-    // ---- expressions: 16-bit ------------------------------------------------------------------------------
-    void eval16(const Expr& e, int64_t dst) {          // dst += e (mod 65536)
-        if (known0_16(dst)) { eval16_fresh(e, dst); return; }
-        int64_t t = tmp2(); eval16_fresh(e, t); add16(dst, t); release2(t);
+    // ---- expressions: any width -------------------------------------------------------------------
+    // dst (size(t) cells, known zero) = e converted to type t
+    void eval_into(const Expr& e, int64_t dst, const Type* t) {
+        int n = std::max(t->size, 1);
+        if (t->kind == TK::Struct) { eval_same(e, dst); return; }
+        if (n == 1) { eval8(e, dst); return; }
+        if (auto v = fold(e, true)) { for (int k = 0; k < n; k++) add(dst + k, (*v >> (8 * k)) & 255); return; }
+        int m = sz(e);
+        if (m == n) { eval_same(e, dst); return; }
+        if (m < n) {
+            if (m == 1) eval8(e, dst); else eval_same(e, dst);
+            if (e.type->is_signed) {
+                int64_t f = tmp();
+                sign_flag(dst + m - 1, f);
+                if_nonzero(f, [&] { for (int k = m; k < n; k++) add(dst + k, 255); });
+                release(f);
+            }
+            return;
+        }
+        // narrowing: the low bytes
+        int64_t w = tmpN(m);
+        eval_same(e, w);
+        moveN(w, dst, n);
+        clearN(w + n, m - n);
+        releaseN(w, m);
     }
-    // dst (known zero pair) = e
-    void eval16_fresh(const Expr& e, int64_t dst) {
-        if (auto v = fold(e, true)) { add(dst, *v & 255); add(dst + 1, (*v >> 8) & 255); return; }
+
+    // dst (size(e.type) cells, known zero) = e
+    void eval_same(const Expr& e, int64_t dst) {
+        int n = sz(e);
+        if (auto v = fold(e, true)) { for (int k = 0; k < n; k++) add(dst + k, (*v >> (8 * k)) & 255); return; }
         switch (e.kind) {
-        case Expr::Num: return;
-        case Expr::Str: fail(e.pos, "a string can only appear in an out statement");
         case Expr::Name: {
             if (Var* v = find_var(e.text)) {
                 if (v->count >= 0) fail(e.pos, "array '" + e.text + "' needs an index");
-                copy(v->cell, dst);
-                if (v->word) copy(v->cell + 1, dst + 1);
+                for (int k = 0; k < n; k++) copy(v->cell + k, dst + k);
                 return;
             }
-            eval8(e, dst);
-            return;
+            if (n == 1) { eval8(e, dst); return; }      // a register
+            fail(e.pos, "'" + e.text + "' is not declared");
         }
-        case Expr::Index: case Expr::In: eval8(e, dst); return;
+        case Expr::Index: case Expr::Field: case Expr::Deref:
+            read_lv(lvalue(e), dst);
+            return;
+        case Expr::AddrOf:
+            eval_address(lvalue(*e.a), dst);
+            return;
+        case Expr::In: eval8(e, dst); return;
         case Expr::Input: {
-            Var w; w.name = "w"; w.cell = dst; w.word = true; w.owned = false;
+            Var w; w.name = "w"; w.cell = dst; w.type = T->u16(); w.owned = false;
             call_proc("__read_word", {w}, e.pos, -1);
             return;
         }
         case Expr::Call: {
             std::vector<const Expr*> args; for (auto& a : e.args) args.push_back(a.get());
-            call_user(e.text, args, e.pos, dst);      // byte results land in the low cell
+            call_user(e.text, args, e.pos, dst);
             return;
         }
-        case Expr::Cast:
-            if (e.ts.base == "byte") { eval8(*e.a, dst); return; }
-            eval16_fresh(*e.a, dst);
+        case Expr::New: {
+            // alloc(count * sizeof(T)) as a T*
+            int es = std::max(e.type->elem->size, 1);
+            int64_t bytes = tmp2();
+            if (e.b) {
+                int64_t c = tmp2(); eval_into(*e.b, c, T->u16());
+                if (es == 1) addN(bytes, c, 2); else mul_constN(c, es, bytes, 2);
+                release2(c);
+            } else addN_const(bytes, 2, es);
+            Var v; v.name = "n"; v.cell = bytes; v.type = T->u16(); v.owned = false;
+            call_proc_values("alloc", {v}, e.pos, dst);
+            release2(bytes);
             return;
+        }
+        case Expr::Cast: eval_into(*e.a, dst, e.type); return;
         case Expr::Unary: {
             if (e.text == "!") { int64_t t = tmp(); eval_cond(*e.a, t); not8(t, dst, 1); release(t); return; }
-            int64_t t = tmp2(); eval16_fresh(*e.a, t); sub16(dst, t); release2(t);
-            if (e.text == "~") add16_const(dst, 0xFFFF);
+            eval_into(*e.a, dst, e.type);
+            if (e.text == "-") negN(dst, n); else notN(dst, n);
             return;
         }
-        case Expr::Binary: break;
+        case Expr::Binary:
+            if (is_cmp(e.text) || e.text == "&&" || e.text == "||") { eval8(e, dst); return; }
+            binary_wide(e, dst);
+            return;
+        default: fail(e.pos, "cannot evaluate this expression here");
         }
-        if (width(e) == 1) { eval8(e, dst); return; }
+    }
+
+    // arithmetic at any width (also 1 byte for the signed operations eval8 leaves out)
+    void binary_wide(const Expr& e, int64_t dst) {
         const std::string& o = e.text;
         const Expr& a = *e.a; const Expr& b = *e.b;
+        int n = sz(e);
+        const Type* t = conv_type(e.type);
+        if (e.type->is_ptr()) {          // pointer +/- integer: scaled
+            const Expr& p = a.type->is_ptr() ? a : b;
+            const Expr& i = a.type->is_ptr() ? b : a;
+            int es = std::max(e.type->elem->size, 1);
+            eval_into(p, dst, T->u16());
+            int64_t ti = tmp2(); eval_into(i, ti, T->u16());
+            int64_t m = ti;
+            if (es != 1) { m = tmp2(); mul_constN(ti, es, m, 2); }
+            if (o == "+") addN(dst, m, 2); else subN(dst, m, 2);
+            if (es != 1) release2(m);
+            release2(ti);
+            return;
+        }
+        if (o == "-" && a.type->is_ptr() && b.type->is_ptr()) {     // pointer difference in elements
+            int es = std::max(a.type->elem->size, 1);
+            int64_t x = tmp2(); eval_into(a, x, T->u16());
+            int64_t y = tmp2(); eval_into(b, y, T->u16());
+            subN(x, y, 2);
+            if (es == 1) moveN(x, dst, 2);
+            else { int64_t d = tmp2(); setN(d, 2, es); int64_t r = tmp2(); sdivmodN(x, d, dst, r, 2); release2(r); release2(d); }
+            release2(y); release2(x);
+            return;
+        }
         if (o == "+" || o == "-") {
             std::vector<std::pair<const Expr*, int>> terms; int64_t constant = 0;
             collect_terms(e, 1, terms, constant);
-            for (auto& t : terms) {
-                if (t.second > 0) eval16(*t.first, dst);
-                else { int64_t tt = tmp2(); eval16_fresh(*t.first, tt); sub16(dst, tt); release2(tt); }
+            for (auto& tm : terms) {
+                if (known0N(dst, n) && tm.second > 0) { eval_into(*tm.first, dst, t); continue; }
+                int64_t x = tmpN(n); eval_into(*tm.first, x, t);
+                if (tm.second > 0) addN(dst, x, n); else subN(dst, x, n);
+                releaseN(x, n);
             }
-            add16_const(dst, constant);
+            addN_const(dst, n, constant);
             return;
         }
         if (o == "*") {
             const Expr* var = &a; std::optional<int64_t> k = fold(b, true);
             if (!k) { k = fold(a, true); if (k) var = &b; }
-            if (k && *k < 256) { int64_t t = tmp2(); eval16_fresh(*var, t); mul16_const(t, *k, dst); release2(t); return; }
-            int64_t ta = tmp2(); eval16_fresh(a, ta);
-            int64_t tb = tmp2(); eval16_fresh(b, tb);
-            mul16(ta, tb, dst);
-            release2(tb); release2(ta);
+            if (k) { int64_t x = tmpN(n); eval_into(*var, x, t); mul_constN(x, *k, dst, n); releaseN(x, n); return; }
+            int64_t x = tmpN(n); eval_into(a, x, t);
+            int64_t y = tmpN(n); eval_into(b, y, t);
+            mulN(x, y, dst, n);
+            releaseN(y, n); releaseN(x, n);
             return;
         }
         if (o == "/" || o == "%") {
-            int64_t ta = tmp2(); eval16_fresh(a, ta);
-            int64_t tb = tmp2(); eval16_fresh(b, tb);
-            int64_t q = tmp2(), r = tmp2();
-            divmod16(ta, tb, q, r);
-            move16(o == "/" ? q : r, dst);
-            release2(r); release2(q); release2(tb); release2(ta);
+            int64_t x = tmpN(n); eval_into(a, x, t);
+            int64_t y = tmpN(n); eval_into(b, y, t);
+            int64_t q = tmpN(n), r = tmpN(n);
+            if (t->is_signed) sdivmodN(x, y, q, r, n); else divmodN(x, y, q, r, n);
+            moveN(o == "/" ? q : r, dst, n);
+            releaseN(r, n); releaseN(q, n); releaseN(y, n); releaseN(x, n);
             return;
         }
         if (o == "<<" || o == ">>") {
             bool left = o == "<<";
             if (auto k = fold(b, true)) {
-                eval16_fresh(a, dst);
-                if (*k >= 16) clear16(dst); else for (int64_t i = 0; i < *k; i++) { if (left) shl16(dst); else shr16(dst); }
+                eval_into(a, dst, t);
+                if (*k >= 8 * n) { if (left || !t->is_signed) clearN(dst, n); else for (int i = 0; i < 8 * n; i++) shrN(dst, n, true); }
+                else for (int64_t i = 0; i < *k; i++) { if (left) shlN(dst, n); else shrN(dst, n, t->is_signed); }
                 return;
             }
-            int64_t n = tmp(); eval8(b, n);
-            eval16_fresh(a, dst);
-            open(n); add(n, -1); if (left) shl16(dst); else shr16(dst); close();
-            release(n);
+            int64_t c = tmp(); eval8(b, c);
+            eval_into(a, dst, t);
+            open(c); add(c, -1); if (left) shlN(dst, n); else shrN(dst, n, t->is_signed); close();
+            release(c);
             return;
         }
         if (o == "&" || o == "|" || o == "^") {
-            int64_t ta = tmp2(); eval16_fresh(a, ta);
-            int64_t tb = tmp2(); eval16_fresh(b, tb);
-            bitwise_core(o[0], ta, tb, dst, 1);
-            bitwise_core(o[0], ta + 1, tb + 1, dst + 1, 1);
-            release2(tb); release2(ta);
+            int64_t x = tmpN(n); eval_into(a, x, t);
+            int64_t y = tmpN(n); eval_into(b, y, t);
+            for (int k = 0; k < n; k++) bitwise_core(o[0], x + k, y + k, dst + k, 1);
+            releaseN(y, n); releaseN(x, n);
             return;
         }
         fail(e.pos, "unsupported operator '" + o + "'");
@@ -1053,7 +1552,7 @@ struct Gen {
         int line = s.pos.line;
         size_t a = (size_t)s.pos.off, b = a;
         while (b < src.size() && src[b] != '\n' && b < (size_t)s.end.off) b++;
-        std::string text = src.substr(a, b - a);
+        std::string text = a < src.size() ? src.substr(a, b - a) : std::string();
         for (char& c : text) if (strchr("+-<>.,[]", c)) c = '_';
         while (!text.empty() && isspace((unsigned char)text.back())) text.pop_back();
         out += '\n';
@@ -1106,39 +1605,6 @@ struct Gen {
     }
     void gen_scope(const std::vector<StmtP>& v) { push_scope(); gen_stmts(v); pop_scope(); }
 
-    struct LValue { enum Kind { Byte, Word, Elem, ElemRT, Reg } kind; int64_t cell = 0; Var* arr = nullptr; const bf::RegisterInfo* reg = nullptr; };
-    LValue lvalue(const Expr& t) {
-        LValue lv{};
-        if (t.kind == Expr::Index) {
-            const std::string& an = t.a->text;
-            Var* v = find_var(an);
-            if (!v) fail(t.pos, "'" + an + "' is not declared");
-            if (v->count < 0) fail(t.pos, "'" + an + "' is not an array");
-            lv.arr = v;
-            if (auto i = fold(*t.b)) {
-                if (*i < 0 || *i >= v->count) fail(t.b->pos, "index " + std::to_string(*i) + " is outside '" + an + "[" + std::to_string(v->count) + "]'");
-                lv.kind = LValue::Elem; lv.cell = array_cell(v->cell, (int)*i);
-            } else lv.kind = LValue::ElemRT;
-            return lv;
-        }
-        if (Var* v = find_var(t.text)) {
-            if (v->is_const) fail(t.pos, "'" + t.text + "' is a constant");
-            if (v->count >= 0) fail(t.pos, "array '" + t.text + "' needs an index");
-            lv.kind = v->word ? LValue::Word : LValue::Byte; lv.cell = v->cell;
-            return lv;
-        }
-        if (const bf::RegisterInfo* r = find_reg(t.text)) { lv.kind = LValue::Reg; lv.cell = r->addr; lv.reg = r; return lv; }
-        fail(t.pos, "'" + t.text + "' is not declared");
-    }
-    bool lv_touched(const LValue& lv, const Expr& e) {
-        switch (lv.kind) {
-        case LValue::Byte: case LValue::Elem: case LValue::Reg: return touches(e, lv.cell, lv.cell + 1);
-        case LValue::Word: return touches(e, lv.cell, lv.cell + 2);
-        case LValue::ElemRT: return touches(e, lv.arr->cell, lv.arr->cell + array_cells(lv.arr->count));
-        }
-        return true;
-    }
-
     static void copy_info(Expr& c, const Expr& e) {
         c.kind = e.kind; c.pos = e.pos; c.value = e.value; c.text = e.text; c.arrow = e.arrow; c.ts = e.ts;
         c.type = e.type; c.optype = e.optype; c.is_const = e.is_const; c.cval = e.cval;
@@ -1151,117 +1617,144 @@ struct Gen {
         for (auto& x : e.args) c->args.push_back(clone(*x));
         return c;
     }
+    // A typed binary expression built by the compiler (compound assignment).
+    ExprP make_binary(const std::string& op, ExprP a, ExprP b, Pos p) {
+        auto e = std::make_unique<Expr>();
+        e->kind = Expr::Binary; e->pos = p; e->text = op;
+        const Type* ta = a->type;
+        e->type = ta;
+        e->optype = ta->is_ptr() ? T->u16() : ta;
+        e->a = std::move(a); e->b = std::move(b);
+        return e;
+    }
 
     void gen_assign(const Stmt& s) {
-        LValue lv = lvalue(*s.target);
+        LV lv = lvalue(*s.target);
         const Expr& e = *s.e;
         std::string op = s.op;
-        if ((op != "=" && op != "+=" && op != "-=") || (lv.kind == LValue::ElemRT && op != "=")) {
+        int n = lv.size();
+        bool simple_target = lv.kind == LV::Cells || lv.kind == LV::Reg || (lv.kind == LV::Elem && !lv.index && n == 1);
+        if (lv.kind == LV::Elem && lv.index && n == 1 && lv.type->kind != TK::Struct && op != "=") simple_target = false;
+        if ((op != "=" && op != "+=" && op != "-=") || (op != "=" && !simple_target)) {
             // x op= e  ->  x = x op e
-            auto bin = std::make_unique<Expr>();
-            bin->kind = Expr::Binary; bin->pos = e.pos; bin->text = op.substr(0, op.size() - 1);
-            bin->a = clone(*s.target); bin->b = clone(e);
-            Stmt t; t.kind = Stmt::Assign; t.op = "="; t.pos = s.pos; t.end = s.end; t.target = clone(*s.target); t.e = std::move(bin);
+            Stmt t; t.kind = Stmt::Assign; t.op = "="; t.pos = s.pos; t.end = s.end; t.target = clone(*s.target);
+            t.e = make_binary(op.substr(0, op.size() - 1), clone(*s.target), clone(e), e.pos);
             gen_assign(t);
             return;
         }
-        auto k = fold(e);
-        switch (lv.kind) {
-        case LValue::Byte: case LValue::Elem: {
-            if (op == "=") {
-                if (e.kind == Expr::In) { go(lv.cell); out += ','; forget(lv.cell); return; }   // ',' straight into the cell: unchanged at end of input
-                if (k && *k > 255) fail(e.pos, "value " + std::to_string(*k) + " does not fit a byte");
-                if (!k) k = fold(e, true);
-                if (k) { set(lv.cell, *k); return; }
-                if (!lv_touched(lv, e)) { clear(lv.cell); eval8(e, lv.cell); return; }
-                int64_t t = tmp(); eval8(e, t); clear(lv.cell); move(t, {{lv.cell, 1}}); release(t);
-                return;
-            }
-            int sign = op == "+=" ? 1 : -1;
-            if (k || fold(e, true) || !lv_touched(lv, e)) { eval8(e, lv.cell, sign); return; }
-            int64_t t = tmp(); eval8(e, t); move(t, {{lv.cell, sign}}); release(t);
-            return;
-        }
-        case LValue::Word: {
-            if (op == "=") {
-                if (k && *k > 65535) fail(e.pos, "value " + std::to_string(*k) + " does not fit a word");
-                if (!k) k = fold(e, true);
-                if (k) { set16(lv.cell, *k); return; }
-                if (!lv_touched(lv, e)) { clear16(lv.cell); eval16_fresh(e, lv.cell); return; }
-                int64_t t = tmp2(); eval16_fresh(e, t); clear16(lv.cell); move16(t, lv.cell); release2(t);
-                return;
-            }
-            if (!k) k = fold(e, true);
-            if (k) { if (op == "+=") add16_const(lv.cell, *k); else add16_const(lv.cell, -*k); return; }
-            int64_t t = tmp2(); eval16_fresh(e, t);
-            if (op == "+=") add16(lv.cell, t); else sub16(lv.cell, t);
+        if (lv.kind == LV::Reg) { gen_assign_reg(lv, op, e, s.pos); return; }
+        if (lv.type->is_ptr() && op != "=") {      // p += n, p -= n (scaled)
+            int es = std::max(lv.type->elem->size, 1);
+            if (auto k = fold(e, true)) { addN_const(lv.cell, 2, (op == "+=" ? 1 : -1) * *k * es); return; }
+            int64_t t = tmp2(); eval_into(e, t, T->u16());
+            int64_t m = t;
+            if (es != 1) { m = tmp2(); mul_constN(t, es, m, 2); }
+            if (op == "+=") addN(lv.cell, m, 2); else subN(lv.cell, m, 2);
+            if (es != 1) release2(m);
             release2(t);
             return;
         }
-        case LValue::ElemRT: {
+        if (n == 1 && lv.kind != LV::Heap && lv.type->kind != TK::Struct) {
+            int64_t cell = lv.kind == LV::Cells ? lv.cell : (!lv.index ? elem_cell(lv, 0) : -1);
+            if (cell >= 0) {
+                if (op == "=") {
+                    if (e.kind == Expr::In) { go(cell); out += ','; forget(cell); return; }   // ',' straight into the cell: unchanged at end of input
+                    if (auto k = fold(e, true)) { set(cell, *k); return; }
+                    if (!lv_touched(lv, e)) { clear(cell); eval8(e, cell); return; }
+                    int64_t t = tmp(); eval8(e, t); clear(cell); move(t, {{cell, 1}}); release(t);
+                    return;
+                }
+                int sign = op == "+=" ? 1 : -1;
+                if (fold(e, true) || !lv_touched(lv, e)) { eval8(e, cell, sign); return; }
+                int64_t t = tmp(); eval8(e, t); move(t, {{cell, sign}}); release(t);
+                return;
+            }
+            // runtime index into a byte array
             int64_t t = tmp(); eval8(e, t);
-            int64_t i = tmp(); eval8(*s.target->b, i);
-            array_write(lv.arr->cell, i, t);
+            int64_t i = tmp(); eval8(*lv.index, i);
+            array_write(plane(*lv.arr, lv.boff), i, t);
             drop(i); drop(t);
             return;
         }
-        case LValue::Reg: {
-            const bf::RegisterInfo& r = *lv.reg;
-            if (r.kind != bf::REG_LATCH) {
-                if (op == "=") fail(s.pos, std::string(r.name) + " cannot be assigned: write it with 'pulse " + r.name + "' or '" + r.name + " += 1'");
-                if (!k) fail(e.pos, std::string(r.name) + " only accepts a constant with += or -=");
-                add(lv.cell, op == "+=" ? *k : -*k);
-                return;
-            }
+        if (lv.kind == LV::Cells && lv.type->kind != TK::Struct) {
             if (op == "=") {
-                if (k) { if (*k > 255) fail(e.pos, "value " + std::to_string(*k) + " does not fit a byte"); set(lv.cell, *k); return; }
-                int64_t t = tmp(); eval8(e, t); clear(lv.cell); move(t, {{lv.cell, 1}}); release(t);
+                if (auto k = fold(e, true)) { setN(lv.cell, n, *k); return; }
+                if (!lv_touched(lv, e)) { clearN(lv.cell, n); eval_into(e, lv.cell, lv.type); return; }
+                int64_t t = tmpN(n); eval_into(e, t, lv.type); clearN(lv.cell, n); moveN(t, lv.cell, n); releaseN(t, n);
                 return;
             }
-            int sign = op == "+=" ? 1 : -1;
-            if (k) { add(lv.cell, sign * *k); return; }
-            int64_t t = tmp(); eval8(e, t); move(t, {{lv.cell, sign}}); release(t);
+            if (auto k = fold(e, true)) { addN_const(lv.cell, n, op == "+=" ? *k : -*k); return; }
+            int64_t t = tmpN(n); eval_into(e, t, lv.type);
+            if (op == "+=") addN(lv.cell, t, n); else subN(lv.cell, t, n);
+            releaseN(t, n);
             return;
         }
+        // structs, wide array elements and heap locations: evaluate, then store
+        int64_t t = tmpN(n);
+        eval_into(e, t, lv.type);
+        write_lv(lv, t);
+        drop(t, n);
+    }
+
+    void gen_assign_reg(const LV& lv, const std::string& op, const Expr& e, Pos pos) {
+        const bf::RegisterInfo& r = *lv.reg;
+        auto k = fold(e);
+        if (r.kind != bf::REG_LATCH) {
+            if (op == "=") fail(pos, std::string(r.name) + " cannot be assigned: write it with 'pulse " + r.name + "' or '" + r.name + " += 1'");
+            if (!k) fail(e.pos, std::string(r.name) + " only accepts a constant with += or -=");
+            add(lv.cell, op == "+=" ? *k : -*k);
+            return;
         }
+        if (op == "=") {
+            if (k) { set(lv.cell, *k); return; }
+            int64_t t = tmp(); eval8(e, t); clear(lv.cell); move(t, {{lv.cell, 1}}); release(t);
+            return;
+        }
+        int sign = op == "+=" ? 1 : -1;
+        if (k) { add(lv.cell, sign * *k); return; }
+        int64_t t = tmp(); eval8(e, t); move(t, {{lv.cell, sign}}); release(t);
     }
 
     void gen_incdec(const Stmt& s) {
-        LValue lv = lvalue(*s.target);
+        LV lv = lvalue(*s.target);
         int d = s.op == "++" ? 1 : -1;
-        switch (lv.kind) {
-        case LValue::Byte: case LValue::Elem: case LValue::Reg: add(lv.cell, d); return;
-        case LValue::Word: if (d > 0) inc16(lv.cell); else dec16(lv.cell); return;
-        case LValue::ElemRT: {
-            Stmt t; t.kind = Stmt::Assign; t.op = d > 0 ? "+=" : "-="; t.pos = s.pos; t.end = s.end; t.target = clone(*s.target);
-            t.e = std::make_unique<Expr>(); t.e->kind = Expr::Num; t.e->value = 1; t.e->pos = s.pos;
-            gen_assign(t);
+        int n = lv.size();
+        if (lv.kind == LV::Reg || (n == 1 && (lv.kind == LV::Cells || (lv.kind == LV::Elem && !lv.index)))) {
+            int64_t cell = lv.kind == LV::Elem ? elem_cell(lv, 0) : lv.cell;
+            add(cell, d);
             return;
         }
+        if (lv.kind == LV::Cells) {
+            if (lv.type->is_ptr()) { addN_const(lv.cell, 2, d * std::max(lv.type->elem->size, 1)); return; }
+            if (d > 0) incN(lv.cell, n); else decN(lv.cell, n);
+            return;
         }
+        Stmt t; t.kind = Stmt::Assign; t.op = d > 0 ? "+=" : "-="; t.pos = s.pos; t.end = s.end; t.target = clone(*s.target);
+        t.e = std::make_unique<Expr>(); t.e->kind = Expr::Num; t.e->value = 1; t.e->pos = s.pos;
+        t.e->type = T->u8(); t.e->is_const = true; t.e->cval = 1;
+        gen_assign(t);
     }
 
     void gen_decl(const Stmt& s) {
-        bool sw = dw(s);
-        Var v; v.name = s.name; v.word = sw; v.count = s.count;
+        Var v; v.name = s.name; v.type = s.vtype; v.count = s.count;
+        if (s.in_heap) {                         // a heap array: a constant pointer
+            v.is_const = true; v.cval = s.cval; v.owned = false;
+            declare(v, s.pos);
+            return;
+        }
         if (s.count >= 0) {
-            if (sw) fail(s.pos, "word arrays are not supported; use two byte arrays");
-            v.cell = alloc((int)array_cells(s.count));
+            v.cell = alloc((int)array_total(v));
         } else {
-            v.cell = alloc(sw ? 2 : 1);
+            int n = v.size();
+            v.cell = alloc(n);
             if (s.e) {
-                if (auto k = fold(*s.e)) {
-                    int64_t max = sw ? 65535 : 255;
-                    if (*k > max) fail(s.e->pos, "value " + std::to_string(*k) + " does not fit a " + (sw ? "word" : "byte"));
-                    if (sw) { add(v.cell, *k & 255); add(v.cell + 1, *k >> 8); } else add(v.cell, *k);
-                } else if (sw) eval16_fresh(*s.e, v.cell);
-                else eval8(*s.e, v.cell);
+                auto k = v.type->is_scalar() ? fold(*s.e) : std::nullopt;
+                if (k) for (int b = 0; b < n; b++) add(v.cell + b, (*k >> (8 * b)) & 255);
+                else eval_into(*s.e, v.cell, v.type);
             }
         }
         declare(v, s.pos);
-        Symbol sym{v.name, v.cell, (int)(s.count >= 0 ? array_cells(s.count) : (sw ? 2 : 1)),
-                   s.count >= 0 ? 'a' : (sw ? 'w' : 'b'), s.count >= 0 ? s.count : 1, cur_proc};
-        if (mapping()) res.symbols.push_back(sym);
+        add_symbol(v.name, v.cell, v.type, v.count, cur_proc);
     }
 
     // Clear the alive flags from the innermost context down to (and including) index stop_at;
@@ -1339,9 +1832,11 @@ struct Gen {
                     continue;
                 }
             }
-            if (a.kind == Expr::Index) {
-                LValue lv = lvalue(a);
-                if (lv.kind == LValue::Elem) { go(lv.cell); out += '.'; continue; }
+            if (a.kind == Expr::Index || a.kind == Expr::Field || a.kind == Expr::Deref) {
+                LV lv = lvalue(a);
+                if (lv.kind == LV::Elem && !lv.index) { go(elem_cell(lv, 0)); out += '.'; continue; }
+                if (lv.kind == LV::Cells) { go(lv.cell); out += '.'; continue; }
+                if (lv.const_addr()) { go(heap_cell(lv.base, HD)); out += '.'; continue; }
             }
             int64_t t = tmp();
             eval8(a, t);
@@ -1353,15 +1848,25 @@ struct Gen {
     void gen_print(const Stmt& s) {
         for (const ExprP& ap : s.args) {
             if (ap->kind == Expr::Str) { Stmt o; o.kind = Stmt::Out; o.args.push_back(clone(*ap)); gen_out(o); continue; }
-            call_user(width(*ap) == 2 ? "__print_word" : "__print_byte", {ap.get()}, s.pos, -1);
+            const Type* t = ap->type;
+            const char* fn;
+            if (t->is_ptr()) fn = "__print_str";
+            else if (t->size == 1) fn = t->is_signed ? "__print_sbyte" : "__print_byte";
+            else if (t->size == 2) fn = t->is_signed ? "__print_int" : "__print_word";
+            else fn = t->is_signed ? "__print_long" : "__print_dword";
+            call_user(fn, {ap.get()}, s.pos, -1);
         }
     }
 
+    void pulse_reg(const std::string& name) {
+        const bf::RegisterInfo* r = find_reg(name);
+        if (!r) internal("no register " + name);
+        go(r->addr); out += '+';
+    }
     void gen_pulse(const std::string& name, Pos p) {
         if (find_var(name)) fail(p, "'" + name + "' is a variable, not a register");
-        const bf::RegisterInfo* r = find_reg(name);
-        if (!r) fail(p, "'" + name + "' is not a register");
-        go(r->addr); out += '+';
+        if (!find_reg(name)) fail(p, "'" + name + "' is not a register");
+        pulse_reg(name);
     }
 
     // return [e];  inside an inlined procedure, the main program, or a trampolined body.
@@ -1373,15 +1878,19 @@ struct Gen {
         ExitCtx& pc = ctxs[p];
         if (pc.ret && !s.e) fail(s.pos, "this procedure returns a value");
         if (!pc.ret && s.e) fail(s.pos, "this procedure returns nothing");
-        if (s.e) {
-            if (pc.ret == 2) { clear16(pc.retval); eval16_fresh(*s.e, pc.retval); }
-            else { clear(pc.retval); eval8(*s.e, pc.retval); }
-        }
+        if (s.e) store_result(*s.e, pc.retval, pc.ret);
         unwind_to(p);
     }
+    void store_result(const Expr& e, int64_t cell, const Type* t) {
+        int n = std::max(t->size, 1);
+        if (n == 1 && t->kind != TK::Struct) { clear(cell); eval8(e, cell); return; }
+        clearN(cell, n);
+        eval_into(e, cell, t);
+    }
 
+    // ---- calls --------------------------------------------------------------------------------------------
     // Inline a procedure with its parameters already bound to cells.  result_cell
-    // receives the return value (-1 discards it).
+    // receives the return value (added; -1 discards it).
     void call_proc(const std::string& name, const std::vector<Var>& bound, Pos p, int64_t result_cell) {
         auto it = procs.find(name);
         if (it == procs.end()) fail(p, "'" + name + "' is not a procedure");
@@ -1394,10 +1903,11 @@ struct Gen {
         std::vector<ExitCtx> saved_ctxs; saved_ctxs.swap(ctxs);
         TProc* saved_tp = cur_tp; cur_tp = nullptr;
         call_stack.push_back(name);
-        int pret = ret_of(&proc);
+        const Type* pret = ret_of(&proc);
+        int rn = pret ? std::max(pret->size, 1) : 0;
         ExitCtx pc; pc.kind = ExitCtx::Proc; pc.ret = pret; pc.needs = contains_return(proc.body);
         int64_t mark = next_free;
-        if (pret) pc.retval = pret == 2 ? tmp2() : tmp();
+        if (pret) pc.retval = tmpN(rn);
         if (pc.needs) { pc.alive = tmp(); set(pc.alive, 1); }
         ctxs.push_back(pc);
         // lexical scoping: the body sees the globals and its own parameters, not the caller's locals
@@ -1411,16 +1921,32 @@ struct Gen {
         ctxs.pop_back();
         if (pc.needs) release(pc.alive);
         if (pret && result_cell >= 0) {
-            move(pc.retval, {{result_cell, 1}});
-            if (pret == 2) move(pc.retval + 1, {{result_cell + 1, 1}});
+            if (rn == 1) move(pc.retval, {{result_cell, 1}});
+            else { if (!known0N(result_cell, rn)) clearN(result_cell, rn); moveN(pc.retval, result_cell, rn); }
         }
-        if (pret) { if (pret == 2) release2(pc.retval); else release(pc.retval); }
+        if (pret) releaseN(pc.retval, rn);
         if (next_free != mark) internal("call frame not released");
         call_stack.pop_back();
         cur_tp = saved_tp;
         ctxs.swap(saved_ctxs);
         cur_proc = saved_proc;
         if (it->second.prelude) prelude_depth--;
+    }
+    // Inline with value parameters copied from the given cells.
+    void call_proc_values(const std::string& name, const std::vector<Var>& vals, Pos p, int64_t result_cell) {
+        auto it = procs.find(name);
+        if (it == procs.end()) internal("missing library procedure " + name);
+        std::vector<Var> bound;
+        int64_t mark = next_free;
+        for (size_t i = 0; i < vals.size(); i++) {
+            const Param& prm = it->second.decl->params[i];
+            int n = std::max(prm.type->size, 1);
+            Var v; v.type = prm.type; v.cell = alloc(n);
+            copyN(vals[i].cell, v.cell, n);
+            bound.push_back(v);
+        }
+        call_proc(name, bound, p, result_cell);
+        next_free = mark;
     }
 
     // Evaluate arguments and inline.  result_cell: where the value goes (added), -1 to discard.
@@ -1432,28 +1958,45 @@ struct Gen {
         if (args.size() != proc.params.size()) fail(p, "'" + name + "' takes " + std::to_string(proc.params.size()) + " argument(s), " + std::to_string(args.size()) + " given");
         int64_t mark = next_free;
         std::vector<Var> bound;
+        std::vector<std::pair<LV, int64_t>> writeback;     // ref arguments that live outside cells
         for (size_t i = 0; i < args.size(); i++) {
             const Param& prm = proc.params[i];
             const Expr& a = *args[i];
-            Var v; v.word = pw(prm); v.count = -1;
+            Var v; v.type = prm.type; v.count = -1;
             if (prm.ref) {
-                if (a.kind != Expr::Name) fail(a.pos, "argument for 'ref " + prm.name + "' must be a variable");
-                Var* sv = find_var(a.text);
-                if (!sv || sv->is_const) fail(a.pos, "argument for 'ref " + prm.name + "' must be a variable");
-                if (prm.array) { if (sv->count < 0) fail(a.pos, "'" + prm.name + "' needs a byte array"); }
-                else {
-                    if (sv->count >= 0) fail(a.pos, "'" + prm.name + "' needs a " + (pw(prm) ? "word" : "byte") + ", not an array");
-                    if (sv->word != pw(prm)) fail(a.pos, "'" + prm.name + "' needs a " + (pw(prm) ? "word" : "byte") + " variable");
+                if (prm.array) {
+                    Var* sv = a.kind == Expr::Name ? find_var(a.text) : nullptr;
+                    if (!sv || !sv->cell_array()) fail(a.pos, "'" + prm.name + "' needs a " + prm.type->name + " array");
+                    v = *sv; v.owned = false;
+                    bound.push_back(v);
+                    continue;
                 }
-                v.cell = sv->cell; v.count = sv->count; v.word = sv->word; v.owned = false;
-            } else {
-                v.cell = alloc(pw(prm) ? 2 : 1);
-                if (pw(prm)) eval16_fresh(a, v.cell); else eval8(a, v.cell);
+                LV lv = lvalue(a);
+                if (lv.kind == LV::Cells) { v.cell = lv.cell; v.owned = false; bound.push_back(v); continue; }
+                if (lv.kind == LV::Reg) fail(a.pos, "a register cannot be passed by 'ref'");
+                // copy in, and back out after the call
+                int n = lv.size();
+                v.cell = alloc(n);
+                read_lv(lv, v.cell);
+                v.owned = false;
+                bound.push_back(v);
+                writeback.emplace_back(lv, v.cell);
+                continue;
             }
+            v.cell = alloc(std::max(prm.type->size, 1));
+            eval_into(a, v.cell, prm.type);
             bound.push_back(v);
         }
         call_proc(name, bound, p, ret_of(&proc) ? result_cell : -1);
-        next_free = mark;        // value parameters were cleared by pop_scope
+        for (auto& wb : writeback) {
+            int n = wb.first.size();
+            int64_t t = tmpN(n);
+            copyN(wb.second, t, n);
+            write_lv(wb.first, t);
+            drop(t, n);
+            clearN(wb.second, n);
+        }
+        next_free = mark;        // value parameters were cleared when the body's scope closed
     }
 
     void gen_stmt(const Stmt& s) {
@@ -1464,9 +2007,7 @@ struct Gen {
         case Stmt::Stack: case Stmt::Heap: case Stmt::Struct: case Stmt::Import:
             return;                                  // handled up front
         case Stmt::Const: {
-            auto k = fold(*s.e);
-            if (!k) fail(s.e->pos, "constant '" + s.name + "' needs a constant expression");
-            Var v; v.name = s.name; v.is_const = true; v.cval = *k; v.owned = false;
+            Var v; v.name = s.name; v.is_const = true; v.cval = s.cval; v.type = s.ctype; v.owned = false;
             declare(v, s.pos);
             return;
         }
@@ -1494,7 +2035,7 @@ struct Gen {
             if (lc.kind == ExitCtx::Block) {
                 int target = s.kind == Stmt::Break ? lc.break_state : lc.cont_state;
                 if (target < 0) fail(s.pos, std::string(s.kind == Stmt::Break ? "'break'" : "'continue'") + " outside a loop");
-                set(state_cell, target);
+                set_state_cell(target);
                 unwind_to(i);
                 break;
             }
@@ -1507,7 +2048,7 @@ struct Gen {
         case Stmt::Out:    gen_out(s); break;
         case Stmt::Print:  gen_print(s); break;
         case Stmt::Pulse:  gen_pulse(s.name, s.pos); break;
-        case Stmt::Halt:   gen_pulse("HALT", s.pos); break;
+        case Stmt::Halt:   pulse_reg("HALT"); break;
         case Stmt::Asm:    out += s.text; known.clear(); break;
         case Stmt::Call: {
             std::vector<const Expr*> args;
@@ -1521,67 +2062,13 @@ struct Gen {
         end_stmt();
     }
 
-    // ---- procedures: registration and call graph --------------------------------------------------------
-    void collect_calls(const Expr& e, std::vector<std::string>& v) {
-        if (e.kind == Expr::Call) v.push_back(e.text);
-        if (e.a) collect_calls(*e.a, v);
-        if (e.b) collect_calls(*e.b, v);
-        for (auto& x : e.args) collect_calls(*x, v);
-    }
-    void collect_calls(const Stmt& s, std::vector<std::string>& v) {
-        if (s.kind == Stmt::Call) v.push_back(s.name);
-        if (s.target) collect_calls(*s.target, v);
-        if (s.e) collect_calls(*s.e, v);
-        if (s.init) collect_calls(*s.init, v);
-        if (s.step) collect_calls(*s.step, v);
-        for (auto& x : s.args) collect_calls(*x, v);
-        for (auto& x : s.body) collect_calls(*x, v);
-        for (auto& x : s.else_body) collect_calls(*x, v);
-    }
+    // ---- procedures: registration -----------------------------------------------------------------------
     void register_procs(const Program& p, bool is_prelude) {
         for (const StmtP& s : p.items) {
             if (s->kind != Stmt::Proc) continue;
-            if (procs.count(s->name)) fail(s->pos, "procedure '" + s->name + "' is already defined");
-            for (size_t i = 0; i < s->params.size(); i++)
-                for (size_t j = 0; j < i; j++) if (s->params[i].name == s->params[j].name) fail(s->params[i].pos, "duplicate parameter '" + s->params[i].name + "'");
-            ProcInfo pi{s.get(), is_prelude};
-            for (auto& x : s->body) collect_calls(*x, pi.callees);
-            procs[s->name] = pi;
+            procs[s->name] = ProcInfo{s.get(), is_prelude};
+            if (sr && sr->tramp.count(s->name)) procs[s->name].tramp = true;
         }
-    }
-    // Decide which procedures are trampolined: those declared rec, and everything that calls one.
-    // A cycle without 'rec' is an error.  Returns true if the main program calls a trampolined procedure.
-    bool plan_trampolines(const Program& prog) {
-        for (auto& kv : procs) {
-            for (const std::string& c : kv.second.callees)
-                if (!procs.count(c)) fail(kv.second.decl->pos, "'" + c + "' is not a procedure");
-            if (kv.second.decl->rec) kv.second.tramp = true;
-        }
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (auto& kv : procs) {
-                if (kv.second.tramp) continue;
-                for (const std::string& c : kv.second.callees) if (procs[c].tramp) { kv.second.tramp = true; changed = true; break; }
-            }
-        }
-        // cycle check among the non-rec procedures (trampolined ones may recurse freely)
-        for (auto& kv : procs) {
-            if (kv.second.tramp) continue;
-            std::vector<std::string> stack{kv.first};
-            std::unordered_set<std::string> seen;
-            while (!stack.empty()) {
-                std::string n = stack.back(); stack.pop_back();
-                for (const std::string& c : procs[n].callees) {
-                    if (c == kv.first) fail(kv.second.decl->pos, "'" + kv.first + "' is recursive; declare it 'rec proc'");
-                    if (seen.insert(c).second) stack.push_back(c);
-                }
-            }
-        }
-        std::vector<std::string> main_calls;
-        for (auto& x : prog.items) if (x->kind != Stmt::Proc) collect_calls(*x, main_calls);
-        for (const std::string& c : main_calls) { auto it = procs.find(c); if (it != procs.end() && it->second.tramp) return true; }
-        return false;
     }
 
     // ---- trampoline: lowering ------------------------------------------------------------------------------
@@ -1620,8 +2107,8 @@ struct Gen {
         for (const Var& f : p->consts) if (f.name == v.name) fail(pos, "'" + v.name + "' is already a constant");
         p->frame.push_back(v);
     }
-    std::string hidden(TProc* p, bool word) {
-        Var v; v.name = "__h" + std::to_string(p->hidden_n++); v.word = word;
+    std::string hidden(TProc* p, const Type* t) {
+        Var v; v.name = "__h" + std::to_string(p->hidden_n++); v.type = t;
         p->frame.push_back(v);
         return v.name;
     }
@@ -1634,7 +2121,7 @@ struct Gen {
             if (!ret_of(pi->decl)) fail(e.pos, "'" + e.text + "' returns nothing and cannot be used in an expression");
             std::vector<ExprP> args;
             for (auto& a : e.args) args.push_back(hoist(*a, L, from));
-            std::string h = hidden(L.p, ret_of(pi->decl) == 2);
+            std::string h = hidden(L.p, ret_of(pi->decl));
             emit_call(L, pi->tp, std::move(args), e.pos, from, h);
             auto n = std::make_unique<Expr>(); n->kind = Expr::Name; n->pos = e.pos; n->text = h; n->type = e.type;
             return n;
@@ -1651,11 +2138,12 @@ struct Gen {
     void emit_call(LowCtx& L, TProc* callee, std::vector<ExprP> args, Pos pos, const Stmt& from, const std::string& result) {
         const Stmt& decl = *callee->decl;
         if (args.size() != decl.params.size()) fail(pos, "'" + callee->name + "' takes " + std::to_string(decl.params.size()) + " argument(s), " + std::to_string(args.size()) + " given");
-        std::vector<std::pair<std::string, int>> copy_out;
+        std::vector<std::pair<const Expr*, int>> copy_out;
         for (size_t i = 0; i < args.size(); i++) {
             if (!decl.params[i].ref) continue;
-            if (args[i]->kind != Expr::Name) fail(args[i]->pos, "argument for 'ref " + decl.params[i].name + "' must be a variable");
-            copy_out.emplace_back(args[i]->text, (int)i);
+            ExprP keep = clone(*args[i]);
+            copy_out.emplace_back(keep.get(), (int)i);
+            synth_exprs.push_back(std::move(keep));
         }
         int resume = new_block(L.p, L);
         Action& a = act(L, Action::Call, &from);
@@ -1667,14 +2155,13 @@ struct Gen {
 
     void set_state(LowCtx& L, int target, const Stmt* from) { Action& a = act(L, Action::SetState, from); a.a = target; }
 
-    StmtP mk_assign(const Stmt& from, const std::string& name, ExprP value) {
+    StmtP mk_assign(const Stmt& from, const std::string& name, ExprP value, const Type* t) {
         auto s = std::make_unique<Stmt>();
         s->kind = Stmt::Assign; s->op = "="; s->pos = from.pos; s->end = from.end;
-        s->target = std::make_unique<Expr>(); s->target->kind = Expr::Name; s->target->pos = from.pos; s->target->text = name;
+        s->target = std::make_unique<Expr>(); s->target->kind = Expr::Name; s->target->pos = from.pos; s->target->text = name; s->target->type = t;
         s->e = std::move(value);
         return s;
     }
-    ExprP mk_num(Pos p, int64_t v) { auto e = std::make_unique<Expr>(); e->kind = Expr::Num; e->pos = p; e->value = (int32_t)v; return e; }
 
     void plain(LowCtx& L, const Stmt& s) { Action& a = act(L, Action::Plain, &s); a.s = &s; }
     void synth_plain(LowCtx& L, StmtP s, const Stmt& from) { Action& a = act(L, Action::Plain, &from); a.s = s.get(); synth.push_back(std::move(s)); }
@@ -1684,24 +2171,22 @@ struct Gen {
     void lower_stmt(const Stmt& s, LowCtx& L) {
         TProc* p = L.p;
         switch (s.kind) {
-        case Stmt::Proc: case Stmt::Stack: return;
+        case Stmt::Proc: case Stmt::Stack: case Stmt::Heap: case Stmt::Struct: case Stmt::Import: return;
         case Stmt::Const: {
-            Var v; v.name = s.name; v.is_const = true; v.owned = false;
-            auto k = fold_const_only(*s.e, p);
-            if (!k) fail(s.e->pos, "constant '" + s.name + "' needs a constant expression");
-            v.cval = *k;
+            Var v; v.name = s.name; v.is_const = true; v.owned = false; v.cval = s.cval; v.type = s.ctype;
             for (const Var& f : p->consts) if (f.name == v.name) fail(s.pos, "'" + v.name + "' is already declared");
             p->consts.push_back(v);
             return;
         }
         case Stmt::Decl: {
-            Var v; v.name = s.name; v.word = dw(s); v.count = s.count;
+            Var v; v.name = s.name; v.type = s.vtype; v.count = s.count;
+            if (s.in_heap) { v.is_const = true; v.cval = s.cval; v.owned = false; p->consts.push_back(v); return; }
             if (s.count >= 0 && !p->is_main()) fail(s.pos, "arrays cannot be local to a rec proc; declare '" + s.name + "' at the top level");
-            if (s.count >= 0 && dw(s)) fail(s.pos, "word arrays are not supported; use two byte arrays");
             frame_add(p, v, s.pos);
             if (s.count >= 0) return;                      // global array: zero from the start
-            ExprP init = s.e ? hoist(*s.e, L, s) : mk_num(s.pos, 0);
-            synth_plain(L, mk_assign(s, s.name, std::move(init)), s);
+            if (!s.e) { Action& a = act(L, Action::Clear, &s); a.result = s.name; return; }
+            ExprP init = hoist(*s.e, L, s);
+            synth_plain(L, mk_assign(s, s.name, std::move(init), s.vtype), s);
             return;
         }
         default: break;
@@ -1789,40 +2274,6 @@ struct Gen {
         }
     }
 
-    // Constants visible while lowering: the procedure's own and the main program's.
-    std::optional<int64_t> fold_const_only(const Expr& e, TProc* p) {
-        if (e.kind == Expr::Num) return e.value;
-        if (e.kind == Expr::Name) {
-            for (const Var& c : p->consts) if (c.name == e.text) return c.cval;
-            if (!tprocs.empty() && tprocs.front().get() != p) for (const Var& c : tprocs.front()->consts) if (c.name == e.text) return c.cval;
-            return std::nullopt;
-        }
-        if (e.kind == Expr::Unary) {
-            auto a = fold_const_only(*e.a, p);
-            if (!a) return std::nullopt;
-            if (e.text == "-") return (-*a) & 0xFFFF;
-            if (e.text == "!") return *a == 0 ? 1 : 0;
-            if (e.text == "~") return (~*a) & 0xFFFF;
-            return *a;
-        }
-        if (e.kind == Expr::Binary) {
-            auto a = fold_const_only(*e.a, p), b = fold_const_only(*e.b, p);
-            if (!a || !b) return std::nullopt;
-            const std::string& o = e.text;
-            if (o == "+") return (*a + *b) & 0xFFFF;
-            if (o == "-") return (*a - *b) & 0xFFFF;
-            if (o == "*") return (*a * *b) & 0xFFFF;
-            if (o == "/") return *b ? std::optional<int64_t>(*a / *b) : std::nullopt;
-            if (o == "%") return *b ? std::optional<int64_t>(*a % *b) : std::nullopt;
-            if (o == "<<") return (*a << *b) & 0xFFFF;
-            if (o == ">>") return *a >> *b;
-            if (o == "&") return *a & *b;
-            if (o == "|") return *a | *b;
-            if (o == "^") return *a ^ *b;
-        }
-        return std::nullopt;
-    }
-
     // Lower one trampolined procedure (or main) into blocks.
     void lower_proc(TProc* p, const std::vector<StmtP>& body) {
         LowCtx L{p, 0};
@@ -1831,7 +2282,7 @@ struct Gen {
         if (p->decl) {
             for (const Param& prm : p->decl->params) {
                 if (prm.array) fail(prm.pos, "rec procs cannot take array parameters; use a top-level array");
-                Var v; v.name = prm.name; v.word = pw(prm);
+                Var v; v.name = prm.name; v.type = prm.type;
                 frame_add(p, v, prm.pos);
             }
         }
@@ -1846,6 +2297,7 @@ struct Gen {
         for (const Var& v : p->consts) scopes.back().vars[v.name] = v;
         for (const Var& v : p->frame) { scopes.back().vars[v.name] = v; scopes.back().order.push_back(v.name); }
     }
+    void set_state_cell(int v) { set(state_cell, v); }
 
     // idx = sp + off into a temporary
     int64_t stack_index(int off) { int64_t i = tmp(); copy(sp_cell, i); add(i, off); return i; }
@@ -1856,11 +2308,8 @@ struct Gen {
         TProc* p = cur_tp;
         if (p->ret && !value) fail(pos, "'" + p->name + "' returns a value");
         if (!p->ret && value) fail(pos, p->is_main() ? "the main program returns nothing" : "'" + p->name + "' returns nothing");
-        if (value) {
-            if (p->ret == 2) { clear16(p->retval); eval16_fresh(*value, p->retval); }
-            else { clear(p->retval); eval8(*value, p->retval); }
-        }
-        if (p->is_main()) set(state_cell, 0);
+        if (value) store_result(*value, p->retval, p->ret);
+        if (p->is_main()) set_state_cell(0);
         else { int64_t i = stack_index(-1); clear(state_cell); array_read(stack_base, i, state_cell); drop(i); }
         size_t b = ctxs.size();
         while (b-- > 0) if (ctxs[b].kind == ExitCtx::Block) break;
@@ -1874,14 +2323,22 @@ struct Gen {
             gen_stmt(*a.s);
             return;
         case Action::SetState:
-            set(state_cell, a.a);
+            set_state_cell(a.a);
             return;
+        case Action::Clear: {
+            Var* v = find_var(a.result);
+            if (!v) internal("cleared variable missing");
+            if (a.src) begin_stmt(*a.src);
+            clearN(v->cell, v->size());
+            if (a.src) end_stmt();
+            return;
+        }
         case Action::IfGoto: {
             if (a.src) begin_stmt(*a.src);
             int64_t c = tmp(); eval_cond(*a.cond, c);
             int64_t f = tmp(); set(f, 1);
-            if_nonzero(c, [&] { set(state_cell, a.a); clear(f); });
-            if_nonzero(f, [&] { set(state_cell, a.b); });
+            if_nonzero(c, [&] { set_state_cell(a.a); clear(f); });
+            if_nonzero(f, [&] { set_state_cell(a.b); });
             release(f); release(c);
             if (a.src) end_stmt();
             return;
@@ -1894,28 +2351,26 @@ struct Gen {
             int64_t mark = next_free;
             std::vector<int64_t> vals;
             for (size_t i = 0; i < a.args.size(); i++) {
-                bool w = pw(decl.params[i]);
-                int64_t t = w ? tmp2() : tmp();
-                if (w) eval16_fresh(*a.args[i], t); else eval8(*a.args[i], t);
+                const Param& prm = decl.params[i];
+                int n = std::max(prm.type->size, 1);
+                int64_t t = tmpN(n);
+                if (prm.ref) read_lv(lvalue(*a.args[i]), t); else eval_into(*a.args[i], t, prm.type);
                 vals.push_back(t);
             }
             // save the caller's frame and the resume state
             TProc* me = blk.owner;
             int off = 0;
-            if (!me->is_main()) for (const Var& v : me->frame) {
-                stack_store(off++, v.cell);
-                if (v.word) stack_store(off++, v.cell + 1);
-            }
+            if (!me->is_main()) for (const Var& v : me->frame) for (int k = 0; k < v.size(); k++) stack_store(off++, v.cell + k);
             { int64_t r = tmp(); set(r, a.a); int64_t i = stack_index(off); array_write(stack_base, i, r); drop(i); drop(r); }
             add(sp_cell, off + 1);
             // load the callee's parameters
             for (size_t i = 0; i < vals.size(); i++) {
                 const Var& prm = callee->frame[i];
-                clear(prm.cell); move(vals[i], {{prm.cell, 1}});
-                if (prm.word) { clear(prm.cell + 1); move(vals[i] + 1, {{prm.cell + 1, 1}}); }
+                clearN(prm.cell, prm.size());
+                moveN(vals[i], prm.cell, prm.size());
             }
             next_free = mark;
-            set(state_cell, callee->entry);
+            set_state_cell(callee->entry);
             if (a.src) end_stmt();
             return;
         }
@@ -1927,33 +2382,28 @@ struct Gen {
             std::vector<int64_t> saved;
             for (auto& co : a.copy_out) {
                 const Var& prm = a.callee->frame[(size_t)co.second];
-                int64_t t = prm.word ? tmp2() : tmp();
-                copy(prm.cell, t);
-                if (prm.word) copy(prm.cell + 1, t + 1);
+                int64_t t = tmpN(prm.size());
+                copyN(prm.cell, t, prm.size());
                 saved.push_back(t);
             }
             int n = me->save_count();
             add(sp_cell, -(n + 1));
             int off = 0;
-            if (!me->is_main()) for (const Var& v : me->frame) {
-                stack_load(off++, v.cell);
-                if (v.word) stack_load(off++, v.cell + 1);
-            }
-            for (size_t i = 0; i < a.copy_out.size(); i++) {
-                auto& co = a.copy_out[i];
-                Var* dst = find_var(co.first);
-                if (!dst || dst->is_const || dst->count >= 0) fail(a.src ? a.src->pos : Pos{}, "argument for a ref parameter must be a variable");
-                const Var& prm = a.callee->frame[(size_t)co.second];
-                if (dst->word != prm.word) fail(a.src ? a.src->pos : Pos{}, "'" + co.first + "' has the wrong type for 'ref " + prm.name + "'");
-                clear(dst->cell); move(saved[i], {{dst->cell, 1}});
-                if (prm.word) { clear(dst->cell + 1); move(saved[i] + 1, {{dst->cell + 1, 1}}); }
+            if (!me->is_main()) for (const Var& v : me->frame) for (int k = 0; k < v.size(); k++) stack_load(off++, v.cell + k);
+            for (size_t i = a.copy_out.size(); i-- > 0;) {
+                LV lv = lvalue(*a.copy_out[i].first);
+                const Var& prm = a.callee->frame[(size_t)a.copy_out[i].second];
+                int64_t t = tmpN(prm.size());
+                moveN(saved[i], t, prm.size());
+                write_lv(lv, t);
+                drop(t, prm.size());
             }
             next_free = mark;
             if (!a.result.empty()) {
                 Var* h = find_var(a.result);
                 if (!h) internal("hidden result variable missing");
-                clear(h->cell); copy(a.callee->retval, h->cell);
-                if (h->word) { clear(h->cell + 1); if (a.callee->ret == 2) copy(a.callee->retval + 1, h->cell + 1); }
+                clearN(h->cell, h->size());
+                copyN(a.callee->retval, h->cell, h->size());
             }
             if (a.src) end_stmt();
             return;
@@ -2024,30 +2474,30 @@ struct Gen {
             kv.second.tp = tp.get();
             tprocs.push_back(std::move(tp));
         }
-        for (auto& x : prog.items) if (x->kind == Stmt::Stack) stack_size = x->count;
+        if (sr && sr->stack_size > 0) stack_size = sr->stack_size;
         lower_proc(tprocs[0].get(), prog.items);               // main first: its consts are visible to the others
         for (size_t i = 1; i < tprocs.size(); i++) lower_proc(tprocs[i].get(), tprocs[i]->decl->body);
         if (blocks.size() > 254) fail(Pos{}, "too many trampoline blocks (" + std::to_string(blocks.size()) + "); the state cell holds 254");
+        if (stack_size > 256) fail(Pos{}, "the recursion stack holds at most 256 cells");
 
         stack_base = alloc((int)array_cells(stack_size));     // lowest: variables and temporaries stay close together above it
         state_cell = alloc(1); alive_cell = alloc(1); sp_cell = alloc(1);
-        res.symbols.push_back(Symbol{"__state", state_cell, 1, 'b', 1, ""});
-        res.symbols.push_back(Symbol{"__sp", sp_cell, 1, 'b', 1, ""});
+        res.symbols.push_back(Symbol{"__state", state_cell, 1, 'b', 1, "", 1, false});
+        res.symbols.push_back(Symbol{"__sp", sp_cell, 1, 'b', 1, "", 1, false});
         res.sp_cell = sp_cell;
         for (auto& tp : tprocs) {
             for (Var& v : tp->frame) {
-                int cells = v.count >= 0 ? (int)array_cells(v.count) : (v.word ? 2 : 1);
+                int cells = v.count >= 0 ? (int)array_total(v) : v.size();
                 v.cell = alloc(cells);
-                if (v.name.rfind("__h", 0) != 0)
-                    res.symbols.push_back(Symbol{tp->is_main() ? v.name : tp->name + "." + v.name, v.cell, cells, v.count >= 0 ? 'a' : (v.word ? 'w' : 'b'), v.count >= 0 ? v.count : 1, ""});
+                if (v.name.rfind("__h", 0) != 0) add_symbol(tp->is_main() ? v.name : tp->name + "." + v.name, v.cell, v.type, v.count, "");
             }
-            if (tp->ret) tp->retval = alloc(tp->ret == 2 ? 2 : 1);
+            if (tp->ret) tp->retval = alloc(std::max(tp->ret->size, 1));
         }
 
         out += "\n# trampoline: stack of " + std::to_string(stack_size) + " cells and " + std::to_string(blocks.size()) + " blocks\n";
         push_frame_scope(tprocs[0].get());
         scopes.back().top = true;
-        set(state_cell, tprocs[0]->entry);
+        set_state_cell(tprocs[0]->entry);
         open(state_cell);
         {
             int64_t cnt = tmp();
@@ -2060,12 +2510,22 @@ struct Gen {
         pop_scope();
     }
 
+    // Start-up code: the heap's bookkeeping words and the bytes of every string literal.
+    void heap_init() {
+        if (heap_lo == INT64_MAX) return;
+        auto put = [&](int64_t addr, int v) { if (v) { int64_t c = heap_cell(addr, HD); go(c); add(c, v); } };
+        auto put16 = [&](int64_t addr, int64_t v) { put(addr, (int)(v & 255)); put(addr + 1, (int)((v >> 8) & 255)); };
+        put16(1, sr->heap_static_end);       // the allocator's break
+        put16(5, heap_size);                 // the end of the heap
+        for (auto& s : sr->heap_init) for (size_t i = 0; i < s.second.size(); i++) put(s.first + (int64_t)i, (unsigned char)s.second[i]);
+    }
+
     void run(const Program& prog) {
         register_procs(prelude, true);
         register_procs(prog, false);
         out += "# compiled by bfl\n";
-        bool tramp = plan_trampolines(prog);
-        if (tramp) { gen_trampoline(prog); res.cells_used = high - ram; return; }
+        heap_init();
+        if (sr && sr->main_tramp) { gen_trampoline(prog); res.cells_used = high - ram; return; }
         push_scope(true);
         ExitCtx mc; mc.kind = ExitCtx::Proc; mc.needs = contains_return(prog.items);
         if (mc.needs) { mc.alive = tmp(); set(mc.alive, 1); }
@@ -2082,28 +2542,29 @@ struct Gen {
 // Language features enabled so far (docs/ROADMAP.md phases).
 static Features current_features() {
     Features f;
-    f.wide_ints = false;
+    f.wide_ints = true;
     f.heap = false;
     f.structs = false;
     return f;
 }
 
 Result compile(const std::string& source, uint32_t ram_start, const Options& opt) {
-    Gen g(source, ram_start);
-    g.res.files.push_back(opt.file_name.empty() ? "<source>" : opt.file_name);
-    auto err = [&](const Pos& p, const std::string& m) { g.res.errors.push_back(Error{p.line, p.col, m, p.file}); };
+    Result res;
+    res.files.push_back(opt.file_name.empty() ? "<source>" : opt.file_name);
+    auto err = [&](const Pos& p, const std::string& m) { res.errors.push_back(Error{p.line, p.col, m, p.file}); };
     std::vector<ParseError> perr;
     Program prog = parse(source, 0, perr);
     for (const ParseError& e : perr) err(e.pos, e.msg);
-    if (!g.res.errors.empty()) return std::move(g.res);
+    if (!res.errors.empty()) return res;
     Types types;
+    Program prelude;
     try {
-        g.prelude = parse(PRELUDE, -1);
+        prelude = parse(PRELUDE, -1);
     } catch (const ParseError& e) {
         err(Pos{}, "internal compiler error in the prelude: " + e.msg);
-        return std::move(g.res);
+        return res;
     }
-    SemaResult sr = analyse(g.prelude, prog, types, current_features(), opt.warnings);
+    SemaResult sr = analyse(prelude, prog, types, current_features(), opt.warnings);
     auto by_pos = [](const Diag& a, const Diag& b) {
         if (a.pos.file != b.pos.file) return a.pos.file < b.pos.file;
         return a.pos.line != b.pos.line ? a.pos.line < b.pos.line : a.pos.col < b.pos.col;
@@ -2111,17 +2572,46 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
     std::stable_sort(sr.errors.begin(), sr.errors.end(), by_pos);
     std::stable_sort(sr.warnings.begin(), sr.warnings.end(), by_pos);
     for (const Diag& d : sr.errors) err(d.pos, d.msg);
-    for (const Diag& d : sr.warnings) g.res.warnings.push_back(Error{d.pos.line, d.pos.col, d.msg, d.pos.file});
-    if (!g.res.errors.empty()) return std::move(g.res);
-    try {
-        g.run(prog);
-    } catch (const ParseError& e) {
-        err(e.pos, e.msg);
-    } catch (const Fail& f) {
-        err(f.pos, f.msg);
-    }
-    if (!g.res.errors.empty()) { g.res.bf.clear(); g.res.stmts.clear(); }
-    return std::move(g.res);
+    for (const Diag& d : sr.warnings) res.warnings.push_back(Error{d.pos.line, d.pos.col, d.msg, d.pos.file});
+    if (!res.errors.empty()) return res;
+
+    // One pass without a heap, or two: the first finds how many cells the
+    // variables need, the second places the heap just above them.
+    auto generate = [&](int64_t heap_lo) -> std::unique_ptr<Gen> {
+        auto g = std::make_unique<Gen>(source, ram_start);
+        g->T = &types; g->opt = opt; g->sr = &sr;
+        g->prelude = std::move(prelude);
+        if (heap_lo != INT64_MAX) {
+            g->heap_lo = heap_lo;
+            g->heap_elem0 = heap_lo + (int64_t)HOP * HK;
+            g->heap_size = sr.heap_size;
+        }
+        try {
+            g->run(prog);
+        } catch (const Fail& f) {
+            g->res.errors.push_back(Error{f.pos.line, f.pos.col, f.msg, f.pos.file});
+        }
+        prelude = std::move(g->prelude);
+        return g;
+    };
+    std::unique_ptr<Gen> g;
+    if (sr.uses_heap) {
+        auto g1 = generate((int64_t)ram_start + ((int64_t)1 << 30));
+        if (!g1->res.errors.empty()) g = std::move(g1);
+        else {
+            int64_t lo = g1->high + 16;
+            g = generate(lo);
+            if (g->res.errors.empty() && g->high != g1->high) g->res.errors.push_back(Error{0, 0, "internal compiler error: heap placement changed the layout", 0});
+            g->res.cells_used = g->high - (int64_t)ram_start + 16 + (int64_t)HK * (HOP + sr.heap_size);
+            g->res.heap_cell = g->heap_elem0;
+            g->res.heap_size = sr.heap_size;
+        }
+    } else g = generate(INT64_MAX);
+    Result outr = std::move(g->res);
+    outr.files = res.files;
+    outr.warnings = res.warnings;
+    if (!outr.errors.empty()) { outr.bf.clear(); outr.stmts.clear(); }
+    return outr;
 }
 
 std::string format_error(const Result& r, const Error& e, const char* kind) {
@@ -2138,6 +2628,7 @@ std::string describe(const Result& r) {
     s += "# symbols: V name kind cell cells count scope\n";
     for (const Symbol& v : r.symbols) { snprintf(buf, sizeof buf, "V %s %c 0x%llX %d %d %s\n", v.name.c_str(), v.kind, (long long)v.cell, v.cells, v.count, v.scope.c_str()); s += buf; }
     if (r.sp_cell >= 0) { snprintf(buf, sizeof buf, "# trampoline stack pointer cell 0x%llX\n", (long long)r.sp_cell); s += buf; }
+    if (r.heap_cell >= 0) { snprintf(buf, sizeof buf, "# heap: %d bytes, byte 0 at cell 0x%llX, %d cells per byte\n", r.heap_size, (long long)r.heap_cell, HK); s += buf; }
     return s;
 }
 

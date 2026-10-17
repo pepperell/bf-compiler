@@ -115,17 +115,17 @@ struct Sema {
     // ---- types ---------------------------------------------------------------------------
     const Type* resolve(const TypeSpec& ts) {
         const Type* t = T.by_name(ts.base);
-        if (t && t->is_int() && t->size > 1 && !(t == T.u16()) && !F.wide_ints) {
+        if (t && t->is_int() && t != T.u8() && t != T.u16() && !F.wide_ints && !in_prelude) {
             error(ts.pos, "type '" + ts.base + "' is not available yet"); return T.error();
         }
-        if (ts.base == "string" && !F.heap) { error(ts.pos, "type 'string' is not available yet"); return T.error(); }
+        if (ts.base == "string" && !F.heap && !in_prelude) { error(ts.pos, "type 'string' is not available yet"); return T.error(); }
         if (!t) {
             auto it = structs.find(ts.base);
             if (it == structs.end()) { error(ts.pos, "unknown type '" + ts.base + "'"); return T.error(); }
             t = T.struct_type(it->second);
         }
         for (int i = 0; i < ts.ptr; i++) {
-            if (!F.heap) { error(ts.pos, "pointers are not available yet"); return T.error(); }
+            if (!F.heap && !in_prelude) { error(ts.pos, "pointers are not available yet"); return T.error(); }
             t = T.ptr(t);
         }
         return t;
@@ -137,8 +137,8 @@ struct Sema {
     }
     const Type* const_type(int64_t v, bool is_long = false) {
         const Type* t = natural(T, v, is_long);
-        if (t->size > 2 && !F.wide_ints) return T.u16();
-        if (t->is_signed && !F.wide_ints) return t->size == 1 ? T.u8() : T.u16();
+        if (t->size > 2 && !F.wide_ints && !in_prelude) return T.u16();
+        if (t->is_signed && !F.wide_ints && !in_prelude) return t->size == 1 ? T.u8() : T.u16();
         return t;
     }
     // The type two integer operands are converted to.
@@ -166,7 +166,7 @@ struct Sema {
         if (to->is_int()) {
             if (from->is_int()) {
                 if (e.is_const) {
-                    if (!fits_either(e.cval, to)) error(e.pos, what + std::string(" ") + std::to_string(e.cval) + " does not fit a " + (to == T.u8() ? std::string("byte") : to->name));
+                    if (to->is_signed ? !fits(e.cval, to) : !fits_either(e.cval, to)) error(e.pos, what + std::string(" ") + std::to_string(e.cval) + " does not fit " + (to->name[0] == 'i' ? "an " : "a ") + to->name);
                 } else if (from->size > to->size) warning(e.pos, "value of type '" + from->name + "' is truncated to '" + to->name + "'");
                 return;
             }
@@ -260,7 +260,7 @@ struct Sema {
         switch (e.kind) {
         case Expr::Num: {
             const Type* t = const_type(e.value, e.text == "L");
-            if (!F.wide_ints && e.value > 65535) { error(e.pos, "number too large for a word"); return T.error(); }
+            if (!F.wide_ints && !in_prelude && e.value > 65535) { error(e.pos, "number too large for a word"); return T.error(); }
             e.is_const = true; e.cval = e.value;
             return t;
         }
@@ -393,7 +393,8 @@ struct Sema {
             return T.error();
         }
         if (!ta->is_int() || !tb->is_int()) { error(e.pos, "invalid operands to '" + o + "' ('" + ta->name + "' and '" + tb->name + "')"); return T.error(); }
-        const Type* c = common(*e.a, *e.b);
+        bool shift = o == "<<" || o == ">>";
+        const Type* c = shift ? ta : common(*e.a, *e.b);       // a shift has its left operand's type
         e.optype = c;
         if (e.a->is_const && e.b->is_const) {
             e.is_const = true;

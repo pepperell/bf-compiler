@@ -274,7 +274,10 @@ are addressed by name.  There is no stack and no recursion.
 
 TYPES AND DECLARATIONS
   byte x;  byte y = 7;        one cell, 0..255, wraps.  Zero unless initialised
+  sbyte s = -5;               one cell, -128..127
   word w = 1000;              two cells (low, high), 0..65535, wraps
+  int i = -300;               two cells, -32768..32767
+  dword d;  long l = -1;      four cells, unsigned / signed 32-bit
   byte buf[16];               array of bytes; index may be a variable
   const MAX = 10;             compile-time constant, no cell
 Variables declared inside { } exist until the closing brace and are cleared
@@ -315,10 +318,13 @@ PROCEDURES AND RECURSION
 EXPRESSIONS
   Operators, loosest first:  ||  &&  |  ^  &  == !=  < <= > >=  << >>  + -  * / %
   Unary: - ! ~ and the casts byte(e), word(e).  Numbers: 10, 0x1F, 0b101, 'A'.
-  Everything is unsigned.  An expression is a word if any operand is a word
-  (or a constant above 255), otherwise a byte; byte + byte wraps at 256,
-  so use word(a) + b for a 16-bit sum.  Comparisons and ! && || give 0 or 1.
-  Division by zero gives 0, the remainder gives the dividend.
+  Operands are converted to the wider type (signed only if both are signed);
+  a constant takes the other operand's type when it fits.  byte + byte wraps
+  at 256, so use word(a) + b for a 16-bit sum.  Casts: int(e) or (int) e.
+  Signed / and % truncate towards zero as in C; >> is arithmetic on signed
+  types.  A shift has its left operand's type.  Comparisons and ! && || give
+  0 or 1.  Division by zero gives 0, the remainder gives the dividend.
+  Numbers with an L suffix (5L) are long.
   && and || only evaluate the right side when needed.
 
 REGISTERS

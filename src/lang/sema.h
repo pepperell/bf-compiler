@@ -26,6 +26,10 @@ struct SemaResult {
     bool uses_heap = false;
     int  heap_size = 8192;                // bytes (heap N;)
     int  stack_size = -1;                 // stack N; (-1 = default)
+    // static heap layout: 0 null, 1-2 allocator break, 3-4 free list, 5-6 heap end,
+    // then heap arrays and string literals; dynamic allocation starts at heap_static_end
+    int  heap_static_end = 7;
+    std::vector<std::pair<int64_t, std::string>> heap_init;   // string literals: address, bytes with the NUL
 };
 
 // Checks prelude + program (prelude procedures first, unchecked for warnings)

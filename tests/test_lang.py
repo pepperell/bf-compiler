@@ -71,6 +71,10 @@ DIAGS = [
     ("warn-unreachable", "proc f() { return; out 1; } f(); byte i; for (i = 0; i < 2; i++) { break; out 2; }",
      ["1:20: warning: unreachable code", "1:75: warning: unreachable code"], ["--warn"], 0),
     ("warn-off-by-default", "byte unused = 2;", [], (), 0),
+    ("warn-mixed-sign", "int a = 1; word b = 2; print a < b;",
+     ["1:30: warning: comparing or combining signed 'int' with unsigned 'word' treats both as unsigned"], ["--warn"], 0),
+    ("err-int-range", "int a = 40000; sbyte s = 300;",
+     ["1:9: value 40000 does not fit an int", "1:26: value 300 does not fit a sbyte"], (), 1),
     ("diag-global-after-call", "f(); byte g = 0; proc f() { g++; }",
      ["1:1: 'f' uses 'g', which is declared after this call"], (), 1),
     ("diag-lexical-scope", "proc f() { out x; } byte x = 1; f();",
@@ -153,6 +157,88 @@ def grid(name, pairs, bits, ops):
     return check(name, "\n".join(src_all), exp_all.encode(), stdin_all)
 
 
+# ---- typed grids (phase 2): every operator at every integer type ---------------------------
+TYPES = {"byte": (8, False), "sbyte": (8, True), "word": (16, False), "int": (16, True), "dword": (32, False), "long": (32, True)}
+
+
+def wrap(v, bits, signed):
+    v &= (1 << bits) - 1
+    if signed and v >> (bits - 1):
+        v -= 1 << bits
+    return v
+
+
+def typed_op(op, a, b, bits, signed):
+    """C semantics at one type: operands already wrapped; division truncates towards zero."""
+    if op in ("==", "!=", "<", "<=", ">", ">="):
+        return int({"==": a == b, "!=": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op])
+    if op == "&&": return int(bool(a) and bool(b))
+    if op == "||": return int(bool(a) or bool(b))
+    if op == "/":
+        if b == 0: return 0
+        q = abs(a) // abs(b)
+        return wrap(-q if (a < 0) != (b < 0) else q, bits, signed)
+    if op == "%":
+        if b == 0: return a
+        q = abs(a) // abs(b)
+        q = -q if (a < 0) != (b < 0) else q
+        return wrap(a - q * b, bits, signed)
+    if op == "<<": return wrap(a << b, bits, signed) if 0 <= b < bits else 0
+    if op == ">>":
+        if 0 <= b < bits: return wrap(a >> b, bits, signed)
+        return -1 if (signed and a < 0) else 0
+    r = {"+": a + b, "-": a - b, "*": a * b, "&": a & b, "|": a | b, "^": a ^ b}[op]
+    return wrap(r, bits, signed)
+
+
+def typed_grid(name, typ, values, ops, shift_counts=(0, 1, 3, 7, 15, 31)):
+    """r = a op b at one type, operands read with `in` (big-endian bytes) so nothing folds."""
+    bits, signed = TYPES[typ]
+    nb = bits // 8
+    lines = [f"{typ} a; {typ} b; {typ} r; byte k;"]
+    stdin = b""
+    exp = ""
+    def load(var):
+        if nb == 1:
+            return f"{var} = in;"
+        return f"{var} = in;" + "".join(f" {var} = {var} * 256 + in;" for _ in range(nb - 1))
+    def raw(v):
+        u = v & ((1 << bits) - 1)
+        return bytes((u >> (8 * (nb - 1 - i))) & 255 for i in range(nb))
+    for a in values:
+        for b in values:
+            lines.append(load("a") + " " + load("b"))
+            stdin += raw(a) + raw(b)
+            for op in ops:
+                if op in ("<<", ">>"):
+                    continue
+                lines.append(f'r = a {op} b; print r, " ";')
+                exp += str(typed_op(op, a, b, bits, signed)) + " "
+            lines.append('out "\\n";')
+            exp += "\n"
+        for op in ("<<", ">>"):
+            if op not in ops:
+                continue
+            for k in shift_counts:
+                if k >= 32:
+                    continue
+                lines.append(f"k = in; r = a {op} k; print r, \" \";")
+                stdin += bytes([k])
+                exp += str(typed_op(op, a, k, bits, signed)) + " "
+        lines.append('out "\\n";')
+        exp += "\n"
+    return check(name, "\n".join(lines), exp.encode(), stdin)
+
+
+ALL_OPS = ["+", "-", "*", "/", "%", "&", "|", "^", "==", "!=", "<", "<=", ">", ">=", "&&", "||", "<<", ">>"]
+GRIDS = [
+    ("grid-sbyte", "sbyte", [0, 1, -1, 7, -128, 100, -3]),
+    ("grid-int", "int", [0, -1, 300, -300, 32767, -32768, -7]),
+    ("grid-dword", "dword", [0, 1, 300, 65536, 4294967295, 123456789]),
+    ("grid-long", "long", [0, -1, 300, -70000, 2147483647, -2147483648]),
+]
+
+
 CASES = []
 
 
@@ -161,6 +247,32 @@ def case(name, src, expected, stdin=b"", extra=()):
 
 
 case("hello", 'out "Hello\\n";', b"Hello\n")
+# ---- integer types (phase 2) ----
+case("int-print", "int a = -32768; int b = 32767; sbyte c = -128; long d = -2147483648; dword e = 4294967295; print a, \" \", b, \" \", c, \" \", d, \" \", e;",
+     b"-32768 32767 -128 -2147483648 4294967295")
+case("sign-extension", "sbyte s = -3; int i = s; long l = s; word w = s; dword d = i; print i, \" \", l, \" \", w, \" \", d;",
+     b"-3 -3 65533 4294967293")
+case("zero-extension", "byte b = 200; int i = b; long l = b; print i, \" \", l, \" \", int(b) - 300;", b"200 200 -100")
+case("truncation", "long l = 70000; int i = l; byte b = l; sbyte s = l; print i, \" \", b, \" \", s;", b"4464 112 112")
+case("mixed-widths", "int i = -5; byte b = 200; sbyte s = -3; word w = 10; print i + b, \" \", s + w, \" \", i * b, \" \", long(i) * 100000;",
+     b"195 7 -1000 -500000")
+case("signed-compare", "int a = -1; int b = 1; sbyte c = -100; print a < b, a > b, c < 0, c >= -100, long(a) < 0;", b"10111")
+case("signed-division", "int a = -7; int b = 2; print a / b, \" \", a % b, \" \", 7 / -2, \" \", int(7) % int(-2), \" \", a / 0, \" \", a % 0;",
+     b"-3 -1 -3 1 0 -7")
+case("arith-shift", "int a = -64; sbyte s = -8; long l = -1; print a >> 2, \" \", s >> 1, \" \", l >> 31, \" \", word(a) >> 2;", b"-16 -4 -1 16368")
+case("long-literal", "long a = 5L; dword b = 0xFFFFFFFF; long c = -2147483648; print a * 3, \" \", b, \" \", c + 1;", b"15 4294967295 -2147483647")
+case("casts", "int i = -1; print word(i), \" \", byte(i), \" \", sbyte(255), \" \", dword(i), \" \", (long)(word)i;",
+     b"65535 255 -1 4294967295 65535")
+case("int-loop", "int i; long sum = 0; for (i = -3; i <= 3; i++) { sum += i * i * i; } print sum; int j = 10; while (j > -10) { j -= 7; } print \" \", j;", b"0 -11")
+case("long-factorial", "long f = 1; byte n; for (n = 1; n <= 12; n++) { f = f * n; } print f;", b"479001600")
+case("dword-divmod", "dword x = 4000000000; dword y = 7; print x / y, \" \", x % y, \" \", x / 65536, \" \", x >> 16;", b"571428571 3 61035 61035")
+case("int-negate-not", "int a = 300; print -a, \" \", ~a, \" \", !a, \" \", -(-a);", b"-300 -301 0 300")
+case("int-compound", "int a = 100; a -= 250; print a; a *= -3; print \" \", a; a /= 7; print \" \", a; a <<= 2; print \" \", a; a >>= 3; print \" \", a; a %= 10; print \" \", a;",
+     b"-150 450 64 256 32 2")
+case("wide-incdec", "int a = 0; a--; print a; long l = 65535; l++; print \" \", l; dword d = 0; d--; print \" \", d;", b"-1 65536 4294967295")
+case("wide-params-return", "proc long sq(long x) { return x * x; } proc int neg(int v) { return -v; } print sq(-3000), \" \", neg(-200), \" \", sq(neg(5));",
+     b"9000000 200 25")
+case("rec-long", "stack 200; rec proc long fib(byte n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } print fib(12);", b"144")
 case("const-fold", "const K = 3 * 7 + 1; byte x = K; out x + 43;", b"A")
 case("byte-wrap", "byte x = 250; x += 10; out x + 61; x = x - 5; out x;", b"A\xff")
 case("copy-keeps-source", "byte a = 65; byte b = a; byte c = a; out a, b, c;", b"AAA")
@@ -310,6 +422,9 @@ def main():
     pairs16 = [(0, 0), (1, 0), (300, 7), (7, 300), (65535, 1), (1000, 1000), (12345, 678), (65535, 65535), (256, 255), (4660, 3)]
     if not grid("word-grid", pairs16, 16, BYTE_OPS):
         fails += 1
+    for gname, typ, vals in GRIDS:
+        if not typed_grid(gname, typ, vals, ALL_OPS):
+            fails += 1
     errors = [
         ("err-undeclared", "x = 1;", "not declared"),
         ("err-redeclared", "byte x; byte x;", "already declared"),
@@ -339,7 +454,7 @@ def main():
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1
-    total = len(CASES) + 3 + len(errors) + len(DIAGS)
+    total = len(CASES) + 3 + len(errors) + len(DIAGS) + len(GRIDS)
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

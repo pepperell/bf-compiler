@@ -37,11 +37,13 @@ struct StmtRange {
 
 struct Symbol {
     std::string name;
-    int64_t     cell;       // absolute tape cell (first cell for words and arrays)
+    int64_t     cell;       // absolute tape cell (first cell for wide values and arrays)
     int         cells;      // cells occupied
-    char        kind;       // 'b' byte, 'w' word, 'a' byte array
+    char        kind;       // 'b' 1 byte, 'w' 2 bytes, 'l' 4 bytes, 'p' pointer, 'a' array
     int         count;      // elements for an array, else 1
     std::string scope;      // "" for globals, else the procedure name
+    int         elem = 1;   // bytes per value (per element for arrays)
+    bool        is_signed = false;
 };
 
 struct Result {
@@ -53,6 +55,8 @@ struct Result {
     std::vector<std::string> files;      // file names by index (0 = the main file)
     int64_t                 cells_used = 0;
     int64_t                 sp_cell = -1;    // trampoline stack pointer cell, -1 if no rec procs are used
+    int64_t                 heap_cell = -1;  // cell of heap byte 0's data, -1 without a heap (5 cells per byte)
+    int                     heap_size = 0;   // bytes
     bool ok() const { return errors.empty(); }
 };
 
