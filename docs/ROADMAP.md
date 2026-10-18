@@ -795,7 +795,8 @@ grids and the fuzzer clean.
   `c >= 0` needs only `a`'s sign, and then adds a constant to `P0`; a negative one
   starts `P0` at `-a` as well. A power of two whose shift is a whole number of bytes is
   that shift (`mulshr(a, 4096, 12)` is `a`, `mulshr(a, 256, 16)` a byte move), 0 gives
-  0 and `k = 0` is `*`.
+  0 and `k = 0` is `*` (since the review: the multiply loop for 16 and 32 bits, the byte
+  product `*` uses for bytes).
 - `multiply_block` frees its cells without clearing them: after the loop, as written or
   in one step, everything but `P` and `A` is zero, and `take` empties `P`. That saved a
   `[-]` (an IR instruction) per cell of the block and makes `*` cheaper too.
@@ -933,6 +934,80 @@ Found along the way:
   `x[- y[- d+ t+] t[- y+]]` with `y` = 0 and `d` past the end of the tape faults in the
   JIT and the interpreter where the program as written does not touch `d`. This was so
   before; not fixed.
+
+**Review fixes.** A sweep of `mulshr(a, b, k)` at every `k` from 0 to `2 * bits + 6`, every
+type, for two variables and 14 constants (-577, -256, -100, -3, -2, -1, 2, 3, 5, 7, 77,
+128, 256, 4096), each the IR instructions and commands of the program less the same
+program with `r = a;`, found the phase larger than ee5c656 at many counts and slower at
+some. Fixed:
+
+- From `k = 8n` up, the bits left after the whole bytes were shifted out by one `shrN`
+  per bit (about 49 IR instructions each at 32 bits). The high half now goes straight
+  from `P` to the result above the whole bytes dropped, then one division of each byte
+  by `2^r` (the remainders moved into the byte below) and a sign fill, as before phase 17
+  (one bit is still a `shrN`, fewer instructions); `k = 16n` is the top byte's sign.
+- Signed with 3 or 4 bytes dropped (32 bits, `k` 17 to 32 and up): the corrections of
+  `P0` were borrow chains whose zero tests went through temporaries past the multiply
+  block, 50 cells from the bytes of `P`, written twice. They now use the loop's scratch
+  cells next to each byte of `P` (zero before the loop; the counter of a byte's
+  subtraction is the third). A complement and increment for the first correction, as the
+  review suggested, measured 5 to 7 IR instructions more than the subtraction with the
+  near cells and saved under 3% of the size at 3 or 4 bytes, so it was not kept.
+- Two variables at `k = 0` on bytes are the byte product of `*` (101 commands against
+  277 for `sbyte`, in the sweep's units), and a constant at `k = 0` runs the multiply
+  loop into the result, as before phase 17 (phase 17 went through `mul_constN`, whose
+  carries into a result not known to be zero cost up to twice the commands: `long`
+  times -577, 4 499 commands against 1 804 now).
+
+Some of the sweep (IR instructions / commands; ee5c656, 10f5975, now):
+
+| | ee5c656 | 10f5975 | now |
+|---|---:|---:|---:|
+| `long`, two variables, k = 12 | 205 / 6 482 | 85 / 5 603 | 85 / 4 215 |
+| `long`, two variables, k = 24 | 168 / 5 717 | 58 / 8 264 | 60 / 4 910 |
+| `long`, two variables, k = 32 | 173 / 6 005 | 62 / 11 993 | 66 / 5 729 |
+| `long`, two variables, k = 39 | 216 / 8 128 | 394 / 23 522 | 108 / 7 723 |
+| `long`, -577, k = 32 | 172 / 5 353 | 45 / 9 210 | 49 / 3 993 |
+| `long`, -577, k = 39 | 215 / 7 476 | 377 / 20 739 | 91 / 5 987 |
+| `dword`, two variables, k = 39 | 111 / 5 665 | 211 / 11 598 | 54 / 4 866 |
+| `int`, two variables, k = 23 | 172 / 3 705 | 226 / 8 689 | 85 / 3 234 |
+| `sbyte`, two variables, k = 15 | 101 / 2 111 | 163 / 4 286 | 59 / 1 698 |
+| `sbyte`, two variables, k = 16 | 81 / 1 290 | 52 / 1 363 | 48 / 1 274 |
+| `byte`, two variables, k = 0 | 30 / 360 | 16 / 283 | 10 / 107 |
+
+Now no count of any type, for the variables or any of the constants, is larger or slower
+than ee5c656. Against 10f5975 a few signed cases are 2 to 4 IR instructions slower (the
+copies through the scratch cells, which the optimiser does not know to be zero, are a
+loop where a fresh temporary's is a multiply-add; copying through temporaries instead
+saved up to 9% of the IR instructions but made some counts larger than ee5c656). The
+instruction count of a signed `mulshr` depends on the signs: `mulshr(a, b, 12)` on
+`long`s is 47 with both positive and 79 with both negative (59 and 71 in 10f5975).
+`tools/bench.py`: `mulshr(long, long, 12)` 6 273 -> 4 885 commands, `mulshr(int, int, 7)`
+1 958 -> 1 888, `3 mulshr in 2 statements` 14 076 -> 12 688, the same IR instructions;
+`raytracer.bfl` 3 616 121 -> 3 598 515 commands, `raytracer_text.bfl` 3 141 253 ->
+3 123 647, `cube.bfl` 250 353 -> 249 537, the rest unchanged.
+
+- Repeated faults at the end of the tape: a loop whose idiom reaches past the end but
+  which as written stops short faulted on every entry (1.4 to 2 us each; a program that
+  enters a 4-byte carry 62 500 times at `--ram 14` took 120 ms against 0 on ee5c656).
+  Each probe now opens with a 5-byte nop; the fault handler turns it into a jump to a stub
+  after the code (`lea rax, [r12+hi]`, `cmp rax, [rbx+80]`, `jae` the loop as written,
+  else back after the nop), with `VirtualProtect` around the write, so that idiom checks
+  the end of the tape, as before phase 17, on every later entry and the others keep no
+  check. That program now takes under a millisecond (`bf --time`, best of 5; the same at
+  `--ram` 10 to 21, outputs identical to ee5c656). Frame times (as above, three rounds
+  each, alternately, fastest): `raytracer.bfl` 31.2 -> 30.4 ms, `raytracer_text.bfl` 12.1
+  -> 12.0, `cube.bfl` 1.30 -> 1.29, `starfield.bfl` 1.07 -> 1.04: the nop costs nothing
+  measurable. `fault-probe-then-runs` in `tests/test.py` is that program at `--ram 14` on
+  every executor, `fault-probe-once` its time on the JIT (under 30 ms; about 100 ms
+  without the patch).
+
+The raytracer's 16 frames rendered headless are identical to 10f5975's. The grids, both
+test suites, `python tests/fuzz.py --bfl 1500 --bf 1000 --seed 730000`, and the review's
+scripts (`mulshr` against Python at every type, count and constant on the JIT, the
+interpreter, `--no-opt`, `BF_NO_IDIOMS` and `BFL_SHARE=0`; signed shifts, division and
+comparisons; every idiom program at `--ram` 3 to 139 against ee5c656) all pass. Not
+done: the optional factor 2 at a whole-byte `k` as a byte move and a doubling.
 
 ### Phase 18: loose ends of phases 11 to 13
 
