@@ -252,13 +252,21 @@ def idiom_cases():
 # A pointer that leaves the tape: every executor must fault at the same cell.  Native code
 # relies on the page after the tape being inaccessible, so the tape ends at a page end.
 FAULT_PROGRAMS = [
-    # name, source, flags, expected stdout, the cell reported (None: the run ends normally)
+    # name, source, flags, expected stdout, the cell reported (None: the run ends normally)[, stdin]
     ("fault-last-cell", ">" * 999 + "+.", ["--ram", "1000"], b"\x01", None),
     ("fault-past-end", ">" * 1000 + "+.", ["--ram", "1000"], b"", 1256),
     ("fault-loop-past-end", "+[>+]", ["--ram", "1000"], b"", 1256),
     ("fault-mul-past-end", ">" * 998 + "+[>>+<<-]", ["--ram", "1000"], b"", 1256),
     ("fault-past-start", "<" * 300 + "+", [], b"", -44),
     ("fault-past-default-ram", ">" * 1048576 + "+", [], b"", 1048832),
+    # a loop of multiply-adds whose counter (read with ',') is 0 runs no pass, so the cells it would add to
+    # are not touched, even past the end; the optimised loop is a multiply-add of the counter, for each
+    # factor (1 is an add of the source, 255 a subtract, others a multiply first) and near and far cells
+    ("fault-mul-of-zero", ",[-" + ">" * 1000 + "+" + "<" * 1000 + "]+++.", ["--ram", "1000"], b"\x03", None, b"\x00"),
+    ("fault-mul-of-zero-factors", ",[-" + ">" * 100 + "-" + ">+++" + "<" * 101 + "]+++.", ["--ram", "100"], b"\x03", None, b"\x00"),
+    ("fault-mul-in-loop", "+[->,[-" + ">" * 1000 + "+>+<" + "<" * 1000 + "]>[-<+>]<<]+++.", ["--ram", "1000"], b"\x03", None, b"\x00"),
+    ("fault-mul-of-one", ",[-" + ">" * 1000 + "+" + "<" * 1000 + "]+++.", ["--ram", "1000"], b"", 1256, b"\x01"),
+    ("fault-mul-wraps-to-zero", ",[-" + ">" * 1000 + "++" + "<" * 1000 + "]+++.", ["--ram", "1000"], b"", 1256, b"\x80"),
 ]
 
 
@@ -272,10 +280,10 @@ def fault_cases():
     def run_all(path, flags, stdin=b""):
         return {label: (lambda r: (r[0], r[1], re.sub(r" [\d.]+ s,", "", r[2].strip())))(run_path(path, stdin, flags + f)) for label, f in modes}
 
-    for name, src, flags, out, cell in FAULT_PROGRAMS:
+    for name, src, flags, out, cell, *stdin in FAULT_PROGRAMS:
         path = os.path.join(tmp, name + ".b")
         open(path, "w").write(src)
-        res = run_all(path, flags)
+        res = run_all(path, flags, stdin[0] if stdin else b"")
         err = "" if cell is None else f"[fault: pointer left the tape (cell {cell})] final cell {cell}"
         ok = all(r == (0 if cell is None else 3, out, err) for r in res.values())
         print(("PASS " if ok else "FAIL ") + name)

@@ -39,6 +39,13 @@ LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
             cr->Rip = (DWORD64)pr->resume;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // a multiply-add of 0, whose loop as written does not run: skip it (41 op ModRM SIB, then disp8 or disp32)
+        uint32_t at = (uint32_t)(rip - c->jit_begin);
+        if ((uint8_t)cr->Rcx == 0 && std::binary_search(c->mul_writes, c->mul_writes + c->n_mul_writes, at)) {
+            int mod = rip[2] >> 6;
+            cr->Rip += 4 + (mod == 1 ? 1 : mod == 2 ? 4 : 0);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
 
     c->fault_addr = (uintptr_t)er->ExceptionInformation[1];
@@ -214,6 +221,8 @@ RunResult Machine::run(const Program& p, bool use_jit) {
         ctx.jit_end = jit.mem + jit.size;
         ctx.probes = jit.probes.data();
         ctx.n_probes = jit.probes.size();
+        ctx.mul_writes = jit.mul_writes.data();
+        ctx.n_mul_writes = jit.mul_writes.size();
     }
 
     // Maps for device-window execution.  Optimised instructions must never run

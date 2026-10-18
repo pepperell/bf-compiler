@@ -91,9 +91,9 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
         case SET:
             if (!cell_write(c, p + x.off, x.arg)) goto oob;
             pc++; break;
-        case MUL:
-            if (!cell_read(c, p + x.target, v) || !cell_read(c, p + x.off, w) ||
-                !cell_write(c, p + x.off, w + v * x.arg)) goto oob;
+        case MUL:                              // of 0: its loop as written does not run, nor touch the cell
+            if (!cell_read(c, p + x.target, v) || (v && (!cell_read(c, p + x.off, w) ||
+                !cell_write(c, p + x.off, w + v * x.arg)))) goto oob;
             pc++; break;
         case MOVE:
             p += x.arg; pc++; break;

@@ -563,9 +563,12 @@ These are the building blocks; knowing them helps read the output and write
   operations are done the statement itself runs, reading those cells; up to two
   statements without such an operation may sit between two that have one. The
   first operation's factors are evaluated before the loop and the last
-  statement after it, with the cell values the compiler knows; the other
-  statements run inside the loop without them. Values known before the loop
-  that no statement in it writes are known again after it. A constant factor
+  statement after it. Each statement of the run runs once, in order, so every
+  statement, inside the loop or after it, starts with the values the compiler
+  knew before the run of the variables no earlier statement of the run writes
+  (a write to an element writes the whole array); reading such a variable costs
+  what its constant would. Values known before the loop that no statement in it
+  writes are known again after it. A constant factor
   is not shared (it is multiplied on its own, as above), nor is an operation that reads a
   variable whose value the compiler knows: a run ends before its statement,
   which can then fold it or use a constant factor, and its result is known. One

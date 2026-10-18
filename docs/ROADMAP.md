@@ -35,7 +35,7 @@ plus the type system, library and tooling they need.
 | 15 | Multiplication as one IR step | 9 |
 | 16 | Planned: shorter trips to operands (placement of temporaries and globals) | 9 |
 | 17 | Cheaper `mulshr`: no shift after the loop, signs as a start value, constant factors | 10, 15 |
-| 18 | Planned: loose ends of phases 11 to 13 | 11, 13 |
+| 18 | Loose ends of phases 11 to 13: device-window profile, dark theme, known values in shared runs | 11, 13 |
 | 19 | Fuzzer coverage of structs, `ref` arrays and `shared proc` | 9 |
 
 One change from the earlier suggestion: better compiler errors move from last to
@@ -477,7 +477,7 @@ minimum, 1 counts as 2, and 0 or less turns it off). Two limits came from review
   factor, and its result stays known: `long k = 100000; long m = 7; long x = k / m; ...`
   had been 256 556 commands shared against 192 358 without sharing, and is now the same.
   The other statements of a run still lose the values the compiler knows, since they run
-  inside the loop.
+  inside the loop. (Phase 18 gives them back.)
 
 Variants measured on the samples (only these four change):
 
@@ -626,6 +626,7 @@ end (phase 12's review) corrected the same thing, so profiling a run that leaves
 now reports the cell it touched, as the JIT does. Still not counted: instructions run
 through the literal program while the pointer can reach the device window
 (`src/interp.cpp`), so such programs under-report, in the UI and in `bf --profile` alike.
+(Phase 18 counts them.)
 
 ### Phase 14: housekeeping
 
@@ -932,7 +933,7 @@ Found along the way:
 - An optimised multiply-add writes its destination even when its source is 0, so
   `x[- y[- d+ t+] t[- y+]]` with `y` = 0 and `d` past the end of the tape faults in the
   JIT and the interpreter where the program as written does not touch `d`. This was so
-  before; not fixed.
+  before; phase 18 fixed it.
 
 ### Phase 18: loose ends of phases 11 to 13
 
@@ -948,6 +949,122 @@ Found along the way:
 
 Done when: each point is fixed with a test or a screenshot check, and the docs no
 longer list it as open.
+
+**Built** in four parts.
+
+**The profiler counts the device window** (`src/machine.cpp`, `src/interp.cpp`,
+`src/profile.h`). `Machine::profile` holds the optimised code's counts followed by the
+literal program's (`Ctx::lit_prof`, which the interpreter uses while it runs the literal
+program), and `profile.h` maps both back to statements through the instructions'
+brainfuck offsets, so `bf --profile` and Run > Profile count them per statement and in
+the totals. A loop writing `LEDS` and the framebuffer registers went from 520 to 22 841
+counted IR instructions, and its `LEDS` line from uncounted to 32%. Test:
+`profile-devices` in `tests/test_lang.py` (the register lines have counts, the rows add
+up to the total).
+
+**A dark theme in the UI** (`src/ui.cpp`, `src/help.cpp`, `src/terminal.cpp`). View >
+Theme: Follow Windows (the default, from `AppsUseLightTheme`, updated on
+`WM_SETTINGCHANGE`), Light or Dark, saved as `theme` in `settings.ini`. Dark covers the
+editor, the imported-file viewer, the generated brainfuck and memory viewers, lists and
+their headers, buttons, combo boxes, the status bar, the menu bar and popup menus
+(uxtheme's ordinals 135 and 136 for the popups; the bar painted on `WM_UAHDRAWMENU` and
+`WM_UAHDRAWMENUITEM`), title bars (`DWMWA_USE_IMMERSIVE_DARK_MODE`), the help window and
+the terminal's default colours. Syntax colours, breakpoint marks and the profiler's heat
+colours have a set per theme; switching keeps the breakpoints, the scroll position and an
+open profile, and the light theme looks as before. Its review found and fixed: breakpoint
+marks were in the undo history, so undo after a theme switch lost a breakpoint that still
+showed (marks are now outside undo, and a debug session reads either theme's mark
+colour); View > Generated brainfuck during a run recompiled the program the machine
+thread was running, and the interpreter then read freed memory (`idiom_thunk` crashed
+within seconds when the framebuffer window was resized): nothing recompiles while a run
+or debug session is on, and the window shows the program that runs; disabled buttons in
+the dark theme are drawn dim.
+
+**Known values in a shared-arithmetic run** (`gen_run` and `run_shared` in
+`src/lang/codegen.cpp`). Each statement of a run runs once and in order, inside the loop
+or after it, so when statement j starts, the cells no earlier statement of the run writes
+still hold what they held before the run (`known_at`: a statement writes its target
+variable, the whole of an array for an element, or a declared variable's cells; writes
+through pointers go to the heap, which has no known values). That knowledge goes back in
+before each statement and each move of a result into H, since the loops before them make
+the compiler forget what it knows; the moves of results into H and out of it
+(`moveN_keep`) keep what is known of the other cells. The loop's own code and a sum's
+shared loop (`shared_terms`) start each pass with what is known before the loop of the
+cells nothing in the loop writes. Reading a known variable in a run now costs what its
+constant does: `long x = a * b + k; long y = x * a - j; n = n + 1; long z = y * b + k - j;
+x = x * z;` with `k`, `j` and `n` known compiles to 256 754 commands, the same as with
+1000, 7, 4 and 993 written in (269 560 before, against 261 989).
+
+The restore after the loop was wrong, but harmlessly: it marked all of H as known zero,
+also the cells holding the earlier results of the last statement, and only the loop of
+the next move (of the last result into H) made the compiler forget it again before
+anything read them. Now H is known only where it is zero, and since that move keeps what
+is known, the restored values reach the statements after the loop. Unchanged: an
+operation that reads a known variable still ends the run before its statement
+(`reads_known`), so no operation inside the loop sees a known value.
+
+Measured on the samples against the commit before (only these four change):
+
+| | commands before | after | IR instructions before | after |
+|---|---:|---:|---:|---:|
+| `raytracer.bfl` (light map and 2 frames) | 3 616 121 | 3 583 669 (-0.9%) | 390 951 700 | 390 587 316 |
+| `raytracer_text.bfl` (light map and 2 frames) | 3 141 253 | 3 092 768 (-1.5%) | 258 495 792 | 258 261 627 |
+| `cube.bfl` (20 frames) | 250 353 | 248 837 (-0.6%) | 119 108 015 | 119 107 365 |
+| `starfield.bfl` (20 frames) | 1 225 020 | 1 224 128 (-0.1%) | 85 663 743 | 85 658 897 |
+
+The `tools/bench.py --only ops` rows are unchanged (they read no known values). Frame
+times, each sample's frame program compiled by both builds and both run by this build,
+alternately, five rounds, the fastest (the machine was shared with other work; `tools/bench.py
+--only frames` on both builds alternately, three rounds each, moved by more than the
+differences): the raytracer 30.9 ms against 31.1 before, `raytracer_text.bfl` 12.1 against
+12.2, `starfield.bfl` 1.05 against 1.08, `cube.bfl` 1.36 against 1.32. The cube executes
+the same IR instructions as before to within 0.001%, 93% of them in two array walks whose
+code did not change; its new code is 2 KB of x64 shorter, which moves those loops. With
+1 to 7 multiply-adds of a zero cell put in front of the program (moving all of its code by
+a few bytes at a time), the build before measured 1.30 to 1.35 ms and this one 1.33 to
+1.37: the cube's frame depends on where its loops land.
+
+Tests: `share-known-in-run` (two inputs: a known variable and an array element read after
+statements of the run that write the array through a runtime index or write the variable)
+and `share-known` (the program above with variables and with constants: the same size and
+output; the build before fails it) in `tests/test_lang.py`. The fuzzer's runs
+(`shared_run`) now give one or two variables constants just before a run in four of ten,
+and some of the plain statements between its statements constants; the run's statements
+read them outside the operations in half of them and in an operation's factor (which
+ends the run) now and then. Measured with a counting build over 300 seeds, the programs
+with a run whose loop keeps nonzero known values went from 16 to 32, those with a run
+ended by a known value from 24 to 64.
+
+**A multiply-add of 0 no longer touches its destination** (`src/interp.cpp`,
+`src/jit.cpp`, `src/machine.cpp`). The optimiser turns a balanced loop into multiply-adds
+of the loop cell, which write their destinations whatever the loop cell holds, where the
+loop as written does not run at all when it is 0: `,[-` then 1000 `>`, `+` and 1000 `<`,
+`]` with input 0 and `--ram 1000` faulted in the JIT and the interpreter and not without
+optimisation (found in phase 17). The interpreter now reads the source first and skips
+the destination when it is 0 (one branch, which also saves the read and write). The JIT
+emits the same code as before, and records where each multiply-add's write (`add` or
+`sub [r12+off], cl` or `al`) starts (`JitCode::mul_writes`); the fault handler, finding a
+fault past the end of the tape at one of them with `cl`, the source, 0, skips the
+instruction (it would add 0) and continues. `cl` and not `al` is tested because the
+product of a non-zero source can be 0 (`d++` with the source 128): the loop as written
+runs then, and faults. Normal runs execute exactly what they did. Tests in
+`tests/test.py`: `fault-mul-of-zero` (factor 1, a 32-bit offset), `-of-zero-factors`
+(255 and 3, 8-bit offsets), `-in-loop` (the loop phase 17 found, inside another),
+`-of-one` and `-wraps-to-zero` (both fault, at the same cell in every executor); the
+build before fails the first three. A remaining difference the other way, not changed:
+the optimiser drops a cell's `+-`, so `>`×1000 `+-` faults only without optimisation.
+
+Found along the way:
+
+- Keeping what is known through every move, not only those of a run (in `move`, whose
+  loop touches only its source and destinations), makes most samples 0.1 to 1.6% smaller
+  (`primes.bfl` 3%), but `hanoi.bfl` and `quicksort.bfl` a few commands larger: `set` on a
+  cell with a known value adds the difference, which is longer than `[-]` and the new value
+  when the difference is large. Not done here; it touches all generated code.
+
+Both test suites pass, `python tests/fuzz.py --bfl 1500 --bf 500 --seed 830000` found
+nothing (981 of the 1 500 programs sharing arithmetic), and the raytracer's 16 frames
+rendered headless (`tools/rt_gif.py`) are identical to the commit before.
 
 ### Phase 19: fuzzer coverage
 

@@ -297,12 +297,11 @@ bool jit_compile(const Program& p, JitCode& out) {
                         cached_src = y.target;
                     }
                     uint8_t m = (uint8_t)y.arg;
+                    if (m != 1 && m != 255) { e.b({0x6B, 0xC1}); e.d8((int8_t)m); } // imul eax, ecx, imm8
+                    out.mul_writes.push_back((uint32_t)e.pos());                   // (JitCode::mul_writes)
                     if (m == 1)        { e.b({0x41, 0x00}); e.r12mem(1, y.off); }  // add [r12+off], cl
                     else if (m == 255) { e.b({0x41, 0x28}); e.r12mem(1, y.off); }  // sub [r12+off], cl
-                    else {
-                        e.b({0x6B, 0xC1}); e.d8((int8_t)m);                        // imul eax, ecx, imm8
-                        e.b({0x41, 0x00}); e.r12mem(0, y.off);                     // add [r12+off], al
-                    }
+                    else               { e.b({0x41, 0x00}); e.r12mem(0, y.off); }  // add [r12+off], al
                     if (y.off == cached_src) cached_src = INT32_MIN;
                     break;
                 }

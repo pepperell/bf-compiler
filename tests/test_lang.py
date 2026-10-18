@@ -551,6 +551,13 @@ case("share-apart", "long a = in; a = a * 1000 - 77777; long b = in; b = b * 300
 case("share-known-values", "long a = in; long b = in; b = b * 1000 + 3; long x = 7; long y = 3; long k = 11; long arr[3]; arr[0] = 5;"
      " x = a * b; arr[2] = b * b; y = x * a + y; print x, \" \", y, \" \", k * 2, \" \", x + 1, \" \", arr[0], \" \", arr[2];",
      b"117039 1521510 22 117040 5 81054009", b"\x0d\x09")
+# inside the loop, a statement knows the values known before the run of the cells no earlier statement
+# of the run writes: k and arr[1] are known until written (arr[i] may be arr[1])
+SHARE_KNOWN_RUN = ("long a = in; long b = in; b = b * 300 + 1; long k = 1000; long j = 7; byte n = 3; long arr[3]; arr[1] = 9; byte i = in;"
+                   " long x = a * b + k; arr[i] = x * a - j; n = n + 1; k = x * b + k - j; long z = k * a + arr[1] + k; x = x * z + n;"
+                   " print x, \" \", arr[0], \" \", arr[1], \" \", k, \" \", z, \" \", n;")
+case("share-known-in-run", SHARE_KNOWN_RUN, b"2113611954 0 83724218 -264827718 -215035986 4", b"AB\x01")
+case("share-known-in-run-other", SHARE_KNOWN_RUN, b"-2070785663 83724218 9 -264827718 -298760195 4", b"AB\x00")
 case("share-in-loop", "long a = in; long b = in; long s = 0; byte i; for (i = 0; i < 5; i++) { if (i == 3) { continue; } long x = a * b; long y = x * a; s += y * b - x * x + x; if (s > 100000000) { break; } a += 1000; }"
      " print s, \" \", a;", b"142508 4049", b"\x31\x17")
 # more operations than one loop runs (16; its pass counter is a single cell): a sum of 300 is cut into
@@ -845,6 +852,34 @@ def share_setting():
     return ok
 
 
+SHARE_KNOWN_SRC = """long a = in; long b = in; b = b * 300 + 1; long k = 1000; long j = 7; byte n = 3;
+long x = a * b + K; long y = x * a - J; n = N; long z = y * b + KJ; x = x * z;
+print x, " ", y, " ", z, " ", n;
+"""
+
+
+def share_known():
+    """Inside a run of statements sharing a multiply, reading variables whose values the compiler knows
+    before the run (k, j, n) costs what the constants cost: the same program with the constants written
+    in compiles to as many commands and prints the same."""
+    sizes, outs = [], []
+    for name, subst in (("vars", ("k", "j", "n + 1", "k - j")), ("consts", ("1000", "7", "4", "993"))):
+        text = SHARE_KNOWN_SRC
+        for key, val in zip(("KJ", "K", "J", "N"), (subst[3], subst[0], subst[1], subst[2])):
+            text = text.replace(key, val)
+        src = os.path.join(TMP, f"share_known_{name}.bfl")
+        open(src, "w", newline="\n").write(text)
+        r = subprocess.run([BF, "--emit", os.path.join(TMP, "share_known.b"), src], capture_output=True, text=True, timeout=60)
+        m = re.search(r"(\d+) commands", r.stdout + r.stderr)
+        sizes.append(int(m.group(1)) if r.returncode == 0 and m else 0)
+        outs.append(subprocess.run([BF, "--quiet-devices", src], input=b"AB", capture_output=True, timeout=60).stdout)
+    ok = 0 < sizes[0] == sizes[1] and outs[0] == outs[1] == b"-61302773 83724218 -34134645 4"
+    print(("PASS " if ok else "FAIL ") + "share-known")
+    if not ok:
+        print(f"   sizes {sizes}, outputs {outs}")
+    return ok
+
+
 def shared_fuzz():
     """A few programs of tests/fuzz.py --focus shared: random BFL with shared procedures, checked against
     the model and against the same program with those procedures inlined."""
@@ -888,6 +923,8 @@ def main():
     if not share_map():
         fails += 1
     if not share_setting():
+        fails += 1
+    if not share_known():
         fails += 1
     if not profile_devices():
         fails += 1

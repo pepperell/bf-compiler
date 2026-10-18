@@ -7,7 +7,8 @@ Two generators:
        compares, casts, constants, sizeof, arrays in cells and in the heap,
        pointers, loops with break and continue, procedures (inlined, rec and
        shared), and runs of statements with several wide multiplies or divisions
-       of one kind (which the compiler shares).  Structs: up to three types with
+       of one kind (which the compiler shares), some reading variables given
+       constants just before or inside the run.  Structs: up to three types with
        integer fields, array fields and earlier structs (and arrays of them) as
        fields; struct variables, arrays of structs in cells and in the heap,
        pointers to them (p->f, (*p).f, p[i].f), fields read and written, whole
@@ -1534,19 +1535,35 @@ class Gen:
     def shared_run(self, cx):
         """A few assignments and declarations whose expressions use operations of one kind and width
         (the compiler runs them through one copy of the routine), sometimes with a plain statement
-        between them; later ones read what earlier ones wrote."""
+        between them; later ones read what earlier ones wrote.  Some variables get constants just before
+        the run or between its statements, so the compiler knows their values: the run's statements read
+        them outside the operations (which fold inside the loop) and now and then in an operation's factor
+        (which ends the run before it)."""
         r = self.r
         t = r.choice(["word", "int", "dword", "long", "long"])
         op = r.choice(["*", "*", "*", "m", "m", "/", "%"])
         k = r.choice([0, 3, 8, 12, 16, 20, 31])
-        res = []
+        res, known = [], []
+        if cx.targets and r.random() < 0.4:
+            for v in r.sample(cx.targets, min(len(cx.targets), r.choice([1, 1, 2]))):
+                res.append(Assign(VarL(v), "=", self.fit(self.lit(), self.vt[v])))
+                known.append(v)
         for _ in range(r.randint(1, 4)):
             if r.random() < 0.15 and cx.targets:
                 v = r.choice(cx.targets)
-                res.append(Assign(VarL(v), "=", self.fit(self.expr(cx, 1), self.vt[v])))
+                lit = r.random() < 0.4
+                res.append(Assign(VarL(v), "=", self.fit(self.lit() if lit else self.expr(cx, 1), self.vt[v])))
+                if lit:
+                    known.append(v)
             mine = [v for v in cx.targets if self.vt[v] == t]
             arrs = [a for a in cx.warrs if a[1] == t]
             e = self.wide_expr(cx, t, op, k)
+            if known and r.random() < 0.5:
+                e = Bin(r.choice("+-^"), e, Cast(t, Var(r.choice(known))))
+            if known and r.random() < 0.15:
+                f = Cast(t, Var(r.choice(known)))
+                x = Cast(t, self.expr(cx, 2))
+                e = Bin(r.choice("+-"), e, MulShr(f, x, k) if op == "m" else Bin(op, f, x) if r.random() < 0.5 else Bin(op, x, f))
             q = r.random()
             if q < 0.35 or not mine:
                 name = self.fresh("l")

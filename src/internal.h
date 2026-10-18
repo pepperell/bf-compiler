@@ -42,6 +42,8 @@ struct Ctx {
     const uint8_t* jit_end;
     const struct JitProbe* probes;    // JitCode::probes, by address
     size_t         n_probes;
+    const uint32_t* mul_writes;   // JitCode::mul_writes
+    size_t         n_mul_writes;
     volatile int32_t halt_req;
     // debugger (interpreter only)
     const uint8_t* bp;            // per-pc breakpoint flags, or nullptr
@@ -116,6 +118,10 @@ struct JitCode {
     void*    exit_slow = nullptr;
     std::vector<const void*> labels;
     std::vector<JitProbe> probes;    // by address
+    // Where each multiply-add writes its destination (add or sub [r12+off], cl or al; cl holds the source),
+    // as offsets from mem in increasing order.  With a source of 0 it changes nothing, and the loop it
+    // came from does not run: a fault past the end of the tape there skips the instruction.
+    std::vector<uint32_t> mul_writes;
     std::string error;
     ~JitCode();
 };

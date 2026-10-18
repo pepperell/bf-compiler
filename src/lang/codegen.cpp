@@ -621,6 +621,13 @@ struct Gen {
         add(c + from, -1);
     }
     void moveN(int64_t s, int64_t dst, int n, int sign = 1) { for (int k = 0; k < n; k++) move(s + k, {{dst + k, sign}}); }
+    // moveN, keeping what is known of the other cells: its loops touch only s and dst
+    void moveN_keep(int64_t s, int64_t dst, int n) {
+        auto before = known;
+        moveN(s, dst, n);
+        for (auto& kv : before)
+            if ((kv.first < s || kv.first >= s + n) && (kv.first < dst || kv.first >= dst + n)) known.insert(kv);
+    }
     void addN(int64_t dst, int64_t s, int n) {         // dst += s; s consumed
         if (known0N(dst, n)) { moveN(s, dst, n); return; }
         for (int k = 0; k < n - 1; k++) {
@@ -1060,8 +1067,8 @@ struct Gen {
     // acc (kd.n cells) += sign * e for every operation, through one copy of the routine.  The hooks generate
     // code around operation i: before(i) and loaded(i) before and after its factors are evaluated, after(i)
     // once its result is in acc.  fresh: acc is zero before every operation (after(i) empties it).
-    // written: the cells, other than acc and temporaries, that the hooks write; they may add to it as they run.
-    // at: the statement the loop's own code is mapped to (a continuation), or null.
+    // written: the cells, other than acc and temporaries, that the hooks write inside the loop (after(m - 1)
+    // runs after it).  at: the statement the loop's own code is mapped to (a continuation), or null.
     struct SharedHooks {
         std::function<void(int)> before, loaded, after;
         std::vector<std::pair<int64_t, int64_t>>* written = nullptr;
@@ -1073,8 +1080,17 @@ struct Gen {
         if (m < 2 || m > SHARE_MAX) internal("shared routine for " + std::to_string(m) + " operations");
         bool pos = false, neg = false;
         for (const SharedOp& o : ops) (o.sign > 0 ? pos : neg) = true;
-        auto snapshot = known;
+        // What is known before the loop of the cells nothing in it writes (neither the routine's cells, acc,
+        // nor what the hooks write) holds on every pass and after the loop: the code inside starts with it.
+        std::unordered_map<int64_t, int> kept;
         int64_t base = next_free;
+        for (auto& kv : known) {
+            if (kv.first >= base || (kv.first >= acc && kv.first < acc + n)) continue;
+            bool w = false;
+            if (h.written) for (auto& r : *h.written) if (kv.first >= r.first && kv.first < r.second) w = true;
+            if (!w) kept.insert(kv);
+        }
+        auto keep = [&] { for (auto& kv : kept) known.insert(kv); };
         int64_t cnt = tmp(), F = tmpN(m - 1), NEG = pos && neg ? tmp() : -1;
         int64_t P = kd.op == 'm' && !(h.fresh && !neg) ? tmpN(n) : -1, X = tmpN(n), Y = tmpN(n);   // P: mulshr's result
         auto load = [&](int i) {                       // the factors of operation i into X and Y
@@ -1091,6 +1107,7 @@ struct Gen {
         set(cnt, m);
         set(F, 1);
         open(cnt);
+        keep();
         {
             const Type* t = conv_type(ops[0].e->type);
             // the result r of the routine: acc += r, acc -= r, or by the sign flag
@@ -1121,7 +1138,7 @@ struct Gen {
             std::vector<std::pair<size_t, size_t>> text, ranges;
             for (int i = 0; i < m - 1; i++) {
                 size_t t0 = out.size(), r0 = res.stmts.size();
-                if_nonzero(F + i, [&] { if (h.after) h.after(i); load(i + 1); if (i + 1 < m - 1) add(F + i + 1, 1); });
+                if_nonzero(F + i, [&] { keep(); if (h.after) h.after(i); load(i + 1); if (i + 1 < m - 1) add(F + i + 1, 1); });
                 go(cnt);
                 text.emplace_back(t0, out.size());
                 ranges.emplace_back(r0, res.stmts.size());
@@ -1142,12 +1159,7 @@ struct Gen {
         }
         close();
         if (h.at) end_stmt();
-        for (auto& kv : snapshot) {                    // what the loop left alone is known again
-            if (kv.first >= base || (kv.first >= acc && kv.first < acc + n)) continue;
-            bool w = false;
-            if (h.written) for (auto& r : *h.written) if (kv.first >= r.first && kv.first < r.second) w = true;
-            if (!w) known[kv.first] = kv.second;
-        }
+        keep();                                        // what the loop left alone is known again
         for (int64_t c = cnt + 1; c < next_free; c++) if (trackable(c)) known[c] = 0;
         if (h.after) h.after(m - 1);
         releaseN(Y, n); releaseN(X, n);
@@ -1298,20 +1310,49 @@ struct Gen {
             slots = std::max(slots, ops[j].size());
         }
         int64_t H = tmpN((int)(slots * n)), acc = tmpN(n);
-        std::vector<std::pair<int64_t, int64_t>> written;
+        int64_t H_end = H + (int64_t)(slots * n);
+        // The cells each statement writes.  Writes through pointers go to the heap, which has no known values.
+        std::vector<std::vector<std::pair<int64_t, int64_t>>> writes(ops.size());
+        std::unordered_set<std::string> declared;
+        for (size_t j = 0; j < ops.size(); j++) {
+            const Stmt& s = *v[i + j];
+            if (s.kind == Stmt::Decl) {
+                declared.insert(s.name);
+                writes[j].emplace_back(prealloc[&s], prealloc[&s] + std::max(s.vtype->size, 1));
+                continue;
+            }
+            const Expr* root = s.target.get();
+            while (root->kind == Expr::Index || (root->kind == Expr::Field && !root->arrow)) root = root->a.get();
+            if (root->kind == Expr::Name && declared.count(root->text)) continue;    // its cells are in already
+            if (const Var* tv = target_var(*s.target))
+                writes[j].emplace_back(tv->cell, tv->cell + (tv->count >= 0 ? array_total(*tv) : tv->size()));
+        }
+        // Written inside the loop: H, and what the statements generated there write, those before the
+        // statement of the last operation (it and those after it are generated after the loop).
+        size_t last = stmt_of.back();
+        std::vector<std::pair<int64_t, int64_t>> written{{H, H_end}};
+        for (size_t j = 0; j < last; j++) written.insert(written.end(), writes[j].begin(), writes[j].end());
+        // Each statement runs once, in order, inside the loop or after it: when statement j starts, the cells
+        // no earlier statement writes hold what they held before the run.  (Its loops make the compiler
+        // forget what it knows, so this goes back in before each statement and each move into H.)
+        auto before = known;
+        auto known_at = [&](size_t j) {
+            for (auto& kv : before) {
+                int64_t c = kv.first;
+                if (c >= acc || (c >= H && c < H_end)) continue;
+                bool w = false;
+                for (size_t e = 0; e < j && !w; e++) for (auto& r : writes[e]) if (c >= r.first && c < r.second) w = true;
+                if (!w) known.insert(kv);
+            }
+        };
         auto gen_one = [&](size_t j) {                 // statement i + j, its operations ready in H
             const Stmt& s = *v[i + j];
+            known_at(j);
             next_is_cont = !ops[j].empty();
             gen_stmt(s);
             for (const Expr* x : ops[j]) {             // not read after all: their cells are cleared
                 auto it = precomputed.find(x);
                 if (it != precomputed.end()) { clearN(it->second, n); precomputed.erase(it); }
-            }
-            if (s.kind == Stmt::Decl) { const Var* dv = find_var(s.name); written.emplace_back(dv->cell, dv->cell + dv->size()); }
-            else {
-                LV lv = lvalue(*s.target);
-                if (lv.kind == LV::Cells) written.emplace_back(lv.cell, lv.cell + lv.size());
-                else if (lv.kind == LV::Elem) written.emplace_back(lv.arr->cell, lv.arr->cell + array_total(*lv.arr));
             }
         };
         SharedHooks h;
@@ -1323,8 +1364,11 @@ struct Gen {
         h.after = [&](int o) {
             size_t j = stmt_of[(size_t)o];
             int64_t cells = H + (int64_t)slot_of[(size_t)o] * n;
+            if (o == (int)flat.size() - 1)             // after the loop: H holds the earlier results of this statement
+                for (int64_t c = cells; c < H_end; c++) known[c] = 0;
+            known_at(j);
             begin_stmt(*v[i + j], true);
-            moveN(acc, cells, n);
+            moveN_keep(acc, cells, n);
             end_stmt();
             precomputed[flat[(size_t)o].e] = cells;
             if (slot_of[(size_t)o] + 1 < ops[j].size()) return;
@@ -2036,7 +2080,7 @@ struct Gen {
         int n = sz(e);
         if (!precomputed.empty()) {                    // computed by a shared routine (gen_run)
             auto it = precomputed.find(&e);
-            if (it != precomputed.end()) { moveN(it->second, dst, n); precomputed.erase(it); return; }
+            if (it != precomputed.end()) { moveN_keep(it->second, dst, n); precomputed.erase(it); return; }
         }
         if (auto v = fold(e, true)) { for (int k = 0; k < n; k++) add(dst + k, (*v >> (8 * k)) & 255); return; }
         switch (e.kind) {
