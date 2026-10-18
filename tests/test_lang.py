@@ -255,6 +255,36 @@ def typed_grid(name, typ, values, ops, shift_counts=(0, 1, 3, 7, 15, 31)):
     return check(name, "\n".join(lines), exp.encode(), stdin)
 
 
+def mulshr_grid(name, typ, values, counts=(0, 1, 7, 8, 9, 12, 15, 16, 17, 24, 31, 32, 33, 47, 48, 63, 64, 70)):
+    """r = mulshr(a, b, k) for every pair of values and every constant count: one loop over the pairs,
+    read with `in`, so each count is one statement.  The model: the exact product, shifted right."""
+    bits, signed = TYPES[typ]
+    nb = bits // 8
+    def load(var):
+        return f"{var} = in;" + "".join(f" {var} = {var} * 256 + in;" for _ in range(nb - 1))
+    def raw(v):
+        u = v & ((1 << bits) - 1)
+        return bytes((u >> (8 * (nb - 1 - i))) & 255 for i in range(nb))
+    lines = [f"{typ} a; {typ} b; {typ} r; byte n = in;", "while (n) {", "    n--; " + load("a") + " " + load("b")]
+    for k in counts:
+        lines.append(f'    r = mulshr(a, b, {k}); print r, " ";')
+    lines += ['    out "\\n";', "}"]
+    pairs = [(a, b) for a in values for b in values]
+    stdin = bytes([len(pairs)]) + b"".join(raw(a) + raw(b) for a, b in pairs)
+    exp = "".join("".join(str(wrap((a * b) >> k, bits, signed)) + " " for k in counts) + "\n" for a, b in pairs)
+    return check(name, "\n".join(lines), exp.encode(), stdin)
+
+
+MULSHR_GRIDS = [
+    ("mulshr-byte", "byte", [0, 1, 3, 127, 128, 200, 255]),
+    ("mulshr-sbyte", "sbyte", [0, 1, -1, 5, -7, 127, -128]),
+    ("mulshr-word", "word", [0, 1, 255, 256, 4096, 40000, 65535]),
+    ("mulshr-int", "int", [0, 1, -1, 300, -4096, 32767, -32768]),
+    ("mulshr-dword", "dword", [0, 1, 255, 65536, 123456789, 4294967295]),
+    ("mulshr-long", "long", [0, 1, -1, 4096, -5200, 2147483647, -2147483648]),
+]
+
+
 ALL_OPS = ["+", "-", "*", "/", "%", "&", "|", "^", "==", "!=", "<", "<=", ">", ">=", "&&", "||", "<<", ">>"]
 GRIDS = [
     ("grid-sbyte", "sbyte", [0, 1, -1, 7, -128, 100, -3]),
@@ -424,6 +454,12 @@ case("for-break-skips-step", "byte c; for (c = 0; c < 5; c++) { if (c == 2) { br
      " rec proc word f(byte n) { byte d; for (d = 0; d < 2; d++) { return 7; } if (n != 0) { f(n - 1); } return 9; } print f(1);",
      b"2 4 7")
 case("mul-const", "byte a = in; print a * 10, \" \", 7 * a;", b"230 161", b"\x17")
+# mulshr: the exact product shifted right (the grids cover every type and count)
+case("mulshr-const", "print mulshr(-3, 5, 1), \" \", mulshr(100000, 100000, 20), \" \", mulshr(4294967295, 4294967295, 64), \" \", mulshr(-2147483648, 4294967295, 70);", b"-8 9536 0 -1")
+case("mulshr-types", "byte b = in; int i = int(in) - 300; word w = in; w = w * 256 + in; print mulshr(i, b, 4), \" \", mulshr(w, 300, 8), \" \", mulshr(b, b, 3);", b"-3200 302 136", b"\xc8\x2c\x01\x02")
+case("mulshr-order", "int r = mulshr(int(in) - 100, int(in), 2); print r;", b"-1125", b"\x0a\x32")
+case("mulshr-known", "long a = 123456; long b = -654321; long c = mulshr(a, b, 12); byte n = in; long d = 0; while (n) { n--; d = mulshr(a, b, 12); d += mulshr(a, 3, 1); } print c, \" \", d;", b"-19721644 -19536460", b"\x01")
+case("mulshr-rec", "rec proc long f(long n) { if (n == 0) { return 1; } return f(n - 1) * 3; } print mulshr(f(5), f(4) - 100, 3);", b"-578")
 case("div-zero", "byte a = in; print a / 0, \" \", a % 0;", b"0 23", b"\x17")   # defined as 0 and a
 case("array-const-index", "byte a[4]; a[0] = 'a'; a[1] = a[0] + 1; a[3] = a[1] + 2; a[2] = a[3] - 1; out a[0], a[1], a[2], a[3];", b"abcd")
 case("array-runtime", """
@@ -664,6 +700,9 @@ def main():
     for gname, typ, vals in GRIDS:
         if not typed_grid(gname, typ, vals, ALL_OPS):
             fails += 1
+    for gname, typ, vals in MULSHR_GRIDS:
+        if not mulshr_grid(gname, typ, vals):
+            fails += 1
     errors = [
         ("err-undeclared", "x = 1;", "not declared"),
         ("err-redeclared", "byte x; byte x;", "already declared"),
@@ -684,6 +723,10 @@ def main():
         ("err-unterminated-string", 'out "abc;', "unterminated string"),
         ("err-string-in-expr", 'byte x = "a";', "cannot convert 'byte*' to 'byte'"),
         ("err-pulse-var", "byte x; pulse x;", "not a register"),
+        ("err-mulshr-count", "byte a = in; byte k = 3; byte r = mulshr(a, a, k);", "must be a constant"),
+        ("err-mulshr-negative", "byte a = in; byte r = mulshr(a, a, -1);", "cannot be negative"),
+        ("err-mulshr-pointer", "heap byte buf[4]; byte* p = buf; byte r = mulshr(p, 2, 1);", "needs two integers"),
+        ("err-mulshr-keyword", "byte mulshr;", "keyword"),
     ]
     for name, src, frag in errors:
         if not check_error(name, src, frag):
@@ -692,7 +735,7 @@ def main():
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1
-    total = len(CASES) + 6 + len(errors) + len(DIAGS) + len(GRIDS) + n_samples
+    total = len(CASES) + 6 + len(errors) + len(DIAGS) + len(GRIDS) + len(MULSHR_GRIDS) + n_samples
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

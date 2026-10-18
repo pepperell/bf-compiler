@@ -382,6 +382,9 @@ EXPRESSIONS
   0 or 1.  Division by zero gives 0, the remainder gives the dividend.
   Numbers with an L suffix (5L) are long.
   && and || only evaluate the right side when needed.
+  mulshr(a, b, k): (a * b) >> k for fixed point, with the exact double-width
+  product rounded down; k is a constant.  Cheaper than * then >>; the loop runs
+  once per bit of b, so put the smaller operand second.
 
 ALLOCATION AND STRINGS
   Node* n = new Node;  int* a = new int[100];  byte* b = alloc(64);  free(n);

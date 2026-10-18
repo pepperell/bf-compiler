@@ -3,7 +3,7 @@
 
 Two generators:
 
-  bfl  random BFL programs over every integer type: arithmetic, shifts,
+  bfl  random BFL programs over every integer type: arithmetic, shifts, mulshr,
        compares, casts, constants, arrays in cells and in the heap, pointers,
        loops with break and continue, inlined and recursive procedures.  Each
        program is also run by a model of BFL written here in Python, the
@@ -435,6 +435,29 @@ class Bin(Expr):
         if op in CMP:
             return V("byte", False, compare(op, a, b))
         return V(c, False, arith(op, a, b, c))
+
+
+class MulShr(Expr):
+    """mulshr(a, b, k): a and b at their common type, the exact product shifted right by the constant k
+    (rounding down), wrapped to that type; two constants fold exactly."""
+    EF = ("a", "b")
+
+    def __init__(self, a, b, k):
+        self.a, self.b, self.k = a, b, k
+
+    def emit(self):
+        return f"mulshr({self.a.emit()}, {self.b.emit()}, {self.k})"
+
+    def ev(self, m):
+        A = self.a.ev(m)
+        B = self.b.ev(m)
+        if A.const and B.const:
+            r = (A.v * B.v) >> self.k
+            if r > 0xFFFFFFFF or r < -0x80000000:
+                r = wrap(r, "dword")
+            return V(const_type(r), True, r)
+        c = common(A, B)
+        return V(c, False, wrap((wrap(A.v, c) * wrap(B.v, c)) >> self.k, c))
 
 
 class Call(Expr):
@@ -903,9 +926,12 @@ class Gen:
             a = self.expr(cx, depth + 1)
             b = self.count(cx, depth) if op in ("<<", ">>") else self.expr(cx, depth + 1)
             return Bin(op, a, b)
-        if k < 0.8:
+        if k < 0.71:
+            kk = r.choice([0, 1, 4, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32, 33, 40, 48, 63, 64, 65, 100])
+            return MulShr(self.expr(cx, depth + 1), self.expr(cx, depth + 1), kk)
+        if k < 0.82:
             return Cast(r.choice(TNAMES), self.expr(cx, depth + 1))
-        if k < 0.9:
+        if k < 0.91:
             return Un(r.choice("-~!"), self.expr(cx, depth + 1))
         if cx.pure and depth < 2:
             p = r.choice(cx.pure)

@@ -386,8 +386,41 @@ struct Sema {
             return t;
         }
         case Expr::Binary: return binary(e, cond);
+        case Expr::MulShr: return mulshr(e);
         }
         return T.error();
+    }
+
+    // mulshr(a, b, k): a and b converted to their common type, multiplied exactly and shifted right by
+    // the constant k (rounding down); the result has that type.  Two constants fold exactly.
+    const Type* mulshr(Expr& e) {
+        const Type* ta = expr(*e.a);
+        const Type* tb = expr(*e.b);
+        Expr& k = *e.args[0];
+        const Type* tk = expr(k);
+        if (ta->is_error() || tb->is_error() || tk->is_error()) return T.error();
+        if (!ta->is_int() || !tb->is_int()) { error(e.pos, "mulshr needs two integers ('" + ta->name + "' and '" + tb->name + "')"); return T.error(); }
+        if (!tk->is_int() || !k.is_const) { error(k.pos, "the shift count of mulshr must be a constant"); return T.error(); }
+        if (k.cval < 0) { error(k.pos, "the shift count of mulshr cannot be negative"); return T.error(); }
+        e.value = std::min<int64_t>(k.cval, 64);
+        const Type* c = common(*e.a, *e.b);
+        e.optype = c;
+        if (e.a->is_const && e.b->is_const) {
+            int64_t x = e.a->cval, y = e.b->cval;           // each in [-2^31, 2^32), so |x * y| < 2^64
+            bool negp = (x < 0) != (y < 0) && x && y;
+            uint64_t m = (uint64_t)(x < 0 ? -x : x) * (uint64_t)(y < 0 ? -y : y);
+            uint64_t qm = e.value >= 64 ? 0 : m >> e.value;
+            int64_t v;
+            if (!negp) v = qm > 0xFFFFFFFFull ? (int64_t)(qm & 0xFFFFFFFFull) : (int64_t)qm;
+            else {
+                bool rest = e.value >= 64 ? m != 0 : (m & ((1ull << e.value) - 1)) != 0;
+                v = -(int64_t)qm - (rest ? 1 : 0);             // floor of a negative quotient
+                if (v < -0x80000000ll) v = wrap(v, T.u32());
+            }
+            e.is_const = true; e.cval = v;
+            return const_type(v);
+        }
+        return c;
     }
 
     const Type* binary(Expr& e, bool cond) {

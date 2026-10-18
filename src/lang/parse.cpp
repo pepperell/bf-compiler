@@ -167,7 +167,7 @@ struct Parser {
     static bool is_keyword(const std::string& w) {
         static const char* kws[] = {"byte", "sbyte", "word", "int", "dword", "long", "string", "const", "proc", "rec", "shared", "ref",
                                     "if", "else", "while", "for", "break", "continue", "out", "print", "pulse", "halt", "asm",
-                                    "in", "input", "return", "stack", "heap", "struct", "import", "sizeof", "new", "null", nullptr};
+                                    "in", "input", "return", "stack", "heap", "struct", "import", "sizeof", "new", "null", "mulshr", nullptr};
         for (const char** k = kws; *k; k++) if (w == *k) return true;
         return false;
     }
@@ -243,6 +243,13 @@ struct Parser {
             if (is_ident("sizeof")) {
                 advance(); expect("(");
                 auto e = mk(Expr::Sizeof, p); e->ts = type_spec(); expect(")");
+                return e;
+            }
+            if (is_ident("mulshr")) {          // mulshr(a, b, k): the exact product shifted right
+                advance(); expect("(");
+                auto e = mk(Expr::MulShr, p);
+                e->a = expr(); expect(","); e->b = expr(); expect(",");
+                e->args.push_back(expr()); expect(")");
                 return e;
             }
             if (is_ident("new")) {

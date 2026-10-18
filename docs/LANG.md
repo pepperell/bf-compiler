@@ -28,7 +28,7 @@ a walking idiom described at the end.
 - Strings `"text"` appear only in `out` and `print`.
 - Identifiers: letters, digits and `_`, case-sensitive. A name may not be a
   register name or a keyword: `byte word const proc rec ref return stack if else
-  while for break continue out print pulse halt asm in input`.
+  while for break continue out print pulse halt asm in input mulshr`.
 
 ## Types and declarations
 
@@ -319,7 +319,43 @@ Rules:
   true. `&&` and `||` evaluate their right operand only when needed.
 - `in` reads one byte; `input` reads a decimal number as a `word`. Both have
   side effects and are evaluated where they appear.
+- **`mulshr(a, b, k)`** multiplies and shifts in one step, for fixed-point
+  arithmetic (see below).
 - `print` writes any integer type in decimal, with a `-` for negative values.
+
+## Fixed point: mulshr
+
+```
+long px = ox + mulshr(dx, t, 12);       // ox + d * t, with d in units of 1/4096
+int  x1 = mulshr(x, cosine, 10) + mulshr(z, sine, 10);   // the product needs 32 bits, the result 16
+```
+
+`mulshr(a, b, k)` is `(a * b) >> k` computed exactly:
+
+- `a` and `b` are converted to their common type, as for `*` (a constant takes the
+  other operand's type when it fits); the result has that type.
+- The product is exact: twice the type's width, signed when the type is signed,
+  so nothing wraps before the shift. The low bytes of the shifted product are the
+  result, wrapped to the type like any other value.
+- The shift rounds down (towards minus infinity, as `>>` does on a signed value):
+  `mulshr(-3, 5, 1)` is -8.
+- `k` must be a constant, 0 or more. `mulshr(a, b, 0)` is `a * b`. A count of the
+  width or more takes the high part of the product (`mulshr(x, y, 32)` on `long`s is
+  its top 32 bits); from twice the width up every bit is shifted out and the result
+  is 0, or -1 for a negative product.
+- So whenever `a * b` does not overflow, `mulshr(a, b, k)` equals `(a * b) >> k`;
+  when it does, `mulshr` still gives the right answer. Two constants fold exactly.
+
+Cost: a shift-and-add loop that runs once per bit of `|b|`, so put the operand with
+the smaller magnitude second. Each step adds `|a|`, shifted, into an accumulator that
+keeps only the bytes that survive the shift (and one below them for the bits): after
+each byte of `b` whose bits are all below the shift, the accumulator's low byte is
+final and is dropped; the last `k % 8` bits are one pass of byte divisions. A Q12
+product of two `long`s runs about 1 100 IR instructions and compiles to about 12 000
+commands, against 1 900 and 18 000 for `(a * b) >> 12` (`tools/bench.py`); for `int`
+it is 490 and 4 900 against 690 and 10 000, since `>>` on an `int` is unrolled bit by
+bit. A constant factor runs the same loop, so it gains less: `(a * 45) >> 12` is
+already cheap to run, though `mulshr` is still the smaller code.
 
 ## Registers
 

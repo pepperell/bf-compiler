@@ -486,7 +486,7 @@ COLORREF tk_colour(Tk k) {
 bool bfl_word(const std::wstring& w, Tk& k) {
     static const std::set<std::wstring> types = {L"byte", L"sbyte", L"word", L"int", L"dword", L"long", L"string"};
     static const std::set<std::wstring> kws = {L"const", L"proc", L"rec", L"ref", L"if", L"else", L"while", L"for", L"break", L"continue",
-        L"out", L"print", L"pulse", L"halt", L"asm", L"in", L"input", L"return", L"stack", L"heap", L"struct", L"import", L"sizeof", L"new", L"null"};
+        L"out", L"print", L"pulse", L"halt", L"asm", L"in", L"input", L"return", L"stack", L"heap", L"struct", L"import", L"sizeof", L"new", L"null", L"mulshr"};
     static std::set<std::wstring> regs;
     if (regs.empty()) for (const RegisterInfo& r : register_map()) regs.insert(widen(r.name));
     if (types.count(w)) { k = Tk::Type; return true; }

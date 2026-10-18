@@ -806,6 +806,129 @@ struct Gen {
             shlN(a, n);
         }
     }
+    // dst (w cells) += src (m <= w cells, consumed).  The IR optimiser runs a carry chain of up to 5
+    // cells (incN) as one step; below the top 5 cells the carry ripples through a cell instead.
+    void add_wide(int64_t dst, int w, int64_t src, int m) {
+        auto inc_carry = [&](int64_t x, int64_t cy) {  // x += 1, cy += 1 when x wraps
+            add(x, 1);
+            int64_t z = tmp(); iszero8(x, z);
+            if_nonzero(z, [&] { add(cy, 1); });
+            release(z);
+        };
+        int64_t c = -1;
+        for (int i = 0; i < w; i++) {
+            if (w - i <= 5) {
+                if (c >= 0) { open(c); add(c, -1); incN(dst, w, i); close(); }
+                for (int j = i; j < m; j++) { open(src + j); add(src + j, -1); incN(dst, w, j); close(); }
+                break;
+            }
+            if (c < 0) c = tmp();
+            int64_t c2 = tmp();
+            if (i < m) { open(src + i); add(src + i, -1); inc_carry(dst + i, c2); close(); }
+            if (i) { open(c); add(c, -1); inc_carry(dst + i, c2); close(); }
+            move(c2, {{c, 1}});
+            release(c2);
+        }
+        if (c >= 0) release(c);
+    }
+    // dst (n cells, known zero) = mulshr(ea, eb, k) at type t: floor(a * b / 2^k) of the exact product
+    // (2n bytes), in n bytes.  Shift and add over the bits of b, low first: an accumulator of
+    // W = n + k/8 (+1 when k%8) cells gets a2 = a << i added for each set bit i, and a2 doubles every bit.
+    // After each byte of b, while whole bytes of the shift remain, the accumulator's low byte is final and
+    // a2's is zero: both drop it (byte moves), so a2 stays n + 1 cells and the accumulator holds only the
+    // bytes that survive and the one below them.  The last k%8 bits are one pass of byte divisions.  Signed
+    // values are multiplied as magnitudes; for a negative product the accumulator starts at 2^k - 1, so the
+    // shift rounds the magnitude up and its negation is the floor.  The cells used every bit sit at the top.
+    void mulshr(const Expr& ea, const Expr& eb, int k, const Type* t, int64_t dst) {
+        int n = std::max(t->size, 1);
+        bool sgn = t->is_signed;
+        k = std::min(k, 16 * n);                      // floor(a * b / 2^16n) is already 0 or -1
+        int q = k / 8, r = k % 8, W = n + q + (r ? 1 : 0);
+        int64_t neg = sgn ? tmp() : -1, drops = q ? tmp() : -1;
+        int64_t cb = tmp(), f = tmp(), b = tmpN(n), acc = tmpN(W), a = tmpN(n + 1);
+        eval_into(ea, a, t);
+        eval_into(eb, b, t);
+        if (sgn) {
+            int64_t s = tmp(), c = tmp(), s2 = tmp();
+            sign_flag(a + n - 1, s);
+            copy(s, c); if_nonzero(c, [&] { negN(a, n); });
+            sign_flag(b + n - 1, s2);
+            copy(s2, c); if_nonzero(c, [&] { negN(b, n); });
+            move(s2, {{s, -1}});                       // s != 0: the signs differ
+            release(s2); release(c);
+            if_nonzero(s, [&] {
+                add(neg, 1);
+                for (int i = 0; i < q; i++) add(acc + i, 255);
+                if (r) add(acc + q, (1 << r) - 1);
+            });
+            release(s);
+        }
+        set(cb, 8);                                    // bits of b's low byte still to come
+        if (q) set(drops, q);
+        set(f, 1);                                     // b == 0 runs once, adding nothing
+        open(f);
+        {
+            clear(f);
+            int64_t h = tmp(), bit = tmp();
+            halve_bit(b, h, bit);
+            move(h, {{b, 1}});
+            int64_t t2 = tmpN(n + 1), t3 = tmpN(n + 1), u = tmp();
+            for (int i = 0; i <= n; i++) { move(a + i, {{t2 + i, 1}, {t3 + i, 1}, {u, 1}}); move(u, {{a + i, 1}}); }
+            release(u);
+            if_nonzero(bit, [&] { add_wide(acc, W, t3, std::min(n + 1, W)); });
+            clearN(t3, n + 1);                         // bit 0, or k = 0 (an n-byte product)
+            releaseN(t3, n + 1);
+            addN(a, t2, n + 1);                        // a2 doubles
+            releaseN(t2, n + 1);
+            release(bit); release(h);
+            add(cb, -1);
+            int64_t z = tmp();
+            iszero8(cb, z);
+            if_nonzero(z, [&] {                        // a byte of b done; its cell is zero
+                add(cb, 8);
+                for (int i = 0; i + 1 < n; i++) move(b + i + 1, {{b + i, 1}});
+                if (q) {
+                    int64_t d = tmp(); copy(drops, d);
+                    if_nonzero(d, [&] {
+                        add(drops, -1);
+                        clear(acc);
+                        for (int i = 0; i + 1 < W; i++) move(acc + i + 1, {{acc + i, 1}});
+                        for (int i = 0; i < n; i++) move(a + i + 1, {{a + i, 1}});
+                    });
+                    release(d);
+                }
+            });
+            release(z);
+            nonzeroN(b, f, n);
+        }
+        close();
+        if (q) {                                       // b ran out before the whole bytes of the shift
+            open(drops);
+            add(drops, -1);
+            clear(acc);
+            for (int i = 0; i + 1 < W; i++) move(acc + i + 1, {{acc + i, 1}});
+            close();
+        }
+        clearN(a, n + 1);
+        releaseN(a, n + 1);
+        if (r) {                                       // acc >>= r: acc[i] = acc[i] / 2^r + (acc[i+1] % 2^r) << (8 - r)
+            for (int i = 0; i <= n; i++) {
+                int64_t d = tmp(), qq = tmp(), rr = tmp();
+                set(d, int64_t(1) << r);
+                divmod8(acc + i, d, qq, rr);
+                move(qq, {{acc + i, 1}});
+                if (i) move(rr, {{acc + i - 1, 1 << (8 - r)}}); else clear(rr);
+                release(rr); release(qq); release(d);
+            }
+        }
+        if (sgn) { if_nonzero(neg, [&] { negN(acc, n); }); }
+        moveN(acc, dst, n);
+        releaseN(acc, W);
+        releaseN(b, n);
+        release(f); release(cb);
+        if (q) release(drops);
+        if (sgn) release(neg);
+    }
     // q += a / b, r += a % b (unsigned; b == 0 gives q = 0, r = a).  a consumed, b cleared; q and r start at zero.
     void divmodN(int64_t a, int64_t b, int64_t q, int64_t r, int n) {
         if (n == 1) { divmod8(a, b, q, r); return; }
@@ -1008,6 +1131,11 @@ struct Gen {
             if (o == "^") return wrap(x ^ y, rt);
             return std::nullopt;
         }
+        case Expr::MulShr: {
+            auto a = fold(*e.a, use_known), b = fold(*e.b, use_known);
+            if (!a || !b) return std::nullopt;
+            return mulshr_at(*a, *b, e.value, conv_type(e.optype ? e.optype : t));
+        }
         default: return std::nullopt;
         }
     }
@@ -1027,7 +1155,7 @@ struct Gen {
         }
         case Expr::Index: return touches(*e.a, lo, hi) || touches(*e.b, lo, hi);
         case Expr::Field: case Expr::Deref: case Expr::AddrOf: case Expr::Unary: case Expr::Cast: return touches(*e.a, lo, hi);
-        case Expr::Binary: return touches(*e.a, lo, hi) || touches(*e.b, lo, hi);
+        case Expr::Binary: case Expr::MulShr: return touches(*e.a, lo, hi) || touches(*e.b, lo, hi);
         case Expr::New: case Expr::Call: return true;      // a procedure body may touch anything
         default: return false;
         }
@@ -1563,6 +1691,7 @@ struct Gen {
             if (is_cmp(e.text) || e.text == "&&" || e.text == "||") { eval8(e, dst); return; }
             binary_wide(e, dst);
             return;
+        case Expr::MulShr: mulshr(*e.a, *e.b, (int)e.value, conv_type(e.type), dst); return;
         default: fail(e.pos, "cannot evaluate this expression here");
         }
     }

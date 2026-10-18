@@ -27,7 +27,7 @@ plus the type system, library and tooling they need.
 | 7 | Recursion on the heap: frames in memory, restrictions lifted | 3, 4 |
 | 8 | Tooling: settings, terminal width, syntax colouring, multi-file debugging | 6 |
 | 9 | A differential fuzzer for the compiler, the optimiser and the JIT | nothing |
-| 10 | Planned: fused multiply-and-shift for fixed-point arithmetic | 9 |
+| 10 | Fused multiply-and-shift for fixed-point arithmetic | 9 |
 | 11 | Planned: arithmetic shared within a block, without the trampoline | 9 |
 | 12 | Planned: faster division | 9 |
 | 13 | Planned: the profiler in the UI | nothing |
@@ -311,6 +311,60 @@ partial products, no shift afterwards.
 Done when: the raytracers, `cube.bfl` and `starfield.bfl` use it, with sizes and
 frame times measured before and after, and the grids test it against Python for
 every type and shift count.
+
+**Built** as the built-in `mulshr(a, b, k)` (a keyword; docs/LANG.md, "Fixed point:
+mulshr"). The product is exact, twice the width, rounded down by the shift, so it
+equals `(a * b) >> k` whenever the product does not overflow; `k` is a constant and
+counts of the width and more take the high half, then 0 or -1. The code
+(`mulshr` in `src/lang/codegen.cpp`) is one shift-and-add loop over the bits of `|b|`
+with an accumulator of `n + k/8 (+1)` bytes: after each byte of `b` the accumulator's
+low byte is final and is dropped with byte moves while whole bytes of the shift
+remain, the last `k % 8` bits are one pass of byte divisions (the DIVMOD idiom), and
+a signed product is formed from magnitudes with the accumulator starting at `2^k - 1`
+when it is negative, so negating the rounded-up magnitude gives the floor. The
+pattern `(a * b) >> k` is not rewritten, since its wrapping product is defined
+behaviour. Tests: a grid per integer type in `tests/test_lang.py` against Python with
+counts 0 to 70 (including 7, 8, 12, 15, 16, 31 and the width and twice it), targeted
+cases (constant folding, operand order, known values, a `rec` call inside, errors),
+and `MulShr` in the fuzzer's generator and model; `--bfl 1500 --bf 300` ran clean.
+
+Measured with `tools/bench.py` against the commit before:
+
+| | before | after |
+|---|---:|---:|
+| `(long * long) >> 12` → `mulshr`, IR instructions | 1 893 | 1 088 |
+| the same, commands | 18 077 | 11 864 |
+| `(int * int) >> 7` → `mulshr`, IR instructions | 690 | 487 |
+| the same, commands | 9 963 | 4 932 |
+| `raytracer.bfl`: ms a frame / light map / commands | 75.0 / 175 / 5.67 M | 66.3 / 160 / 5.12 M |
+| `raytracer_text.bfl` | 36.5 / 174 / 5.18 M | 30.1 / 153 / 4.64 M |
+| `cube.bfl`: ms a frame / commands | 1.52 / 537 K | 1.40 / 388 K |
+| `starfield.bfl` | 1.25 / 1.81 M | 1.19 / 1.80 M |
+
+The raytracers use it for every single product and for the dot products (a sum of
+`mulshr` terms rounds each term down, so 1 to 2% of the pixels change by a dither
+step and a lamp moves by a pixel in two of 16 frames; the pictures look the same).
+`cube.bfl` rotates in `int`s, because the exact product no longer needs `long`s, with
+shifts instead of `/ 1024`: a corner sometimes lands one cell over, since the shift
+rounds down where the division truncated. `starfield.bfl` has no fixed-point products
+in its frame (its perspective divides by depth); its random numbers now scale the
+generator's high half by `mulshr(r, n, 16)` instead of `% n`, a different but equally
+random sky.
+
+Found along the way:
+
+- A raytracer statement's 40 000 to 70 000 commands are mostly the trips to its
+  operands: a global 900 cells from the temporaries costs about 4 x 900 commands per
+  byte copied. `mulshr` removes the multiply's and the shift's own code (about a
+  third of the bench statement), not those trips; the samples shrink by 10%.
+- The IR's loop idioms match a carry chain of at most 5 cells (24 cells and 40 000
+  verification points in `src/ir.cpp`); a 6-byte accumulator's chain ran as written
+  and was 7 times slower, so the wide add ripples a carry cell below the top 5.
+- `mulshr(a, b, 0)` is `a * b` in about 60% of the IR instructions of `*` (no operand
+  compare and swap, doubling by adding instead of `shlN`), and the one-pass byte
+  division shift would make every constant `>>` and `<<` of more than one bit much
+  shorter (`fa >> 12` is 6 400 commands today). Both are left for the phases that
+  rework arithmetic (11, 12).
 
 ### Phase 11: arithmetic shared within a block
 

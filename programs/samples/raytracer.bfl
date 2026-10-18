@@ -113,16 +113,16 @@ proc sky(long dy) {                   // by the ray's height: pale at the horizo
     if (up < 0) { up = 0; }
     if (up > 128) { up = 128; }
     int u = int(up);
-    cr = 190 + ((-160 * u) >> 7);
-    cg = 200 + ((-150 * u) >> 7);
-    cb = 225 + ((-105 * u) >> 7);
+    cr = 190 + mulshr(-160, u, 7);
+    cg = 200 + mulshr(-150, u, 7);
+    cb = 225 + mulshr(-105, u, 7);
 }
 
 // Blend the colour towards the horizon haze; f is 0..128.
 proc haze(int f) {
-    cr = cr + (((190 - cr) * f) >> 7);
-    cg = cg + (((200 - cg) * f) >> 7);
-    cb = cb + (((225 - cb) * f) >> 7);
+    cr = cr + mulshr(190 - cr, f, 7);
+    cg = cg + mulshr(200 - cg, f, 7);
+    cb = cb + mulshr(225 - cb, f, 7);
 }
 
 // The floor at quarter-unit cell (qx, qz): from the light map, or unlit tiles beyond it.
@@ -162,9 +162,9 @@ proc put(byte x, byte y) {
 // and the unit normal (Q12) in nx, ny, nz.
 proc light_sphere(byte s, long px, long py, long pz) {
     long k = skn[s];
-    nx = ((px - scx[s]) * k) >> 8;
-    ny = ((py - scy[s]) * k) >> 8;
-    nz = ((pz - scz[s]) * k) >> 8;
+    nx = mulshr(k, px - scx[s], 8);
+    ny = mulshr(k, py - scy[s], 8);
+    nz = mulshr(k, pz - scz[s], 8);
     int n7x = int(nx >> 5);
     int n7y = int(ny >> 5);
     int n7z = int(nz >> 5);
@@ -176,30 +176,30 @@ proc light_sphere(byte s, long px, long py, long pz) {
         int ndl = n7x * ldx[i] + n7y * ldy[i] + n7z * ldz[i];         // Q14
         if (ndl > 0) {
             word dif = word(ndl >> 6);                                // 0..256
-            lr += (dif * word(lcr[l])) >> 8;
-            lg += (dif * word(lcg[l])) >> 8;
-            lb += (dif * word(lcb[l])) >> 8;
+            lr += mulshr(dif, word(lcr[l]), 8);
+            lg += mulshr(dif, word(lcg[l]), 8);
+            lb += mulshr(dif, word(lcb[l]), 8);
             int ndh = n7x * hvx[i] + n7y * hvy[i] + n7z * hvz[i];
             if (ndh > 0) {
                 word sp = word(ndh >> 6);
                 if (sp > 255) { sp = 255; }
-                sp = (sp * sp) >> 8;                                  // a power of 32
-                sp = (sp * sp) >> 8;
-                sp = (sp * sp) >> 8;
-                sp = (sp * sp) >> 8;
-                sp = (sp * sp) >> 8;
-                spr += (sp * word(lcr[l])) >> 8;
-                spg += (sp * word(lcg[l])) >> 8;
-                spb += (sp * word(lcb[l])) >> 8;
+                sp = mulshr(sp, sp, 8);                               // a power of 32
+                sp = mulshr(sp, sp, 8);
+                sp = mulshr(sp, sp, 8);
+                sp = mulshr(sp, sp, 8);
+                sp = mulshr(sp, sp, 8);
+                spr += mulshr(sp, word(lcr[l]), 8);
+                spg += mulshr(sp, word(lcg[l]), 8);
+                spb += mulshr(sp, word(lcb[l]), 8);
             }
         }
     }
     if (lr > 255) { lr = 255; }
     if (lg > 255) { lg = 255; }
     if (lb > 255) { lb = 255; }
-    cr = int((word(scr[s]) * lr) >> 8) + int(spr);
-    cg = int((word(scg[s]) * lg) >> 8) + int(spg);
-    cb = int((word(scb[s]) * lb) >> 8) + int(spb);
+    cr = int(mulshr(lr, word(scr[s]), 8)) + int(spr);
+    cg = int(mulshr(lg, word(scg[s]), 8)) + int(spg);
+    cb = int(mulshr(lb, word(scb[s]), 8)) + int(spb);
 }
 
 // The colour seen along a reflected ray from P on sphere skip (direction Q12, a = its length squared Q8).
@@ -212,7 +212,7 @@ proc reflection(byte skip, long px, long py, long pz, long qx, long qy, long qz,
             long ocx = px - scx[s];
             long ocy = py - scy[s];
             long ocz = pz - scz[s];
-            long b = (ocx * qx + ocy * qy + ocz * qz) >> 12;
+            long b = mulshr(qx, ocx, 12) + mulshr(qy, ocy, 12) + mulshr(qz, ocz, 12);
             if (b < 0) {
                 long c = (ocx * ocx + ocy * ocy + ocz * ocz - srr[s]) >> 8;
                 long disc = b * b - a * c;
@@ -224,14 +224,14 @@ proc reflection(byte skip, long px, long py, long pz, long qx, long qy, long qz,
         }
     }
     if (hit != 255) {
-        light_sphere(hit, px + ((best * qx) >> 12), py + ((best * qy) >> 12), pz + ((best * qz) >> 12));
+        light_sphere(hit, px + mulshr(qx, best, 12), py + mulshr(qy, best, 12), pz + mulshr(qz, best, 12));
     } else if (qy < 0) {
         long tf = ((-py) << 12) / qy;
         if (tf > FAR) {
             cr = 190; cg = 200; cb = 225;
         } else {
-            long hx = px + ((tf * qx) >> 12);
-            long hz = pz + ((tf * qz) >> 12);
+            long hx = px + mulshr(qx, tf, 12);
+            long hz = pz + mulshr(qz, tf, 12);
             floor_colour(int(hx >> 6), int(hz >> 6));
         }
     } else {
@@ -257,8 +257,8 @@ proc prepare_lights() {
         }
         // a line passing closer than 0.85 r to the centre is in full shadow, beyond
         // 1.15 r fully lit, and in between partly: a soft edge
-        long rin = (srad[s] * 218) >> 8;
-        long rout = (srad[s] * 294) >> 8;
+        long rin = mulshr(srad[s], 218, 8);
+        long rout = mulshr(srad[s], 294, 8);
         shin[s] = rin * rin;
         shout[s] = rout * rout;
     }
@@ -293,21 +293,21 @@ proc build_light_map() {
                     long ocx = scx[s] - px;
                     long ocy = scy[s];
                     long ocz = scz[s] - pz;
-                    long along = (ocx * wx + ocy * wy + ocz * wz) >> 8;     // Q8
+                    long along = mulshr(ocx, wx, 8) + mulshr(ocy, wy, 8) + mulshr(ocz, wz, 8);     // Q8
                     if (along > 0 && along < dist) {
                         long m2 = ocx * ocx + ocy * ocy + ocz * ocz - along * along;   // Q16
                         if (m2 < shin[s]) {
                             inten = 0;
                         } else if (m2 < shout[s]) {
-                            inten = (inten * (((m2 - shin[s]) << 8) / (shout[s] - shin[s]))) >> 8;
+                            inten = mulshr(inten, ((m2 - shin[s]) << 8) / (shout[s] - shin[s]), 8);
                         }
                     }
                 }
                 if (inten > 255) { inten = 255; }                  // keeps w * colour within a word
                 word w = word(inten);
-                lr += (w * word(lcr[l])) >> 8;
-                lg += (w * word(lcg[l])) >> 8;
-                lb += (w * word(lcb[l])) >> 8;
+                lr += mulshr(w, word(lcr[l]), 8);
+                lg += mulshr(w, word(lcg[l]), 8);
+                lb += mulshr(w, word(lcb[l]), 8);
             }
             if (lr > 255) { lr = 255; }
             if (lg > 255) { lg = 255; }
@@ -315,9 +315,9 @@ proc build_light_map() {
             word tr = 40;  word tg = 42;  word tb = 52;              // dark tile
             if (((ix >> 2) ^ (iz >> 2)) & 1) { tr = 235; tg = 230; tb = 220; }
             word i = (word(iz) * 64 + word(ix)) * 3;
-            cr = int((tr * lr) >> 8);
-            cg = int((tg * lg) >> 8);
-            cb = int((tb * lb) >> 8);
+            cr = int(mulshr(tr, lr, 8));
+            cg = int(mulshr(tg, lg, 8));
+            cb = int(mulshr(tb, lb, 8));
             lmap[i] = byte(cr);
             lmap[i + 1] = byte(cg);
             lmap[i + 2] = byte(cb);
@@ -343,14 +343,14 @@ proc place_camera(word ang) {
     long hl = isqrt(fx * fx + fz * fz);
     rx = (-fz * 4096) / hl;
     rz = (fx * 4096) / hl;
-    ux = (-rz * fy) >> 12;                  // up = right x forward
-    uy = (rz * fx - rx * fz) >> 12;
-    uz = (rx * fy) >> 12;
-    dux = (rx * PIX) >> 12;
-    duz = (rz * PIX) >> 12;
-    dvx = (-ux * PIX) >> 12;
-    dvy = (-uy * PIX) >> 12;
-    dvz = (-uz * PIX) >> 12;
+    ux = mulshr(-rz, fy, 12);                  // up = right x forward
+    uy = mulshr(rz, fx, 12) - mulshr(rx, fz, 12);
+    uz = mulshr(rx, fy, 12);
+    dux = mulshr(rx, PIX, 12);
+    duz = mulshr(rz, PIX, 12);
+    dvx = mulshr(-ux, PIX, 12);
+    dvy = mulshr(-uy, PIX, 12);
+    dvz = mulshr(-uz, PIX, 12);
     d0x = fx - dux * 64 - dvx * 32;
     d0y = fy - dvy * 32;
     d0z = fz - duz * 64 - dvz * 32;
@@ -380,9 +380,9 @@ proc place_camera(word ang) {
         socdu[s] = ocx * dux + ocz * duz;
         socdv[s] = ocx * dvx + ocy * dvy + ocz * dvz;
         socd0[s] = ocx * d0x + ocy * d0y + ocz * d0z;
-        long zc = -((ocx * fx + ocy * fy + ocz * fz) >> 12);
-        long xc = -((ocx * rx + ocz * rz) >> 12);
-        long yc = -((ocx * ux + ocy * uy + ocz * uz) >> 12);
+        long zc = -(mulshr(ocx, fx, 12) + mulshr(ocy, fy, 12) + mulshr(ocz, fz, 12));
+        long xc = -(mulshr(ocx, rx, 12) + mulshr(ocz, rz, 12));
+        long yc = -(mulshr(ocx, ux, 12) + mulshr(ocy, uy, 12) + mulshr(ocz, uz, 12));
         bvis[s] = 0;
         if (zc > srad[s] + 64) {
             long cxp = 64 + (xc * 4096) / (zc * PIX);
@@ -423,10 +423,10 @@ proc locate_lamps() {
         long vx = lpx[l] - ox;
         long vy = lpy[l] - oy;
         long vz = lpz[l] - oz;
-        long zc = (vx * fx + vy * fy + vz * fz) >> 12;
+        long zc = mulshr(vx, fx, 12) + mulshr(vy, fy, 12) + mulshr(vz, fz, 12);
         if (zc > 128) {
-            long xc = (vx * rx + vz * rz) >> 12;
-            long yc = (vx * ux + vy * uy + vz * uz) >> 12;
+            long xc = mulshr(vx, rx, 12) + mulshr(vz, rz, 12);
+            long yc = mulshr(vx, ux, 12) + mulshr(vy, uy, 12) + mulshr(vz, uz, 12);
             lsx[l] = 64 + (xc * 4096) / (zc * PIX);
             lsy[l] = 32 - (yc * 4096) / (zc * PIX);
             if (lsx[l] > -3 && lsx[l] < W + 2 && lsy[l] > -3 && lsy[l] < H + 2) { lvis[l] = 1; }
@@ -507,21 +507,21 @@ proc render() {
                     }
                 }
                 if (hit != 255) {
-                    long px = ox + ((best * dx) >> 12);
-                    long py = oy + ((best * dy) >> 12);
-                    long pz = oz + ((best * dz) >> 12);
+                    long px = ox + mulshr(dx, best, 12);
+                    long py = oy + mulshr(dy, best, 12);
+                    long pz = oz + mulshr(dz, best, 12);
                     light_sphere(hit, px, py, pz);
                     int own_r = cr;  int own_g = cg;  int own_b = cb;
                     // reflect the ray about the normal and see what it meets
-                    long dn = (dx * nx + dy * ny + dz * nz) >> 12;
-                    long qx = dx - ((dn * nx) >> 11);
-                    long qy = dy - ((dn * ny) >> 11);
-                    long qz = dz - ((dn * nz) >> 11);
+                    long dn = mulshr(dx, nx, 12) + mulshr(dy, ny, 12) + mulshr(dz, nz, 12);
+                    long qx = dx - mulshr(nx, dn, 11);
+                    long qy = dy - mulshr(ny, dn, 11);
+                    long qz = dz - mulshr(nz, dn, 11);
                     reflection(hit, px, py, pz, qx, qy, qz, a);
                     int k = sref[hit];
-                    cr = own_r + (((cr - own_r) * k) >> 7);
-                    cg = own_g + (((cg - own_g) * k) >> 7);
-                    cb = own_b + (((cb - own_b) * k) >> 7);
+                    cr = own_r + mulshr(cr - own_r, k, 7);
+                    cg = own_g + mulshr(cg - own_g, k, 7);
+                    cb = own_b + mulshr(cb - own_b, k, 7);
                 }
             }
             if (hit == 255) {

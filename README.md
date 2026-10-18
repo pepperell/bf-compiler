@@ -154,6 +154,13 @@ once. Scratch cells the loop always leaves holding a constant are checked on ent
 one holds something else the body runs as written. `bf --dump` shows them. On
 `programs/samples/raytracer.bfl` this made a frame 16 times faster (2.3 s to 85 ms).
 
+**Fixed point.** BFL's `mulshr(a, b, k)` is `(a * b) >> k` with the exact
+double-width product, computed by one shift-and-add loop that keeps only the bytes
+surviving the shift (docs/LANG.md). A Q12 `long` product runs 1 100 IR instructions
+instead of 1 900 and is a third smaller; with it the raytracer's frame went from 75 to
+66 ms and its code from 5.67 M to 5.12 M commands, and `raytracer_text.bfl` from 36.5 to
+30 ms.
+
 ## Memory map
 
 Cells are 8-bit. The tape is `mmio_size` device cells followed by `ram_size` RAM cells.

@@ -121,14 +121,15 @@ while (FRAMES == 0 || frame < FRAMES) {
 
     // rotate about y by a, then about x by b, then project
     for (v = 0; v < 8; v++) {
-        long x = mx[v];
-        long y = my[v];
-        long z = mz[v];
-        long x1 = (x * ca + z * sa) / 1024;
-        long z1 = (z * ca - x * sa) / 1024;
-        long y2 = (y * cb - z1 * sb) / 1024;
-        long z2 = (y * sb + z1 * cb) / 1024;
-        long d = z2 + DIST;
+        int x = mx[v];
+        int y = my[v];
+        int z = mz[v];
+        // mulshr keeps the whole 32-bit product, so the arithmetic stays in ints
+        int x1 = mulshr(x, ca, 10) + mulshr(z, sa, 10);
+        int z1 = mulshr(z, ca, 10) - mulshr(x, sa, 10);
+        int y2 = mulshr(y, cb, 10) - mulshr(z1, sb, 10);
+        int z2 = mulshr(y, sb, 10) + mulshr(z1, cb, 10);
+        int d = z2 + DIST;
         px[v] = int(CX + x1 * FX / d);
         py[v] = int(CY + y2 * FY / d);
         pz[v] = int(z2);

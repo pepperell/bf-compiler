@@ -33,20 +33,20 @@ using ExprP = std::unique_ptr<Expr>;
 
 struct Expr {
     enum Kind {
-        Num, Str, Name, Index, Field, Deref, AddrOf, In, Input, Unary, Binary, Call, Cast, Sizeof, New, Null
+        Num, Str, Name, Index, Field, Deref, AddrOf, In, Input, Unary, Binary, Call, Cast, Sizeof, New, Null, MulShr
     };
     Kind        kind;
     Pos         pos;
-    int64_t     value = 0;      // Num
+    int64_t     value = 0;      // Num; MulShr: the shift count (sema)
     std::string text;           // Str: contents; Name/Call: identifier; Field: field name; Unary/Binary: operator
     bool        arrow = false;  // Field: p->f (true) or s.f (false)
-    ExprP       a, b;           // Unary/Deref/AddrOf/Cast: a; Binary: a op b; Index: a[b]; Field: a.f; New: b = count
-    std::vector<ExprP> args;    // Call
+    ExprP       a, b;           // Unary/Deref/AddrOf/Cast: a; Binary: a op b; Index: a[b]; Field: a.f; New: b = count; MulShr: the factors
+    std::vector<ExprP> args;    // Call; MulShr: the shift count
     TypeSpec    ts;             // Cast, Sizeof, New
 
     // ---- filled in by the semantic pass ----
     const Type* type = nullptr;     // result type
-    const Type* optype = nullptr;   // Binary: the type both operands are converted to
+    const Type* optype = nullptr;   // Binary, MulShr: the type both operands are converted to
     bool        is_const = false;   // compile-time constant (cval valid)
     int64_t     cval = 0;
 };

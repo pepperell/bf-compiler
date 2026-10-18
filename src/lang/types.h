@@ -144,5 +144,13 @@ inline int64_t wrap(int64_t v, const Type* t) {
     if (t->is_signed && (u >> (bits - 1)) & 1) return (int64_t)(u | ~m);
     return (int64_t)u;
 }
+// mulshr(x, y, k) at type t (at most 4 bytes): floor(x * y / 2^k) of the exact product of x and y
+// (both of type t), wrapped to t.
+inline int64_t mulshr_at(int64_t x, int64_t y, int64_t k, const Type* t) {
+    x = wrap(x, t); y = wrap(y, t);
+    if (t->is_signed) { int64_t p = x * y; return wrap(k >= 63 ? (p < 0 ? -1 : 0) : p >> k, t); }
+    uint64_t p = (uint64_t)x * (uint64_t)y;
+    return wrap(k >= 64 ? 0 : (int64_t)(p >> k), t);
+}
 
 } // namespace bfl

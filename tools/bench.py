@@ -134,6 +134,9 @@ OPS = [('long * long', 'lc = fa * fb;'),           # 5200 * 4181, Q12-sized as i
        ('int / int', 'ic = ia / ib;'),             # -10600 / 47
        ('word / word', 'wc = wa / wb;'),           # 50207 / 80
        ('(long * long) >> 12', 'lc = (fa * fb) >> 12;'),   # 5200 * 4181 >> 12, fixed point
+       ('mulshr(long, long, 12)', 'lc = mulshr(fa, fb, 12);'),   # the same, fused (exact product)
+       ('(int * int) >> 7', 'ic = (ia * ib) >> 7;'),     # -10600 * 47 >> 7 (* wraps, mulshr does not)
+       ('mulshr(int, int, 7)', 'ic = mulshr(ia, ib, 7);'),
        ('byte / byte', 'bc = ba / bb;')]           # 200 / 17
 
 def profile_line(bf, path, line):
