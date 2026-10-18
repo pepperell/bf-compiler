@@ -9,13 +9,20 @@ namespace bf {
 
 namespace {
 
+// An access off the tape records the cell for the fault report, as the address it would
+// have (as a native fault does).
+inline bool off_tape(Ctx* c, int64_t a) {
+    if ((uint64_t)a < c->tape_size) return false;
+    c->fault_ptr = (uintptr_t)c->tape + (uintptr_t)a;
+    return true;
+}
 inline bool cell_read(Ctx* c, int64_t a, uint32_t& v) {
-    if ((uint64_t)a >= c->tape_size) return false;
+    if (off_tape(c, a)) return false;
     v = (a < (int64_t)c->mmio_size) ? c->m->mmio_read((uint32_t)a) : c->tape[a];
     return true;
 }
 inline bool cell_write(Ctx* c, int64_t a, uint32_t v) {
-    if ((uint64_t)a >= c->tape_size) return false;
+    if (off_tape(c, a)) return false;
     if (a < (int64_t)c->mmio_size) c->m->mmio_write((uint32_t)a, (uint8_t)v);
     else c->tape[a] = (uint8_t)v;
     for (int32_t i = 0; i < c->watch_n; i++) if (c->watch[i] == a) c->watch_hit = a;   // data breakpoints
@@ -142,8 +149,7 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
         }
         continue;
     oob:
-        c->status = (int32_t)Status::Fault;
-        c->fault_ptr = (uintptr_t)(p + x.off);
+        c->status = (int32_t)Status::Fault;          // fault_ptr was set by cell_read / cell_write
         c->msg = "pointer left the tape";
         break;
     }

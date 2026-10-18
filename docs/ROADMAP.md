@@ -434,6 +434,10 @@ Measured with `tools/bench.py` against the commit before (after phase 10):
 | `raytracer_text.bfl` | 29.5 / 152 / 4.64 M | 24.9 / 85 / 4.31 M |
 | `cube.bfl`, `starfield.bfl`: ms a frame | 1.38, 1.16 | 1.35, 1.08 |
 
+The unoptimised count is for the benchmark's operands (`892200 / 1006`); the loop's
+passes cost more the larger the values, so the loop alone runs from about 0.4 M commands
+(`123456789 / 10`) to 2.8 M (`0xFFFFFFFF / 0xFFFFFFFF`).
+
 A raytracer frame executes 181 M IR instructions instead of 225 M: its 8 000 divisions
 took about 45 M and now take 1.6 M. (Against the commit before phase 10 a frame went
 from 75 to 58 ms.) `text.bfl` grows by 3% although its `dword / 10` shrinks from 10.7 K

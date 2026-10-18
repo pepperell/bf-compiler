@@ -508,10 +508,11 @@ These are the building blocks; knowing them helps read the output and write
   with a borrow chain into `X`, sets `A`'s low bit, and on a borrow adds `B`
   back and clears the bit again. A byte's zero test is `t+ c[>-]>[- … >]` with
   `t` and the cell after it free: it ends on that cell either way, without
-  looping over `c`, so the loop runs in time linear in the values (about 850 000
-  commands for a 32-bit `/` as written). The optimiser recognises the loop by its
-  exact text and runs all the passes in one step; signs, division by zero and
-  the moves in and out are done around it.
+  looping over `c`, so the loop runs in time linear in the values (as written,
+  from about 0.4 to 2.8 million commands for a 32-bit `/`, more for larger
+  operands). The optimiser recognises the loop by its exact text and runs all
+  the passes in one step; signs, division by zero and the moves in and out are
+  done around it.
 - **Byte arrays** occupy `3·(n+1)` cells: a zero header triple, then per element
   `(C, V, D)`: counter, value carry, data. A read moves the index into `C₀`,
   walks `[-[->>>+<<<]+>>>]` leaving markers, copies `D` into `V` using `C` as the

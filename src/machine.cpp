@@ -31,7 +31,7 @@ LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     if (!in_jit && !c->stop) return EXCEPTION_CONTINUE_SEARCH;    // a real bug somewhere else
 
     c->fault_addr = (uintptr_t)er->ExceptionInformation[1];
-    c->fault_ptr = in_jit ? (uintptr_t)cr->R12 : (uintptr_t)c->ptr;
+    c->fault_ptr = in_jit ? c->fault_addr : (uintptr_t)c->ptr;    // the cell accessed, as the interpreter reports it
     if (c->stop) c->status = (int32_t)(c->halt_req ? Status::Halted : Status::Stopped);
     else {
         c->status = (int32_t)Status::Fault;
@@ -90,8 +90,11 @@ Machine::Machine(const Config& cfg) : cfg_(cfg) {
     region_size_ = GUARD + tape_bytes + GUARD;
     region_ = (uint8_t*)VirtualAlloc(nullptr, region_size_, MEM_RESERVE, PAGE_NOACCESS);
     if (!region_) throw std::bad_alloc();
-    tape_ = region_ + GUARD;
-    if (!VirtualAlloc(tape_, tape_bytes, MEM_COMMIT, PAGE_READWRITE)) throw std::bad_alloc();
+    if (!VirtualAlloc(region_ + GUARD, tape_bytes, MEM_COMMIT, PAGE_READWRITE)) throw std::bad_alloc();
+    // The tape ends where its last page does, so the first cell past it faults in native code
+    // too.  Native code never reaches the slack below cell 0: it runs only while the pointer
+    // is in RAM, and the bounds-checked interpreter does the rest.
+    tape_ = region_ + GUARD + (tape_bytes - tape_size_);
     dev_.assign(mmio_size_, nullptr);
     dev_base_.assign(mmio_size_, 0);
     view_mu_ = new std::mutex();
@@ -141,7 +144,7 @@ void Machine::protect_ram(bool accessible) {
     DWORD old;
     size_t page = 4096;
     size_t bytes = (tape_size_ + page - 1) & ~(page - 1);
-    VirtualProtect(tape_, bytes, accessible ? PAGE_READWRITE : PAGE_NOACCESS, &old);
+    VirtualProtect(region_ + GUARD, bytes, accessible ? PAGE_READWRITE : PAGE_NOACCESS, &old);
     ram_locked_ = !accessible;
 }
 

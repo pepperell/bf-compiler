@@ -168,10 +168,10 @@ compiler emits it from a generator in the executor (`bf::division_loop`), and th
 optimiser recognises a loop whose commands are exactly that text and runs all its
 passes in one step, with its scratch cells checked on entry as for the other idioms. A
 32-bit `/` runs about 200 IR instructions instead of 7 150 and is half the code; even as
-written it runs in linear time (850 000 commands instead of 27 million), since a byte's
-zero test there does not copy the byte. The raytracer's frame went from 65 to 58 ms (its
-light map from 158 to 89 ms) and its code to 4.80 M commands, and `raytracer_text.bfl`
-from 29.5 to 25 ms.
+written it runs in linear time (850 000 commands for the benchmark's operands instead of
+27 million, and at most about 3 million), since a byte's zero test there does not copy the
+byte. The raytracer's frame went from 65 to 58 ms (its light map from 158 to 89 ms) and
+its code to 4.80 M commands, and `raytracer_text.bfl` from 29.5 to 25 ms.
 
 ## Memory map
 
@@ -269,7 +269,8 @@ device window freely; the fast code never sees it.
 a flag and revokes page access on RAM. The next tape access faults, a vectored exception
 handler recognises the run context, and it redirects the thread to the JIT exit stub using
 the stack pointer saved in the prologue. The same handler reports a pointer that leaves the
-tape (the tape sits between two 1 GiB reserved guard regions) as status "fault".
+tape (the tape sits between two 1 GiB reserved guard regions, and ends where its last page
+does) as status "fault", with the cell it touched, as the interpreter does.
 
 **Adding a device.** Derive from `bf::Device`, override `read(rel)` / `write(rel, v)` where
 `rel` is the offset within the mapped range (and `plain(rel)` for registers that behave

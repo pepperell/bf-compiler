@@ -237,6 +237,65 @@ def idiom_cases():
     return fails, len(IDIOM_PROGRAMS)
 
 
+# A pointer that leaves the tape: every executor must fault at the same cell.  Native code
+# relies on the page after the tape being inaccessible, so the tape ends at a page end.
+FAULT_PROGRAMS = [
+    # name, source, flags, expected stdout, the cell reported (None: the run ends normally)
+    ("fault-last-cell", ">" * 999 + "+.", ["--ram", "1000"], b"\x01", None),
+    ("fault-past-end", ">" * 1000 + "+.", ["--ram", "1000"], b"", 1256),
+    ("fault-loop-past-end", "+[>+]", ["--ram", "1000"], b"", 1256),
+    ("fault-mul-past-end", ">" * 998 + "+[>>+<<-]", ["--ram", "1000"], b"", 1256),
+    ("fault-past-start", "<" * 300 + "+", [], b"", -44),
+    ("fault-past-default-ram", ">" * 1048576 + "+", [], b"", 1048832),
+]
+
+
+def fault_cases():
+    import re
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    fails = 0
+    modes = (("jit", []), ("interp", ["--interp"]), ("noopt", ["--no-opt"]))
+
+    def run_all(path, flags, stdin=b""):
+        return {label: (lambda r: (r[0], r[1], re.sub(r" [\d.]+ s,", "", r[2].strip())))(run_path(path, stdin, flags + f)) for label, f in modes}
+
+    for name, src, flags, out, cell in FAULT_PROGRAMS:
+        path = os.path.join(tmp, name + ".b")
+        open(path, "w").write(src)
+        res = run_all(path, flags)
+        err = "" if cell is None else f"[fault: pointer left the tape (cell {cell})] final cell {cell}"
+        ok = all(r == (0 if cell is None else 3, out, err) for r in res.values())
+        print(("PASS " if ok else "FAIL ") + name)
+        if not ok:
+            fails += 1
+            for k, v in res.items():
+                print(f"   {k}: rc={v[0]} out={v[1][:20]!r} err={v[2]!r}")
+    # division loops (src/ir.cpp) cut off by the end of RAM: the idiom must not run, and the loop
+    # as written faults.  The executors touch cells in different orders (an idiom's guards, merged
+    # blocks), so they may report different cells, but each must be past the end.
+    bad = []
+    progs = {c[0]: c[1] for c in IDIOM_PROGRAMS}
+    for name, prog, rams in (("word", progs["word-divide"], range(10, 46)), ("long", progs["long-divide"], range(10, 96, 2))):
+        bfl, b = os.path.join(tmp, name + ".bfl"), os.path.join(tmp, name + ".b")
+        open(bfl, "w").write(prog + "\n")
+        subprocess.run([BF, "--emit", b, bfl], capture_output=True, timeout=60)
+        faulted = 0
+        for ram in rams:
+            res = run_all(b, ["--ram", str(ram)], IDIOM_INPUTS[0])
+            faulted += res["jit"][0] == 3
+            cells = [int(m.group(1)) for m in (re.match(r"\[fault: .* \(cell (-?\d+)\)\]", v[2]) for v in res.values()) if m]
+            past = all(c >= 256 + ram for c in cells) and len(cells) == 3 * (res["jit"][0] == 3)
+            if res["jit"][:2] != res["interp"][:2] or res["jit"][:2] != res["noopt"][:2] or not past:
+                bad.append(f"{name} --ram {ram}: " + "; ".join(f"{k} rc={v[0]} out={v[1]!r} {v[2]}" for k, v in res.items()))
+        if not faulted or faulted == len(rams):
+            bad.append(f"{name}: {faulted} of {len(rams)} RAM sizes faulted")
+    print(("PASS " if not bad else "FAIL ") + "fault-division-at-end")
+    for x in bad[:6]:
+        print("   " + x)
+    return fails + bool(bad), len(FAULT_PROGRAMS) + 1
+
+
 def bf_fuzz():
     """A few programs of tests/fuzz.py: random brainfuck aimed at the loops the
     optimiser rewrites, through every executor, against the reference interpreter."""
@@ -280,6 +339,8 @@ def main():
     fails = 0
     idiom_fails, idiom_n = idiom_cases()
     fails += idiom_fails
+    fault_fails, fault_n = fault_cases()
+    fails += fault_fails
     fails += bf_fuzz()
     fails += fuzz_stack()
     ok, why = readme_matches_regs()
@@ -312,7 +373,7 @@ def main():
             print("   expected:", expected)
             for k, v in results.items():
                 print(f"   {k}: rc={v[0]} out={v[1]!r} err={v[2]!r}")
-    total = len(CASES) + 3 + len(THIRDPARTY) + idiom_n
+    total = len(CASES) + 3 + len(THIRDPARTY) + idiom_n + fault_n
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 
