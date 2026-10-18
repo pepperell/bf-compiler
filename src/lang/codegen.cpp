@@ -1556,7 +1556,15 @@ struct Gen {
                 if (i) b.base += *i * es;
                 else b.hidx.emplace_back(t.b.get(), es);
             } else {
-                if (!i) fail(t.b->pos, "an array field of a struct held in cells needs a constant index");
+                if (!i) {
+                    const Expr* root = &base;
+                    while (root->kind == Expr::Field || root->kind == Expr::Index) root = root->a.get();
+                    Var* rv = root->kind == Expr::Name ? find_var(root->text) : nullptr;
+                    if (rv && rv->count >= 0 && !rv->owned)      // an array parameter bound to the caller's cells
+                        fail(t.b->pos, "an array field of a struct held in cells needs a constant index; the array passed for '" +
+                                       root->text + "' is in cells: pass a heap array");
+                    fail(t.b->pos, "an array field of a struct held in cells needs a constant index; put the struct in the heap");
+                }
                 if (b.kind == LV::Cells) b.cell += *i * es; else if (b.kind == LV::Elem) b.boff += (int)(*i * es);
                 else fail(t.pos, "cannot index this");
             }

@@ -77,7 +77,9 @@ padding. A struct can be assigned, passed and returned by value, passed by `ref`
 stored in arrays and in the heap, and contain other structs and arrays; it
 cannot contain itself (use a pointer). Structs cannot be compared or printed.
 An array field of a struct held in cells needs a constant index; in the heap any
-index works (`pool[i].data[j]`). A part of a returned struct can be read directly,
+index works (`pool[i].data[j]`), also through an array parameter given a heap
+array (`a[i].data[j]`; a trampolined procedure's always are) and in the local
+arrays of a re-entrant procedure. A part of a returned struct can be read directly,
 through fields and constant indices (`mk().x`, `mk().a.data[2]`).
 
 ## Pointers and the heap

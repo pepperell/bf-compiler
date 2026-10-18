@@ -14,7 +14,11 @@ Two generators:
        structs copied by assignment, passed by value and by ref and returned
        (also mk(1).f).  Procedures take ref array parameters (ref T a[], T an
        integer type or a struct), in cells when inlined and heap arrays when
-       trampolined, and some procs are marked shared.  Each program is also run
+       trampolined, and some procs are marked shared.  A procedure the program
+       does not call gets a call added in the main program (declaring what its
+       ref and array arguments need, printed after it) or in a later procedure,
+       so that what is declared runs; calls such as f(i, a[i]), where f writes
+       i, are frequent.  Each program is also run
        by a model of BFL written here in Python, the oracle.  It is compiled twice
        (the brainfuck must be identical), once without the automatic layout of
        globals, once without shared arithmetic (BFL_SHARE=0) and, when it has
@@ -39,14 +43,18 @@ former tests/fuzz_shared.py):
   - ref parameters: an inlined procedure works on the argument's cells where it
     can, a trampolined one (and an inlined one for a place outside cells) copies
     the argument in and back out.  So a procedure with ref parameters touches no
-    globals and calls nothing that does, and no two ref arguments of one call
-    share storage (a variable, an array, a struct, the heap array a pointer
-    points into).  Where the argument is copied back to does not change:
-    its index or address is computed once, at the call.
+    globals and calls nothing that does, and no two ref or array arguments of
+    one call share storage (a variable, an array, a struct, the heap array a
+    pointer points into; an array parameter may be any global array of its
+    element type).  Where the argument is copied back to does not change: its
+    index or address is computed once, at the call.
 Array parameters are always bound to the array itself, inlined or not.  A
 trampolined procedure takes a pointer, so its array arguments are heap arrays,
 array parameters, or local arrays of a re-entrant procedure (which live in the
-heap).  An array field of a struct held in cells is indexed by a constant.
+heap).  An array field of a struct held in cells is indexed by a constant; in
+the heap (a heap array, a pointer, a re-entrant procedure's local array, an
+array parameter given only heap arrays, as a trampolined one always is) by
+anything.
 
 The executors: the JIT and the IR interpreter, each with optimisation, without
 it, and without the loop idioms or the block rebuilding (BF_NO_IDIOMS,
@@ -67,11 +75,13 @@ import itertools
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BF = os.path.join(HERE, "..", "out", "bf.exe")
@@ -301,6 +311,7 @@ class Model:
         self.st = {s.name: s for s in prog.structs}
         self.steps = 0
         self.depth = 0
+        self.ran = set()                 # the procedures called
 
     def lookup(self, name):
         if name in self.frame:
@@ -322,6 +333,7 @@ class Model:
     def call(self, p, args):
         if len(args) != len(p.params):
             raise ModelError("argument count")
+        self.ran.add(p.name)
         frame = {}
         for (t, ref, pn), a in zip(p.params, args):
             if ref == "[]":
@@ -1012,6 +1024,7 @@ class Proc(Node):
     def __init__(self, name, ret, params, body, rec, shared=False, asize=None):
         self.name, self.ret, self.params, self.body, self.rec = name, ret, params, body, rec
         self.shared, self.asize = shared, asize or {}
+        self.hparams = set()             # struct array parameters that take only heap arrays (Gen.proc)
 
     def lines(self, ind, unshare=False):
         plist = ", ".join(("ref " if ref else "") + f"{t} {n}" + ("[]" if ref == "[]" else "") for t, ref, n in self.params)
@@ -1056,8 +1069,11 @@ def lines(lst, ind):
     return out
 
 
-def model_run(prog, stdin):
+def model_run(prog, stdin, ran=None):
+    """The program's output; ran, a set, gets the names of the procedures it called."""
     m = Model(prog, stdin)
+    if ran is not None:
+        m.ran = ran
     try:
         run_list(prog.decls, m)
         run_list(prog.main, m)
@@ -1099,11 +1115,15 @@ class SR:
     """A struct root, where a struct place starts: kind "var" (a struct variable or parameter), "cells" (an
     array of structs in cells), "heap" (a heap array of structs), "ptr" (a pointer to a struct in a heap
     array, with n elements from it on), "param" (a ref array parameter).  root: the storage it stands for
-    (for a pointer, the heap array), so that the ref arguments of one call never share one."""
-    __slots__ = ("name", "t", "n", "kind", "root")
+    (for a pointer, the heap array), so that the ref arguments of one call never share one.  inheap: the
+    structs are known to be in the heap, so an array field takes a runtime index (a heap array or a
+    pointer into one, an array parameter that only ever gets heap arrays, a re-entrant procedure's local
+    array)."""
+    __slots__ = ("name", "t", "n", "kind", "root", "inheap")
 
-    def __init__(self, name, t, n, kind, root=None):
+    def __init__(self, name, t, n, kind, root=None, inheap=None):
         self.name, self.t, self.n, self.kind, self.root = name, t, n, kind, root or name
+        self.inheap = kind in ("heap", "ptr") if inheap is None else inheap
 
 
 def walk(node):
@@ -1216,7 +1236,7 @@ class Gen:
             if i == 0 and p.rec:
                 a = Bin("%", Cast("byte", self.expr(cx, depth + 1)), Lit(4))
             elif ref == "[]":
-                a = self.array_arg(cx, p, t, p.asize[pn], False, set())
+                a = self.array_arg(cx, p, t, p.asize[pn], False, set(), pn)
             elif is_struct(t):
                 a = self.struct_expr(cx, t, depth + 1)
             else:
@@ -1303,8 +1323,8 @@ class Gen:
         return self.tmpl[t]
 
     def inst(self, cx, tmpl, heap, depth):
-        """The steps of a template: an index into an array field is a constant unless the struct is in
-        the heap (a struct held in cells needs one)."""
+        """The steps of a template: an index into an array field is a constant unless the struct is known
+        to be in the heap (a struct held in cells needs one)."""
         out = []
         for k, v in tmpl:
             if k == "f":
@@ -1319,7 +1339,7 @@ class Gen:
         r = self.r
         if sr.kind == "var":
             return Path("v", sr.name, self.inst(cx, tmpl, False, depth))
-        heap = sr.kind in ("heap", "ptr")
+        heap = sr.inheap
         if sr.kind == "ptr":
             q = r.random()
             if tmpl and q < 0.5:
@@ -1405,13 +1425,25 @@ class Gen:
                     yield (lambda spec=spec: Path("v", sr.name, [x if isinstance(x, str) else Lit(x) for x in spec])), lt
 
     # arguments of statement calls
-    def array_arg(self, cx, callee, t, n, write, used):
-        """An array of element type t and at least n elements for a ref array parameter, or None.  A
+    def clash(self, cx, root, used):
+        """Can the storage root stand for shares one of the roots in used?  An array parameter may be bound
+        to any global array of its element type, which an impure procedure also sees by name."""
+        keys = {root}
+        if root in cx.aparams:
+            keys |= cx.garrays.get(cx.aparams[root], set())
+        else:
+            keys |= {pn for pn, t in cx.aparams.items() if root in cx.garrays.get(t, ())}
+        return bool(keys & used)
+
+    def array_arg(self, cx, callee, t, n, write, used, pn):
+        """An array of element type t and at least n elements for the ref array parameter pn, or None.  A
         trampolined callee takes a pointer: a heap array, an array parameter, a local of a re-entrant
-        procedure (tpass)."""
+        procedure (tpass); a parameter that indexes array fields of its structs at run time (hparams) takes
+        only arrays known to be in the heap (hpass)."""
         cands = [a[0] for a in (cx.warrs if write else cx.arrs) if a[3] != "ptr" and a[1] == t and a[2] >= n]
         cands += [sr.name for sr in (cx.swroots if write else cx.sroots) if sr.kind in ("cells", "heap", "param") and sr.t == t and sr.n >= n]
-        cands = [c for c in cands if c not in used and (not callee.tramp or c in cx.tpass)]
+        cands = [c for c in cands if not self.clash(cx, c, used) and (c in cx.tpass if callee.tramp else
+                                                                       c in cx.hpass if pn in callee.hparams else True)]
         if not cands:
             return None
         c = self.r.choice(cands)
@@ -1421,34 +1453,47 @@ class Gen:
     def ref_arg(self, cx, t, used):
         """A place of type t for a ref parameter: a variable, an array element, a place in a struct; or
         None.  No two ref arguments of a call share storage (used: the roots taken), since the compiler
-        copies some in and back out and binds others to the cells themselves."""
+        copies some in and back out and binds others to the cells themselves.  With idxvars (variables
+        passed by ref in the same call) it prefers places, whose indices may read them."""
         r = self.r
         cands = []
         if not is_struct(t):
             cands += [(v, lambda v=v: Var(v)) for v in cx.targets if self.vt[v] == t and v not in used] * 2
             for a in cx.warrs:
                 root = self.ptr_root.get(a[0], a[0])
-                if a[1] == t and root not in used:
+                if a[1] == t and not self.clash(cx, root, used):
                     cands.append((root, lambda a=a: self.index_of(cx, a, 1)))
         for sr in cx.swroots:
-            if sr.root not in used:
+            if not self.clash(cx, sr.root, used):
                 tm = [s for s, lt in self.templates(sr.t) if lt == t]
                 if tm:
                     cands.append((sr.root, lambda sr=sr, tm=tm: self.root_path(cx, sr, r.choice(tm), 1)))
         if not cands:
             return None
-        root, mk = r.choice(cands if not cx.idxvars else [c for c in cands if c[0] not in cx.targets] * 3 + cands)
+        root, mk = r.choice(cands if not cx.idxvars else [c for c in cands if c[0] not in cx.targets] * 4 + cands)
         used.add(root)
         return mk()
 
     def stmt_args(self, cx, p):
-        used, args = set(), []
+        """The arguments of a call statement, or None.  Variables for some integer ref parameters are
+        chosen first, so that the index of a place passed to another ref parameter, before or after
+        them, may read one of them: f(i, a[i]) where f writes i, whose place must stay where it was."""
+        used, args = set(), [None] * len(p.params)
+        byvar = []
         for i, (t, ref, pn) in enumerate(p.params):
+            if ref is True and not is_struct(t) and self.r.random() < 0.5:
+                vs = [v for v in cx.targets if self.vt[v] == t and v not in used]
+                if vs:
+                    args[i] = Var(self.r.choice(vs))
+                    used.add(args[i].name)
+                    byvar.append(args[i].name)
+        for i, (t, ref, pn) in enumerate(p.params):
+            if args[i] is not None:
+                continue
             if ref == "[]":
-                a = self.array_arg(cx, p, t, p.asize[pn], p.kind != "pure", used)
+                a = self.array_arg(cx, p, t, p.asize[pn], p.kind != "pure", used, pn)
             elif ref:
-                # an index in a later ref argument may read a variable this call passes by ref
-                a = self.ref_arg(cx.but(idxvars=[v for v in used if v in self.vt and v in cx.targets]), t, used)
+                a = self.ref_arg(cx.but(idxvars=byvar + [v for v in used if v in self.vt and v in cx.targets and v not in byvar]), t, used)
             elif i == 0 and p.rec:
                 a = Bin("%", Cast("byte", self.expr(cx, 1)), Lit(4))
             elif is_struct(t):
@@ -1457,7 +1502,7 @@ class Gen:
                 a = self.fit(self.expr(cx, 1), t)
             if a is None:
                 return None
-            args.append(a)
+            args[i] = a
         return args
 
     def wide_op(self, cx, t, op, k):
@@ -1685,18 +1730,24 @@ class Gen:
             params.append(("byte", False, f"{name}n"))
         for k in range(r.randint(0 if kind != "ref" else 1, 3 - rec)):
             pn = f"{name}a{k}"
-            if r.random() < self.p_arrparam:
-                params.append((vtype(), "[]", pn))
+            if kind == "ref" and k < 2 and r.random() < 0.6:
+                # integer ref parameters, often two: f(i, a[i])
+                params.append((params[0][0] if k and r.random() < 0.5 else r.choice(TNAMES), True, pn))
+            elif r.random() < self.p_arrparam:
+                params.append((r.choice(S) if S and r.random() < 0.5 else r.choice(TNAMES), "[]", pn))
                 asize[pn] = r.randint(1, 3)
             else:
                 params.append((vtype(), kind == "ref" and (k == 0 or r.random() < 0.4), pn))
         ro = kind == "pure"
+        # a struct array parameter that may take only heap arrays, so that its array fields take runtime
+        # indices: always when trampolined, sometimes when inlined
+        hparams = {pn for t, ref, pn in params if ref == "[]" and is_struct(t) and (rec or shared or r.random() < 0.5)}
         reads, targets, arrs, warrs, sroots, swroots = [], [], [], [], [], []
         for t, ref, pn in params:
             self.vt[pn] = t
             if ref == "[]":
                 if is_struct(t):
-                    sr = SR(pn, t, asize[pn], "param")
+                    sr = SR(pn, t, asize[pn], "param", inheap=pn in hparams)
                     sroots.append(sr)
                     if not ro:
                         swroots.append(sr)
@@ -1719,6 +1770,8 @@ class Gen:
                      ptrs=list(cx.gptrs) if glob else [],
                      sroots=sroots + (list(cx.gsroots) if glob else []), swroots=swroots + (list(cx.gsroots) if imp else []),
                      tpass={pn for _, ref, pn in params if ref == "[]"} | (set(cx.gtpass) if glob else set()),
+                     hpass={pn for _, ref, pn in params if ref == "[]" and (rec or shared or pn in hparams)} | (set(cx.gtpass) if glob else set()),
+                     aparams={pn: t for t, ref, pn in params if ref == "[]"},
                      hptrs=list(cx.ghptrs) if glob else [],
                      pure=[p for p in procs if p.kind == "pure" and not is_struct(p.ret)] if glob else [],
                      spure=[p for p in procs if p.kind == "pure" and is_struct(p.ret)] if glob else [],
@@ -1744,7 +1797,7 @@ class Gen:
             size = r.randint(1, 3) if is_struct(t) else r.randint(2, 4)
             body.append(ArrDecl(t, an, size, False))
             if is_struct(t):
-                sr = SR(an, t, size, "cells")
+                sr = SR(an, t, size, "cells", inheap=rec)
                 bcx.sroots.append(sr)
                 bcx.swroots.append(sr)
             else:
@@ -1752,23 +1805,43 @@ class Gen:
                 bcx.warrs.append((an, t, size, False))
             if rec:
                 bcx.tpass.add(an)               # a re-entrant procedure's local arrays live in the heap
+                bcx.hpass.add(an)
         p = Proc(name, ret, params, body, rec, shared, asize)
         p.kind = kind
         p.tramp = rec or shared
+        p.hparams = hparams
+        p.bcx, p.top = bcx, len(body)           # where a call may be added later (call_unrun)
         body += self.stmts(bcx, r.randint(2, 5), 0)
+        for sr in [sr for sr in bcx.swroots if sr.inheap and sr.kind in ("param", "cells") and sr.name.startswith(name)]:
+            # an array field of a struct in the heap reached through a parameter or a re-entrant local, at
+            # runtime indices: a[i].d[j] op= e
+            tm = [(s, lt) for s, lt in self.templates(sr.t) if lt in TYPES and any(k == "i" for k, _ in s)]
+            if tm and r.random() < 0.7:
+                s, lt = r.choice(tm)
+                steps = [self.index_expr(bcx, sr.n, 1, True)] + \
+                        [v if k == "f" else self.index_expr(bcx, v, 2, True) for k, v in s]
+                op = r.choice(["=", "=", "+=", "^="])
+                body.insert(r.randint(p.top, len(body)), Assign(Path("v", sr.name, steps), op, self.fit(self.expr(bcx, 1), lt)))
+        for v in [pn for t, ref, pn in params if ref is True and not is_struct(t)]:
+            if r.random() < 0.6:
+                # write a ref parameter, which the caller may also have used in the index of another argument
+                w = IncDec(VarL(v), r.choice(["++", "--"])) if r.random() < 0.4 else Assign(VarL(v), "=", self.fit(self.expr(bcx, 1), self.vt[v]))
+                body.insert(r.randint(p.top, len(body)), w)
         if rec:
             n = Var(f"{name}n")
 
             def again():
                 """the arguments of a call to itself, which counts n down so that the recursion ends"""
-                args = [Cast("byte", Bin("-", Var(n.name), Lit(1)))]
+                args, used = [Cast("byte", Bin("-", Var(n.name), Lit(1)))], set()
                 for t, ref, pn in params[1:]:
                     if ref == "[]":
-                        args.append(self.array_arg(bcx, p, t, asize[pn], False, set()))
+                        args.append(self.array_arg(bcx, p, t, asize[pn], False, used, pn))
                     elif is_struct(t):
                         args.append(self.struct_value(bcx, t, body))
                     else:
                         args.append(self.fit(self.expr(bcx, 2), t))
+                if None in args:                 # every array parameter passed on, which the caller's arguments made safe
+                    args = [Var(pn) if ref == "[]" else a for (t, ref, pn), a in zip(params, args)]
                 return args
             if kind == "pure" and is_struct(ret):
                 base = []
@@ -1805,6 +1878,95 @@ class Gen:
         p.tramp = p.tramp or any(isinstance(x, (Call, CallS)) and x.name in self.procs and self.procs[x.name].tramp for x in walk(p))
         self.procs[name] = p
         return p
+
+    def call_unrun(self, prog, unrun, ran):
+        """Add a call statement to each procedure in unrun, at the top level of the main program or of a
+        later procedure that ran and may call it (an impure one, or a ref one calling a ref one, and not a
+        trampolined callee from an inlined caller, which would trampoline the caller after its own
+        callers chose their arguments).  In the main program, variables and arrays the arguments need are
+        declared first when there are none (provide), and printed after the call.  Returns the (list,
+        statement) pairs added."""
+        r = self.r
+        added = []
+        for p in unrun:
+            sites = [(prog.main, 0, None)]
+            for q in prog.procs[prog.procs.index(p) + 1:]:
+                if q.name in ran and (q.kind == "impure" or (q.kind == "ref" and p.kind == "ref")) and (q.tramp or not p.tramp):
+                    sites.append((q.body, q.top, q.bcx))
+            r.shuffle(sites)
+            for body, top, cx in sites:
+                pre, post = [], []
+                if cx is None:
+                    cx = self.mcx.but(targets=list(self.mcx.targets), reads=list(self.mcx.reads), warrs=list(self.mcx.warrs),
+                                      arrs=list(self.mcx.arrs), sroots=list(self.mcx.sroots), swroots=list(self.mcx.swroots),
+                                      tpass=set(self.mcx.tpass), hpass=set(self.mcx.hpass))
+                    if r.random() < 0.8:
+                        self.provide(cx, p, pre, post)
+                args = self.stmt_args(cx, p)
+                if args is None:
+                    continue
+                end = next((k for k in range(top, len(body)) if isinstance(body[k], Return)), len(body))
+                at = r.randint(top, end)
+                sts = pre + [CallS(p.name, args)] + post
+                body[at:at] = sts
+                added += [(body, st) for st in sts]
+                break
+        return added
+
+    def provide(self, cx, p, pre, post):
+        """Declarations in the main program (pre) that give each ref and array parameter of p an argument
+        when cx has none, and statements printing them after the call (post)."""
+        r = self.r
+        for t, ref, pn in p.params:
+            if ref == "[]":
+                n = p.asize[pn]
+                have = [a for a in cx.warrs if a[3] != "ptr" and a[1] == t and a[2] >= n] + \
+                       [sr for sr in cx.swroots if sr.kind in ("cells", "heap") and sr.t == t and sr.n >= n]
+                heap = p.tramp or pn in p.hparams or r.random() < 0.4
+                if have and r.random() < 0.5:
+                    continue
+                name, size = self.fresh("ma"), n + r.randint(0, 1)
+                pre.append(ArrDecl(t, name, size, heap))
+                if heap:
+                    cx.tpass.add(name)
+                    cx.hpass.add(name)
+                if is_struct(t):
+                    sr = SR(name, t, size, "heap" if heap else "cells")
+                    cx.sroots.append(sr)
+                    cx.swroots.append(sr)
+                    es = [Cast("byte", Bin(">>", mk(), Lit(8 * k))) for mk, lt in self.const_leaves(sr) for k in range(TYPES[lt][0] // 8)]
+                else:
+                    cx.arrs.append((name, t, size, heap))
+                    cx.warrs.append((name, t, size, heap))
+                    es = [Cast("byte", Bin(">>", Idx(name, Lit(i)), Lit(8 * k))) for i in range(size) for k in range(TYPES[t][0] // 8)]
+                post += [Out(es[i:i + 16]) for i in range(0, len(es), 16)]
+            elif ref and not is_struct(t):
+                if r.random() < 0.5:             # an array of t, for a place: f(i, a[i])
+                    heap, name, size = r.random() < 0.5, self.fresh("ma"), r.randint(2, 4)
+                    pre.append(ArrDecl(t, name, size, heap))
+                    cx.arrs.append((name, t, size, heap))
+                    cx.warrs.append((name, t, size, heap))
+                    es = [Cast("byte", Bin(">>", Idx(name, Lit(i)), Lit(8 * k))) for i in range(size) for k in range(TYPES[t][0] // 8)]
+                    post += [Out(es[i:i + 16]) for i in range(0, len(es), 16)]
+                if [v for v in cx.targets if self.vt[v] == t] and r.random() < 0.6:
+                    continue
+                name = self.fresh("mv")
+                self.vt[name] = t
+                pre.append(Decl(t, name, self.fit(self.expr(cx, 1), t)))
+                cx.targets.append(name)
+                cx.reads.append(name)
+                post.append(Print(Var(name)))
+            elif ref:
+                if any(lt == t for sr in cx.swroots for _, lt in self.templates(sr.t)):
+                    continue
+                name = self.fresh("mv")
+                self.vt[name] = t
+                pre.append(Decl(t, name, None))
+                sr = SR(name, t, 1, "var")
+                cx.sroots.append(sr)
+                cx.swroots.append(sr)
+                es = [Cast("byte", Bin(">>", mk(), Lit(8 * k))) for mk, lt in self.const_leaves(sr) for k in range(TYPES[lt][0] // 8)]
+                post += [Out(es[i:i + 16]) for i in range(0, len(es), 16)]
 
     def program(self):
         r = self.r
@@ -1883,17 +2045,22 @@ class Gen:
                         decls.append(Assign(mk(), "=", self.fit(self.lit(), lt)))
         tpass = {a[0] for a in harrs} | {sr.name for sr in gsr if sr.kind == "heap"}
         hptrs = [a[:3] for a in harrs] + [(sr.name, sr.t, sr.n) for sr in gsr if sr.kind == "heap"]
+        garrays = {}                     # element type -> the global arrays of it (an array parameter may be any)
+        for name, t in [a[:2] for a in garrs + harrs] + [(sr.name, sr.t) for sr in gsr if sr.kind in ("cells", "heap")]:
+            garrays.setdefault(t, set()).add(name)
         cx = Cx(globals_=g, garrs=garrs + harrs, gwarrs=garrs + harrs + gptrs, gptrs=gptrs, gsroots=gsr, gtpass=tpass,
-                ghptrs=hptrs, sroots=[], swroots=[], spure=[], tpass=set(), hptrs=[], ro=False, idxvars=[])
+                ghptrs=hptrs, sroots=[], swroots=[], spure=[], tpass=set(), hpass=set(), hptrs=[], ro=False, idxvars=[],
+                aparams={}, garrays=garrays)
         procs = []
         for i in range(r.choice([2, 3, 3, 4]) if self.focus == "shared" else r.choice([0, 1, 2, 2, 3, 4])):
             procs.append(self.proc(cx, i, procs))
         mcx = cx.but(targets=list(g), reads=list(g), warrs=garrs + harrs + gptrs, arrs=garrs + harrs, ptrs=gptrs,
-                     sroots=list(gsr), swroots=list(gsr), tpass=set(tpass), hptrs=hptrs,
+                     sroots=list(gsr), swroots=list(gsr), tpass=set(tpass), hpass=set(tpass), hptrs=hptrs,
                      pure=[p for p in procs if p.kind == "pure" and not is_struct(p.ret)],
                      spure=[p for p in procs if p.kind == "pure" and is_struct(p.ret)],
                      calls=procs, counters=[], in_loop=False, out_ok=True, ret=None)
         main = self.stmts(mcx, r.randint(4, 10), 0)
+        self.mcx = mcx
         dump = []
         for name in g:
             nb = TYPES[self.vt[name]][0] // 8
@@ -1911,14 +2078,30 @@ class Gen:
 
 def gen_bfl(seed, focus=None):
     """A program and its input for one seed; retries until the model can run it.  focus: "shared" or
-    "struct" makes shared procedures or structs more frequent."""
+    "struct" makes shared procedures or structs more frequent.  A procedure the program does not call
+    gets a call added (Gen.call_unrun), in a few rounds, while the model can still run the program."""
     r = random.Random(seed if focus is None else f"{focus}{seed}")
     for _ in range(20):
-        prog, stdin = Gen(r, focus).program()
+        gen = Gen(r, focus)
+        prog, stdin = gen.program()
+        ran = set()
         try:
-            expected = model_run(prog, stdin)
+            expected = model_run(prog, stdin, ran)
         except ModelError:
             continue
+        for _ in range(3):
+            unrun = [p for p in prog.procs if p.name not in ran]
+            added = gen.call_unrun(prog, unrun, ran) if unrun else []
+            if not added:
+                break
+            more = stdin + bytes(r.randint(0, 255) for _ in range(4))
+            ran2 = set()
+            try:
+                expected, stdin, ran = model_run(prog, more, ran2), more, ran2
+            except ModelError:
+                for lst, st in added:
+                    lst.remove(st)
+                break
         return prog, stdin, expected
     return None
 
@@ -2418,7 +2601,8 @@ def run_cases(bf, bfl_n, bf_n, seed0, tmp, jobs=None, log=print, progress=False,
                 res = f.result()
             except Exception as e:      # a bug in the fuzzer itself
                 k, s = futs[f]
-                res = Result(k, s, "fail", [Failure("fuzzer", "", repr(e))], focus=focus if k == "bfl" else None)
+                tb = "".join(traceback.format_exception(type(e), e, e.__traceback__)[-3:]).strip()
+                res = Result(k, s, "fail", [Failure("fuzzer", "", tb)], focus=focus if k == "bfl" else None)
             with lock:
                 results.append(res)
                 if res.status == "fail":
@@ -2434,7 +2618,9 @@ def save_failure(res, outdir, bf, tmp, shrink, log):
     os.makedirs(outdir, exist_ok=True)
     base = os.path.join(outdir, f"{res.kind}-{res.focus + '-' if res.focus else ''}{res.seed}")
     notes = [f"seed {res.seed}", res.replay()] + [str(f) for f in res.fails]
-    if res.kind == "bfl":
+    if res.data is None:                 # the fuzzer itself failed: there is no program to write
+        pass
+    elif res.kind == "bfl":
         prog, stdin, expected = res.data
         with open(base + ".bfl", "w", newline="\n") as f:
             f.write(prog.text())
@@ -2515,6 +2701,7 @@ def main():
     ap.add_argument("--replay", nargs=2, metavar=("KIND", "SEED"), help="run one program (bfl or bf) and show it")
     ap.add_argument("--focus", choices=["shared", "struct"], help="BFL programs with more shared procs or structs")
     a = ap.parse_args()
+    a.bf = os.path.abspath(a.bf)
     tmp = tempfile.mkdtemp(prefix="bffuzz")
     if a.replay:
         sys.exit(replay(a.bf, a.replay[0], int(a.replay[1]), tmp, a.focus))
@@ -2531,6 +2718,8 @@ def main():
                   + (f", {sum(r.shared for r in rs)} sharing arithmetic, {sum(r.procs_shared for r in rs)} with shared procs"
                      if kind == "bfl" else ""))
     print(f"{time.time() - t0:.0f} s")
+    if not failed:
+        shutil.rmtree(tmp, ignore_errors=True)
     sys.exit(1 if failed else 0)
 
 

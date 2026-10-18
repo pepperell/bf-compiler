@@ -91,6 +91,12 @@ DIAGS = [
     ("err-struct-self", "struct S { S inner; }", ["1:12: a struct cannot contain itself; use a pointer"], (), 1),
     ("err-dot-on-pointer", "struct Point { int x; int y; } heap Point h[1]; Point* p = h; p.x = 1;", ["1:64: 'Point*' is a pointer: use '->'"], (), 1),
     ("err-cell-struct-runtime-index", "struct B { byte d[3]; } B b; byte i = 1; b.d[i] = 2;", ["1:46: an array field of a struct held in cells needs a constant index; put the struct in the heap"], (), 1),
+    ("err-cell-struct-index-param", "struct B { byte d[3]; } B c[2]; proc f(ref B a[], byte i) { a[0].d[i] = 1; } f(c, in);",
+     ["1:68: an array field of a struct held in cells needs a constant index; the array passed for 'a' is in cells: pass a heap array"], (), 1),
+    ("err-cell-struct-index-local", "struct B { byte d[3]; } shared proc f(byte i) { B l[2]; l[1].d[i] = 1; } f(in);",
+     ["1:64: an array field of a struct held in cells needs a constant index; put the struct in the heap"], (), 1),
+    ("err-returned-struct-runtime-index", "struct B { byte d[3]; } proc B mk() { B r; return r; } byte i = 1; out mk().d[i];",
+     ["1:79: an array field of a returned struct needs a constant index"], (), 1),
     ("err-import-missing", 'import "nope.bfl";', ["1:1: cannot find 'nope.bfl' next to this file or in the standard library"], (), 1),
     ("warn-library-quiet", 'import "strings.bfl"; import "math.bfl"; byte x = 1; out x;', [], ["--warn"], 0),
     ("err-int-range", "int a = 40000; sbyte s = 300;",
@@ -472,6 +478,16 @@ case("ref-arg-place-fixed", "heap byte h[3]; proc f(ref byte x, ref byte y) { x 
      " shared proc g2(ref byte y, ref byte x) { x = 2; y = 9; } byte a[3]; byte i = 0; f(i, a[i]); i = 0; f(i, h[i]); print a[0], a[2], h[0], h[2], \" \";"
      " byte b[3]; byte c[3]; byte j = 0; g(j, b[j]); j = 0; g2(c[j], j); j = 0; h[0] = 0; g2(h[j], j); print b[0], b[2], c[0], c[2], h[0], h[2];",
      b"9090 909090")
+# ... and a runtime index into an array field of a struct in the heap was rejected when the heap array was
+# reached through an array parameter (trampolined, or inlined and given a heap array) or was the local array
+# of a re-entrant procedure
+case("heap-field-index-param", "struct C { byte w; byte d[3]; } heap C pool[3];"
+     " shared proc g(ref C a[], byte i, byte j) { a[i].d[j] = 1 + i + j; a[i].w = a[i].d[j]; }"
+     " proc f(ref C a[], byte i, byte j) { a[i].d[j] += 10 + i + j; g(a, i, 0); } proc h(ref C a[], byte i, byte j) { a[i].d[j]--; }"
+     " rec proc r(byte n, byte j) { C la[2]; la[1].d[j] = n + 5; if (n != 0) { r(n - 1, j); } pool[2].d[0] = pool[2].d[0] + la[1].d[j]; }"
+     " byte i = in; byte j = in; g(pool, i, j); f(pool, i, j + 1); h(pool, i, j); r(2, j);"
+     " print pool[1].d[1], \" \", pool[1].d[2], \" \", pool[1].d[0], \" \", pool[1].w, \" \", pool[2].d[0];",
+     b"2 13 2 2 18", b"\x01\x01")
 case("mul-const", "byte a = in; print a * 10, \" \", 7 * a;", b"230 161", b"\x17")
 # mulshr: the exact product shifted right (the grids cover every type and count)
 case("mulshr-const", "print mulshr(-3, 5, 1), \" \", mulshr(100000, 100000, 20), \" \", mulshr(4294967295, 4294967295, 64), \" \", mulshr(-2147483648, 4294967295, 70);", b"-8 9536 0 -1")
