@@ -1,9 +1,10 @@
 # Roadmap: BFL towards modern programming
 
-Status: implemented (phases 0 to 8). Hardware and devices are out of scope here.
-The sections below are the plan as written. Where the result differs, docs/HEAP.md
-(phase 0), docs/TRAMPOLINE.md (phase 7) and the note under phase 8 say what was
-built, and docs/LANG.md describes the language as it is.
+Status: implemented (phases 0 to 8); phases 9 to 14 are planned (section 11).
+Hardware and devices are out of scope here. The sections below are the plan as
+written. Where the result differs, docs/HEAP.md (phase 0), docs/TRAMPOLINE.md
+(phase 7) and the note under phase 8 say what was built, and docs/LANG.md
+describes the language as it is.
 
 BFL today has bytes and 16-bit words, byte arrays, inlined procedures with return
 values, and recursion through `rec proc` (docs/LANG.md, docs/TRAMPOLINE.md). What
@@ -25,6 +26,12 @@ plus the type system, library and tooling they need.
 | 6 | Imports and the standard library | 1, 5 |
 | 7 | Recursion on the heap: frames in memory, restrictions lifted | 3, 4 |
 | 8 | Tooling: settings, terminal width, syntax colouring, multi-file debugging | 6 |
+| 9 | Planned: a differential fuzzer for the optimiser and JIT | nothing |
+| 10 | Planned: fused multiply-and-shift for fixed-point arithmetic | 9 |
+| 11 | Planned: arithmetic shared within a block, without the trampoline | 9 |
+| 12 | Planned: faster division | 9 |
+| 13 | Planned: the profiler in the UI | nothing |
+| 14 | Planned: housekeeping (the raytracer animation) | nothing |
 
 One change from the earlier suggestion: better compiler errors move from last to
 phase 1. Pointers, structs and signed types need a real type checker, and today
@@ -226,7 +233,93 @@ touches breakpoint backgrounds nor fills the undo history. Watch rows show
 multi-byte, signed and pointer values whole. Run > Check heap accesses and Run >
 Check recursion stack match the `bf` flags.
 
-## 11. Decisions for you
+## 11. Next: phases 9 to 14 (planned)
+
+After phase 8 the optimiser learnt loop idioms (multi-byte carries, compares,
+halving and byte division each run in one step), known cell values carried
+across blocks, automatic layout of globals, one-walk array elements, folding of
+constant arguments and `shared proc` (README.md "Speed", docs/LANG.md). Where
+that leaves things, measured on `programs/samples/raytracer.bfl`: a frame takes
+70 ms (2.3 s before), the program is 5.67M brainfuck commands (7.92M before), a
+32-bit `*` executes about 2 400 IR instructions and a `/` about 7 000, and long
+arithmetic is most of both the code and the run time.
+
+### Phase 9: differential fuzzer for the optimiser and JIT
+
+The loop idioms, the block rebuilding and the inline idiom code in the JIT are
+the most intricate parts of the executor, and each is checked by a handful of
+test programs. `tests/fuzz_shared.py` (shared against inlined procedures) found
+a miscompile on its first run that no hand-written test had: a dangling pointer
+that made the same source compile differently now and then.
+
+- Generate random BFL programs over every integer type: arithmetic, shifts,
+  compares, casts, arrays in cells and in the heap, loops with `break` and
+  `continue`, inlined procedures. Generate raw brainfuck too, with poked
+  scratch cells, as the idiom tests do.
+- Run each through the JIT, the IR interpreter and the unoptimised JIT (the
+  reference: every command as written), with idioms and block rebuilding on and
+  off (`BF_NO_IDIOMS`, `BF_NO_REBUILD`); for BFL arithmetic also check against
+  values computed in Python.
+- Check that compiling the same source twice gives the same brainfuck.
+- Shrink failing programs automatically, as `reduce_nd.py` did by hand.
+- A few seeds run in the test suites; long runs on demand.
+
+Done when: a long run (thousands of programs) finds nothing, and every bug it
+found has a minimal regression test.
+
+### Phase 10: fused multiply-and-shift
+
+Fixed-point code is full of `(a * b) >> 12`: a full 32-bit product, then a
+shift. Each such statement in the raytracer compiles to 40 000 to 70 000
+commands. A built-in (for example `mulshr(a, b, 12)`, or a recognised pattern)
+computes only the bytes of the product that survive the shift: fewer
+partial products, no shift afterwards.
+
+Done when: the raytracers, `cube.bfl` and `starfield.bfl` use it, with sizes and
+frame times measured before and after, and the grids test it against Python for
+every type and shift count.
+
+### Phase 11: arithmetic shared within a block
+
+Most of the remaining size is inlined `*` and `/`: `place_camera` in the
+raytracer is 1.6M commands of straight-line arithmetic. `shared proc` cannot fix
+this, because sharing through the trampoline makes every caller a trampoline
+too (docs/LANG.md, "When shared pays"). Instead, when a block or statement holds
+several multiplies (or divides) of the same width, emit one copy of the routine
+inside a small local loop that runs once per operation, choosing operands and
+destination by a counter. No dispatcher, no frames, and known values survive
+outside the loop.
+
+Done when: measured on the samples; kept only where it makes code smaller
+without making frames noticeably slower.
+
+### Phase 12: faster division
+
+Division is the costliest operation (about 7 000 IR instructions for 32 bits)
+and the top of the raytracer's profile (`isqrt`, normalising vectors). Options to
+measure: recognise the whole bit-by-bit division loop as one idiom; divide a byte
+at a time; skip more leading zero bits of the divisor and dividend.
+
+Done when: `/` and `%` are measurably cheaper in executed instructions and the
+raytracer frame time drops, with the grids green.
+
+### Phase 13: the profiler in the UI
+
+`bf --profile` lists the BFL statements that execute the most instructions. In
+the UI: Run > Profile runs the program on the interpreter, then colours the
+editor's lines by their share of instructions (a heat scale) and lists the top
+statements in a pane; double-click jumps to the line. Multi-file programs show
+imported files' counts in the file viewer.
+
+Done when: profiling a sample in the UI agrees with `bf --profile`.
+
+### Phase 14: housekeeping
+
+`docs/raytracer.gif` (16 frames of the raytracer) is not committed and was
+recorded when a frame took 2.3 s. Re-record it now that a frame takes 70 ms, and
+commit it with a mention in README.md, or drop it.
+
+## 12. Decisions for you
 
 1. **Pointer syntax.** C-style `byte* p`, `*p`, `p->x` is assumed. An alternative
    is Pascal-style `^byte`, or keeping `ref` and adding `ptr`.
@@ -238,7 +331,7 @@ Check recursion stack match the `bf` flags.
 5. **Checks.** Null, bounds and stack checks are opt-in flags, since each one
    costs on every access.
 
-## 12. Risks
+## 13. Risks
 
 - **Heap access speed** decides how usable phases 3 to 7 are. Phase 0 exists to
   find out before anything depends on it.
