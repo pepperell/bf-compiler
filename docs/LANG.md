@@ -468,9 +468,10 @@ byte compare, the carry and borrow chains of multi-byte `+` and `-`, halving
 (shifts, bitwise operators) and byte division each run as one step (`src/ir.cpp`,
 "loop idioms"), and so does the whole multi-byte division loop ("the division
 loop"). Measured in IR instructions executed, a 32-bit `+` is about 40, `<` about
-120, `*` about 2 400 and `/` about 200, against 10 000, 2 300, 129 000 and
-290 000 without those idioms. Several of the same word or long `*`, `mulshr`,
-`/` or `%` in one sum or run of statements share one copy of their code
+120, `*` 1 700 to 2 400 (more for larger operands) and `/` about 200, against
+10 000, 2 300, 129 000 and 290 000 without those idioms. Several of the same
+16- or 32-bit `*`, `mulshr`, `/` or `%` in one sum or run of statements share
+one copy of their code
 ("Shared arithmetic" below): three `long` products in a sum are about 15 000
 commands instead of 34 500.
 `bf --profile` shows where a program's instructions go, by statement. The compiler also tracks cells whose value it knows in straight-line
@@ -518,7 +519,7 @@ These are the building blocks; knowing them helps read the output and write
   operands). The optimiser recognises the loop by its exact text and runs all
   the passes in one step; signs, division by zero and the moves in and out are
   done around it.
-- **Shared arithmetic.** A word or long `*`, `mulshr`, `/` or `%` is thousands
+- **Shared arithmetic.** A 16- or 32-bit `*`, `mulshr`, `/` or `%` is thousands
   of commands (a 32-bit `*` about 11 000), so when a block would emit the same
   routine (operator, width, signedness, and for `mulshr` the count) at least
   twice, it emits it once, inside a loop that runs once per operation: a counter
@@ -532,10 +533,17 @@ These are the building blocks; knowing them helps read the output and write
   operations are done the statement itself runs, reading those cells; up to two
   statements without such an operation may sit between two that have one. The
   first operation's factors are evaluated before the loop and the last
-  statement after it, with the cell values the compiler knows; values known
-  before the loop that no statement in it writes are known again after it.
-  A constant factor is not shared (it becomes shifts and adds). `BFL_SHARE=0`
-  in the environment of `bf` turns sharing off, for measuring. In the
+  statement after it, with the cell values the compiler knows; the other
+  statements run inside the loop without them. Values known before the loop
+  that no statement in it writes are known again after it. A constant factor
+  is not shared (it becomes shifts and adds), nor is an operation that reads a
+  variable whose value the compiler knows: a run ends before its statement,
+  which can then fold it or use a constant factor, and its result is known. One
+  loop runs at most 16 operations, because the code between the loop's flags
+  and the variables grows with their number: a sum with more is cut into
+  several loops, and a run ends before the statement that would pass 16.
+  `BFL_SHARE=N` in the environment of `bf` sets the fewest operations shared
+  (1 counts as 2), and 0 or less turns sharing off, for measuring. In the
   statement map each statement of a run keeps a range where it starts, where
   the debugger stops; the loop's own code, the routine included, is a
   continuation of the run's first statement, so `bf --profile` counts the

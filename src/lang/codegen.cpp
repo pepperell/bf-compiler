@@ -990,7 +990,15 @@ struct Gen {
     // with the known cell values of straight-line code; the values known before the loop that it cannot
     // change are known again after it.  Two places use it: the terms of one sum (shared_terms, from
     // binary_wide) and a run of statements (find_run and gen_run, from gen_stmts).  Either shares a routine
-    // that would otherwise be emitted at least opt.share times (2 by default; 0 turns sharing off).
+    // that would otherwise be emitted at least share_min() times, at most SHARE_MAX of them in one loop.
+    // The fewest operations worth sharing: opt.share (2 by default), 0 or less never shares, and 1 is
+    // taken as 2 (one operation has nothing to share the routine with).
+    int share_min() const { return opt.share <= 0 ? 0 : std::max(opt.share, 2); }
+    // The most operations one loop runs.  Its flags and operand cells lie past the variables, so the code
+    // between them grows with the count: beyond about 16 operations the loop gets bigger for each one
+    // added, and a 16-bit run of 32 statements is bigger shared than inlined.  (The pass counter is also a
+    // single cell, good for 255.)  A sum with more is cut into loops of at most this many.
+    static constexpr int SHARE_MAX = 16;
     struct SharedKind {
         char op = 0;                // '*', 'm' (mulshr), '/', '%'
         int n = 0, k = 0;           // width; mulshr's shift count
@@ -1013,7 +1021,7 @@ struct Gen {
     }
     // The routine e runs on as a term of an n-byte sum, if it is one that can be shared.
     std::optional<SharedKind> shared_kind(const Expr& e, int n) {
-        if (!opt.share || n < 2 || sz(e) != n || !e.type || !e.type->is_int()) return std::nullopt;
+        if (!share_min() || n < 2 || sz(e) != n || !e.type || !e.type->is_int()) return std::nullopt;
         if (!precomputed.empty() && precomputed.count(&e)) return std::nullopt;    // computed already (gen_run)
         const Type* t = conv_type(e.type);
         if (e.kind == Expr::MulShr) return SharedKind{'m', n, std::min((int)e.value, 16 * n), t->is_signed};
@@ -1035,6 +1043,7 @@ struct Gen {
     };
     void run_shared(const SharedKind& kd, const std::vector<SharedOp>& ops, int64_t acc, const SharedHooks& h = {}) {
         int n = kd.n, m = (int)ops.size();
+        if (m < 2 || m > SHARE_MAX) internal("shared routine for " + std::to_string(m) + " operations");
         bool pos = false, neg = false;
         for (const SharedOp& o : ops) (o.sign > 0 ? pos : neg) = true;
         auto snapshot = known;
@@ -1162,16 +1171,41 @@ struct Gen {
         if (e && n >= 2 && sz(*e) >= 2) wide_ops(*e, found);
         return found;
     }
-    // The longest run of statements from v[i] whose operations of one kind, at least opt.share of them,
-    // can share a routine.  Statements without such an operation may sit between two that have one, up
-    // to SHARE_GAP in a row.  Returns the number of statements in the run (0: none), its kind and operations.
+    // Does e read a variable the compiler knows the value of (a cell in vals)?  declared: the names declared
+    // by earlier statements of the run, which have no cells yet.
+    bool reads_known(const Expr& e, const std::unordered_map<int64_t, int>& vals, const std::unordered_set<std::string>& declared) {
+        if (e.kind == Expr::Name) {
+            const Var* v = declared.count(e.text) ? nullptr : find_var(e.text);
+            if (!v || v->is_const) return false;
+            for (int64_t c = v->cell, end = c + (v->count >= 0 ? array_total(*v) : v->size()); c < end; c++)
+                if (vals.count(c)) return true;
+            return false;
+        }
+        return (e.a && reads_known(*e.a, vals, declared)) || (e.b && reads_known(*e.b, vals, declared));
+    }
+    // The variable whose cells an assignment to target writes, if the compiler can tell.
+    const Var* target_var(const Expr& target) {
+        switch (target.kind) {
+        case Expr::Name: return find_var(target.text);
+        case Expr::Index: return target_var(*target.a);
+        case Expr::Field: return target.arrow ? nullptr : target_var(*target.a);
+        default: return nullptr;
+        }
+    }
+    // The longest run of statements from v[i] whose operations of one kind, at least share_min() and at most
+    // SHARE_MAX of them, can share a routine.  Statements without such an operation may sit between two that
+    // have one, up to SHARE_GAP in a row.  An operation that reads a variable with a value the compiler knows
+    // ends the run before its statement: generated outside the loop, it can fold or use a constant factor,
+    // and its result can be known.  Returns the number of statements in the run (0: none), its kind and
+    // operations.
     static constexpr int SHARE_GAP = 2;
     size_t find_run(const std::vector<StmtP>& v, size_t i, SharedKind& kind, std::vector<std::vector<const Expr*>>& ops) {
-        if (!opt.share || !shareable_stmt(*v[i])) return 0;
+        if (!share_min() || !shareable_stmt(*v[i])) return 0;
         struct Found { std::vector<std::pair<const Expr*, SharedKind>> ops; bool in_sum = true; };
         std::vector<Found> all;
         std::unordered_map<int64_t, int> saved;
         std::swap(saved, known);                       // the run's later statements see other values
+        std::unordered_map<int64_t, int> vals = saved; // known before the run and not written by it so far
         std::unordered_set<std::string> declared;
         run_names = &declared;
         for (size_t j = i; j < v.size(); j++) {
@@ -1179,6 +1213,7 @@ struct Gen {
             if (!shareable_stmt(s)) break;
             Found f;
             for (const Expr* x : stmt_ops(s)) f.ops.emplace_back(x, *shared_kind(*x, sz(*x)));
+            if (std::any_of(f.ops.begin(), f.ops.end(), [&](auto& o) { return reads_known(*o.first, vals, declared); })) break;
             if (!f.ops.empty()) {                      // are they all terms of the statement's sum?
                 Terms terms; int64_t c = 0;
                 collect_terms(*s.e, 1, terms, c, sz(*s.e));
@@ -1188,6 +1223,9 @@ struct Gen {
             all.push_back(f);
             if (all.size() > (size_t)SHARE_GAP && std::all_of(all.end() - SHARE_GAP - 1, all.end(), [](auto& x) { return x.ops.empty(); })) break;
             if (s.kind == Stmt::Decl) declared.insert(s.name);
+            else if (const Var* tv = target_var(*s.target)) {
+                for (int64_t c = tv->cell, end = c + (tv->count >= 0 ? array_total(*tv) : tv->size()); c < end; c++) vals.erase(c);
+            } else vals.clear();                       // through a pointer: it could be anything
         }
         std::swap(saved, known);
         run_names = nullptr;
@@ -1202,11 +1240,12 @@ struct Gen {
                 std::vector<const Expr*> mine;
                 for (auto& o : all[j].ops) if (o.second == kd) mine.push_back(o.first);
                 if (mine.empty()) { if (++gap > SHARE_GAP) break; picked.push_back(mine); continue; }
+                if (count + (int)mine.size() > SHARE_MAX) break;
                 gap = 0; count += (int)mine.size(); stmts++; end = j + 1;
                 picked.push_back(mine);
             }
             // the terms of a single statement's sum share without a run (shared_terms)
-            if (count < opt.share || count <= best_count || (stmts == 1 && all[0].in_sum)) continue;
+            if (count < share_min() || count <= best_count || (stmts == 1 && all[0].in_sum)) continue;
             best = end; best_count = count; kind = kd;
             picked.resize(end);
             ops = picked;
@@ -1270,18 +1309,28 @@ struct Gen {
         releaseN(H, (int)(slots * n));
     }
 
-    // The terms of an n-byte sum that use one routine at least opt.share times, by routine; they are taken
-    // out of terms.
+    // The terms of an n-byte sum that use one routine at least share_min() times, by routine, in loops of
+    // at most SHARE_MAX of them (as even as possible); they are taken out of terms.
     std::vector<std::pair<SharedKind, std::vector<SharedOp>>> shared_terms(Terms& terms, int n) {
-        std::vector<std::pair<SharedKind, std::vector<SharedOp>>> groups;
-        if (!opt.share) return groups;
+        std::vector<std::pair<SharedKind, std::vector<SharedOp>>> groups, cut;
+        if (!share_min()) return groups;
         for (auto& tm : terms) if (!movable(*tm.first)) return groups;     // terms are evaluated in another order
         for (auto& tm : terms) if (auto kd = shared_kind(*tm.first, n)) {
             auto it = std::find_if(groups.begin(), groups.end(), [&](auto& g) { return g.first == *kd; });
             if (it == groups.end()) groups.push_back({*kd, {}}), it = groups.end() - 1;
             it->second.push_back({tm.first, tm.second});
         }
-        groups.erase(std::remove_if(groups.begin(), groups.end(), [&](auto& g) { return (int)g.second.size() < opt.share; }), groups.end());
+        for (auto& g : groups) {
+            size_t total = g.second.size();
+            if ((int)total < share_min()) continue;
+            size_t parts = (total + SHARE_MAX - 1) / SHARE_MAX, from = 0;
+            for (size_t p = 0; p < parts; p++) {
+                size_t to = total * (p + 1) / parts;   // more than SHARE_MAX / 2 in each when cut
+                cut.push_back({g.first, std::vector<SharedOp>(g.second.begin() + (std::ptrdiff_t)from, g.second.begin() + (std::ptrdiff_t)to)});
+                from = to;
+            }
+        }
+        groups = cut;
         Terms rest;
         for (auto& tm : terms) {
             bool taken = false;

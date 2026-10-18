@@ -488,7 +488,13 @@ case("share-known-values", "long a = in; long b = in; b = b * 1000 + 3; long x =
      b"117039 1521510 22 117040 5 81054009", b"\x0d\x09")
 case("share-in-loop", "long a = in; long b = in; long s = 0; byte i; for (i = 0; i < 5; i++) { if (i == 3) { continue; } long x = a * b; long y = x * a; s += y * b - x * x + x; if (s > 100000000) { break; } a += 1000; }"
      " print s, \" \", a;", b"142508 4049", b"\x31\x17")
-case("share-rec", "rec proc long f(long n, long m) { if (n == 0) { return m; } long x = n * m; long y = x * x - n * n; return f(n - 1, y % 1000003) + x * n; } print f(4, 12345);",
+# more operations than one loop runs (16; its pass counter is a single cell): a sum of 300 is cut into
+# several loops, and a run of 130 statements into several runs
+SHARE_PRE = "word a = in; a = a * 256 + in; word b = in; b = b * 3 + 7; word c = in; word d = in; d = d * 5 + 1;"
+case("share-many-terms", SHARE_PRE + " word x = 0 " + " ".join(("-" if i % 3 == 2 else "+") + " a * b" for i in range(300)) + "; print x;",
+     b"20176", b"\x12\x34\x56\x78\x9a")
+case("share-many-stmts", SHARE_PRE + " word x = c;" + " x = x + a * b - c * d;" * 130 + " print x;", b"4944", b"\x12\x34\x56\x78\x9a")
+case("share-rec","rec proc long f(long n, long m) { if (n == 0) { return m; } long x = n * m; long y = x * x - n * n; return f(n - 1, y % 1000003) + x * n; } print f(4, 12345);",
      b"-2088721")
 case("array-const-index", "byte a[4]; a[0] = 'a'; a[1] = a[0] + 1; a[3] = a[1] + 2; a[2] = a[3] - 1; out a[0], a[1], a[2], a[3];", b"abcd")
 case("array-runtime", """
@@ -709,6 +715,37 @@ def share_map():
     return ok
 
 
+SHARE_SETTING_SRC = """long a = long(in) * 1000; long b = long(in) - 7;
+long x = a * b + 5; long y = a / b; long z = mulshr(a, b, 3) - 1; long w = x * y;
+long k = 100000; long m = 7; long p = k / m; long q = p / m; long r = k * m; long u = r * p;
+print x, " ", y, " ", z, " ", w, " ", p, " ", q, " ", u;
+"""
+
+
+def share_setting():
+    """BFL_SHARE: 1 compiles as 2 (one operation has nothing to share with), 0 and below never share,
+    and all print the same.  The second line is a run sharing a multiply (x and w).  Operations on values
+    the compiler knows are not shared: the third line's fold whether or not sharing is on."""
+    src = os.path.join(TMP, "share_setting.bfl")
+    open(src, "w", newline="\n").write(SHARE_SETTING_SRC)
+    folded = os.path.join(TMP, "share_known.bfl")
+    open(folded, "w", newline="\n").write(SHARE_SETTING_SRC.splitlines()[2] + "\nprint p, \" \", q, \" \", u;\n")
+    sizes, outs, known = {}, {}, {}
+    for share in ("2", "1", "0", "-1"):
+        env = dict(os.environ, BFL_SHARE=share)
+        for f, into in ((src, sizes), (folded, known)):
+            r = subprocess.run([BF, "--emit", os.path.join(TMP, "share_setting.b"), f], capture_output=True, text=True, timeout=60, env=env)
+            m = re.search(r"(\d+) commands", r.stdout + r.stderr)
+            into[share] = int(m.group(1)) if r.returncode == 0 and m else 0
+        outs[share] = subprocess.run([BF, "--quiet-devices", src], input=b"ab", capture_output=True, timeout=60, env=env).stdout
+    ok = (0 < sizes["2"] == sizes["1"] < sizes["0"] == sizes["-1"] and 0 < known["2"] == known["0"]
+          and set(outs.values()) == {b"8827005 1065 1103374 810825733 14285 2040 1409565408"})
+    print(("PASS " if ok else "FAIL ") + "share-setting")
+    if not ok:
+        print(f"   sizes {sizes}, with known values {known}, outputs {outs}")
+    return ok
+
+
 def shared_fuzz():
     """A few programs of tests/fuzz_shared.py: shared and inlined procedures agree."""
     sys.path.insert(0, os.path.dirname(__file__))
@@ -746,6 +783,8 @@ def main():
     if not deterministic():
         fails += 1
     if not share_map():
+        fails += 1
+    if not share_setting():
         fails += 1
     if not shared_fuzz():
         fails += 1
@@ -803,7 +842,7 @@ def main():
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1
-    total = len(CASES) + 7 + len(errors) + len(DIAGS) + len(GRIDS) + len(MULSHR_GRIDS) + n_samples
+    total = len(CASES) + 8 + len(errors) + len(DIAGS) + len(GRIDS) + len(MULSHR_GRIDS) + n_samples
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

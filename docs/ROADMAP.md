@@ -418,7 +418,33 @@ charges the routine to that line, and breakpoints no longer stop at continuation
 
 The heuristic: share whenever a routine would otherwise be emitted at least twice in one
 sum or one run (`Options::share`; `BFL_SHARE=N` in the environment of `bf` sets the
-minimum, 0 turns it off). Variants measured on the samples (only these four change):
+minimum, 1 counts as 2, and 0 or less turns it off). Two limits came from review:
+
+- One loop runs at most 16 operations (`SHARE_MAX`). The flags and operand cells lie past
+  the variables, so the code between them grows with the count and the loop's size with
+  its square; the pass counter is also one cell, which wrapped at 256 operations and gave
+  wrong results. A sum with more is cut into even loops of at most 16, and a run ends
+  before the statement that would pass 16. Size with sharing minus size without, in
+  commands, for a few caps:
+
+  | | cap 8 | cap 16 | cap 32 | cap 64 | no cap |
+  |---|---:|---:|---:|---:|---:|
+  | sum of 128 `long` `*` | -1 108 K | -1 135 K | -1 074 K | -892 K | -500 K |
+  | sum of 128 `word` `/` | -146 K | -133 K | -88 K | +11 K | +215 K |
+  | run of 32 `x = x + x * b;` on `word` | -30 K | -21 K | +1.7 K | +1.7 K | +1.7 K |
+  | run of 64 `x = x + mulshr(x, b, 7);` on `long` | -441 K | -433 K | -357 K | -177 K | -177 K |
+
+  16 is best or close to it for 32-bit operations (16-bit runs do better at 8), and the
+  samples are the same at any cap from 16 up; at 8 the raytracer is 10 K commands larger.
+- An operation that reads a variable whose value the compiler knows ends a run before its
+  statement (`reads_known`, against the values known before the run less the variables
+  its earlier statements assign). Generated outside the loop it folds or uses a constant
+  factor, and its result stays known: `long k = 100000; long m = 7; long x = k / m; ...`
+  had been 256 556 commands shared against 192 358 without sharing, and is now the same.
+  The other statements of a run still lose the values the compiler knows, since they run
+  inside the loop.
+
+Variants measured on the samples (only these four change):
 
 | | raytracer commands | ms a frame | raytracer_text | cube | starfield |
 |---|---:|---:|---:|---:|---:|
@@ -437,11 +463,14 @@ frame times differ by about 1 ms from run to run.
 
 Tests: `share-*` cases in `tests/test_lang.py` (sums of each kind with mixed signs, runs of
 each kind, operations apart in one statement, known values kept and dropped, a run in a
-loop with `continue` and `break`, in a `rec proc`), and `share-map`: a run is smaller than
-with `BFL_SHARE=0`, prints the same, has a step mark for each statement and `bf --profile`
-counts each line. The fuzzer generates runs of statements with several operations of one
+loop with `continue` and `break`, in a `rec proc`, a sum of 300 and a run of 130
+statements), `share-map`: a run is smaller than with `BFL_SHARE=0`, prints the same, has a
+step mark for each statement and `bf --profile` counts each line, and `share-setting`:
+`BFL_SHARE` of 1 and -1 compile like 2 and 0, and operations on known values are the same
+size with and without sharing. The fuzzer generates runs of statements with several operations of one
 kind (`shared_run`) and runs every program compiled with `BFL_SHARE=0` as well; `--bfl 2000
---bf 300` (seed 20000) found nothing, and 1 151 of the 2 000 programs shared arithmetic.
+--bf 300` (seed 20000) found nothing, and 1 151 of the 2 000 programs shared arithmetic; after
+the two limits, `--bfl 800 --bf 300` (seed 31000) found nothing, with 439 sharing.
 
 Measured with `tools/bench.py` against the commit before (after phase 12):
 
