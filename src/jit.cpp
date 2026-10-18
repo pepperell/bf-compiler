@@ -115,7 +115,7 @@ bool jit_compile(const Program& p, JitCode& out) {
                 guard = e.jcc(Emitter::CC_B);
             }
             const Idiom& d = p.idioms[(size_t)x.arg];
-            if (d.kind == IDIOM_DIVMOD || d.kind == IDIOM_DIVIDE) {
+            if (d.kind == IDIOM_DIVMOD || d.kind == IDIOM_DIVIDE || d.kind == IDIOM_MULTIPLY || d.kind == IDIOM_PRODUCT) {
                 e.mov_ctxptr_from_r12();
                 e.mov_rcx_rbx();
                 e.b({0xBA}); e.d32(x.arg);                         // mov edx, idx
@@ -123,6 +123,11 @@ bool jit_compile(const Program& p, JitCode& out) {
                 e.b({0x85, 0xC0});                                 // test eax, eax
                 fixups.push_back({e.jcc(Emitter::CC_NE), x.target});
             } else {
+                // a loop that reaches the end of the tape runs as written, which faults (or not) where it should:
+                // the code below touches every cell of a carry chain and reads every scratch cell
+                e.b({0x49, 0x8D}); e.r12mem(0, d.hi);              // lea rax, [r12+hi]
+                e.b({0x48, 0x3B, 0x43, 0x50});                     // cmp rax, [rbx+80]  (tape_end)
+                fixups.push_back({e.jcc(Emitter::CC_AE), (int32_t)i + 1});
                 for (const Idiom::Guard& g : d.guards) {           // scratch cells: else run the body
                     if (!g.check) continue;
                     e.b({0x41, 0x80}); e.r12mem(7, g.off); e.d8(g.val);         // cmp byte [r12+off], val

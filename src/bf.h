@@ -11,6 +11,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <vector>
@@ -64,12 +65,18 @@ enum IdiomKind : uint8_t {
     IDIOM_DIVMOD,   // cells R, C, Q, B: per pass R++, C--, and when C reaches 0: Q++, R = 0, C = B
     IDIOM_DIVIDE,   // the division loop (division_loop): cells the bytes of A, R and B, `bytes` each;
                     // per pass (A:R) <<= 1, and when R >= B: R -= B, A |= 1
+    IDIOM_MULTIPLY, // the multiply loop (multiply_loop): cells the `wide` bytes of P, then the `bytes`
+                    // bytes of A and of B; per pass P = 2P + A * (B's top bit), B <<= 1
+    IDIOM_PRODUCT,  // a loop of multiply-adds from cells it does not write: cells pairs (d, s), and
+                    // per pass d += s * factors[i]
 };
 struct Idiom {
     IdiomKind kind;
     int8_t    sign = 1;                 // IDIOM_ADD
-    uint8_t   bytes = 0;                // IDIOM_DIVIDE
+    uint8_t   bytes = 0;                // IDIOM_DIVIDE, IDIOM_MULTIPLY
+    uint8_t   wide = 0;                 // IDIOM_MULTIPLY
     std::vector<int32_t> cells;
+    std::vector<uint8_t> factors;       // IDIOM_PRODUCT
     struct Guard { int32_t off; uint8_t val; bool check; };
     std::vector<Guard> guards;          // scratch cells: hold val after every pass; check: must hold it on entry
     int32_t lo = 0, hi = 0;             // range of offsets touched
@@ -112,6 +119,24 @@ struct DivisionLayout {
     int cells() const { return group(2 * n) + 1; }
 };
 const std::string& division_loop(int n);
+
+// The BFL compiler's shift-and-add multiplication as brainfuck text: one loop on the pass counter
+// at cell 0, which the optimiser recognises by its text (for n = 1, 2, 4 and every w) and runs in
+// one step (ir.cpp, "the multiply loop").  Each pass doubles the w-byte product P (its top bit is
+// dropped), shifts the n-byte B left by one bit and adds the n-byte A to P when the bit shifted out
+// was set: after 8n passes from P = 0, P = A * B mod 256^w and B = 0.  n <= w <= 2n, n <= 4.  Cells,
+// relative to the counter: a group per byte of P (the byte, two cells for its zero test, a counter,
+// and below byte n A's byte), a group of four per byte of B, then X, the bit shifted out.  Every cell
+// but P, A and B is zero on entry and after every pass; A is unchanged.
+struct MultiplyLayout {
+    int n, w;
+    int p(int k) const { return 1 + 5 * std::min(k, n) + 4 * std::max(k - n, 0); }
+    int a(int k) const { return p(k) + 4; }
+    int b(int k) const { return p(w) + 4 * k; }
+    int x() const { return b(n); }
+    int cells() const { return x() + 1; }
+};
+const std::string& multiply_loop(int n, int w);
 
 // ---- hardware -----------------------------------------------------------------
 struct Device {

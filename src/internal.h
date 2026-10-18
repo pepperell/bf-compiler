@@ -5,7 +5,7 @@
 
 namespace bf {
 
-// The first 80 bytes are addressed by machine code; offsets are fixed.
+// The first 88 bytes are addressed by machine code; offsets are fixed.
 struct Ctx {
     uint8_t*  ptr;                                 // 0   current cell (absolute)
     uint8_t*  ram_base;                            // 8   tape + mmio_size  (held in r13)
@@ -18,6 +18,7 @@ struct Ctx {
     uint32_t(*in_fn)(Ctx*);                        // 56  0..255, or 256 = leave the cell alone
     void*   (*slow_fn)(Ctx*, int32_t pc);          // 64  interpret from pc, return resume address
     int32_t (*idiom_fn)(Ctx*, int32_t idx);        // 72  run Program::idioms[idx] at ptr: 1 done, 0 run the body
+    uint8_t*  tape_end;                            // 80  tape + tape_size: an idiom runs inline only below it
     // ---- not touched by machine code ----
     uint8_t*       tape;
     size_t         tape_size;
@@ -61,7 +62,7 @@ struct Ctx {
 static_assert(offsetof(Ctx, ptr) == 0 && offsetof(Ctx, ram_base) == 8 && offsetof(Ctx, saved_rsp) == 16, "ctx layout");
 static_assert(offsetof(Ctx, status) == 32 && offsetof(Ctx, stop) == 36 && offsetof(Ctx, exit_common) == 40, "ctx layout");
 static_assert(offsetof(Ctx, out_fn) == 48 && offsetof(Ctx, in_fn) == 56 && offsetof(Ctx, slow_fn) == 64, "ctx layout");
-static_assert(offsetof(Ctx, idiom_fn) == 72, "ctx layout");
+static_assert(offsetof(Ctx, idiom_fn) == 72 && offsetof(Ctx, tape_end) == 80, "ctx layout");
 
 // Ctx::idiom_fn: checks that every cell the idiom touches is on the tape first.
 int32_t idiom_thunk(Ctx* c, int32_t idx);

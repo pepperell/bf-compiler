@@ -1928,6 +1928,39 @@ def pm(d):
     return "+" * d if d > 0 else "-" * -d
 
 
+def bf_product(r):
+    """A counted loop of copies (BFL's byte `*`: x[- y[- d+ t+] t[- y+]]) with their temporaries
+    cleared first, which the optimiser runs as one product when no copy writes another's source."""
+    cells = r.sample([o for o in range(-3, 9) if o], 6)
+    copies = []
+    for i in range(r.randint(1, 2)):
+        s, d, t = cells[3 * i:3 * i + 3]
+        if r.random() < 0.15:
+            d = r.choice([0] + cells)                  # not a product
+        copies.append((s, d, t, r.choice([1, 1, 2, -1, 3])))
+    pos = 0
+    out = ""
+
+    def go(c):
+        nonlocal pos, out
+        out += ">" * (c - pos) if c > pos else "<" * (pos - c)
+        pos = c
+    for s, d, t, k in copies:
+        go(t); out += "[-]"
+    go(0)
+    out += "["
+    dec = r.randint(0, len(copies))
+    for i in range(len(copies) + 1):
+        if i == dec:
+            go(0); out += r.choice(["-", "-", "-", "+", "--"])
+        if i < len(copies):
+            s, d, t, k = copies[i]
+            go(s); out += "[-"; go(d); out += pm(k); go(t); out += "+"; go(s); out += "]"
+            go(t); out += "[-"; go(s); out += "+"; go(t); out += "]"
+    go(0)
+    return out + "]"
+
+
 def bf_balanced(r, depth):
     """A loop whose body comes back to the loop cell: a multiply, an if, a carry, an idiom candidate."""
     offs = r.sample([o for o in range(-3, 5) if o], r.randint(1, 4))
@@ -1966,8 +1999,10 @@ def bf_seq(r, depth, n):
             parts.append(".")
         elif k < 0.45:
             parts.append(",")
-        elif k < 0.72 and depth < 3:
+        elif k < 0.66 and depth < 3:
             parts.append(bf_balanced(r, depth))
+        elif k < 0.72:
+            parts.append(bf_product(r))
         elif k < 0.82:
             parts.append(r.choice(["[-]", "[+]", "[-]+", "[>]", "[<]", "[>>]", "[<<]", "[->+<]", "[-<+>]", "[->>+<<]"]))
         elif depth < 3:

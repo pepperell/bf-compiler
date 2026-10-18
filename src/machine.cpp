@@ -180,6 +180,7 @@ RunResult Machine::run(const Program& p, bool use_jit) {
     ctx.idioms = p.idioms.data();
     ctx.tape = tape_;
     ctx.tape_size = tape_size_;
+    ctx.tape_end = tape_ + tape_size_;
     ctx.mmio_size = mmio_size_;
     ctx.prog = &p;
     ctx.console = console_;

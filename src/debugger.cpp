@@ -43,6 +43,7 @@ struct Debugger::Impl {
         ctx.in_fn = machine_in_thunk;
         ctx.tape = m.tape_;
         ctx.tape_size = m.tape_size_;
+        ctx.tape_end = m.tape_ + m.tape_size_;
         ctx.mmio_size = m.mmio_size_;
         ctx.prog = &p;
         ctx.console = m.console_;

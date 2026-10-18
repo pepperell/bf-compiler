@@ -192,6 +192,18 @@ IDIOM_PROGRAMS = [
     ("long-divide", "long a = in; long b = in; a = a * 100003 - 7000000; long d = b - 3; long c = a / d;"
                     " out byte(c), byte(c >> 8), byte(c >> 16), byte(c >> 24); dword u = dword(a) % dword(d * 1000);"
                     " out byte(u), byte(u >> 8), byte(u >> 16), byte(u >> 24);", range(16, 96)),
+    # the multiply loop (ir.cpp, "the multiply loop") for `*` and mulshr: B and A of 1, 2 and 4 bytes,
+    # P of 2, 3, 4, 6 and 8; its cells lie above the operands, poked as for division
+    ("word-multiply", "word a = in; word b = in; a = a * 300 + b; word d = b + 7; word c = a * d; out byte(c), byte(c >> 8);"
+                      " int s = mulshr(int(a), int(d) - 40, 5); out byte(s), byte(s >> 8);"
+                      " sbyte m = mulshr(sbyte(a), sbyte(b) - 100, 3); out byte(m);", range(16, 44)),
+    ("long-multiply", "long a = in; long b = in; a = a * 100003 - 7000000; long d = b * 999 - 3; long c = a * d;"
+                      " out byte(c), byte(c >> 8), byte(c >> 16), byte(c >> 24); c = mulshr(a, d, 12);"
+                      " out byte(c), byte(c >> 8), byte(c >> 16), byte(c >> 24); dword u = mulshr(dword(a), dword(d), 32);"
+                      " out byte(u), byte(u >> 8), byte(u >> 16), byte(u >> 24);", range(16, 88)),
+    # a byte `*`: a loop of multiply-adds from cells it does not write (IDIOM_PRODUCT)
+    ("byte-multiply", "byte a = in; byte b = in; byte c = a * b; out c; sbyte s = sbyte(a) * sbyte(b) - sbyte(a); out byte(s);"
+                      " c = (a + 3) * (b ^ 5) + a; out c;"),
 ]
 IDIOM_INPUTS = [b"\xc8\x4d", b"\x00\x00", b"\xff\x01", b"\x05\x05"]
 
@@ -271,12 +283,13 @@ def fault_cases():
             fails += 1
             for k, v in res.items():
                 print(f"   {k}: rc={v[0]} out={v[1][:20]!r} err={v[2]!r}")
-    # division loops (src/ir.cpp) cut off by the end of RAM: the idiom must not run, and the loop
-    # as written faults.  The executors touch cells in different orders (an idiom's guards, merged
+    # division and multiply loops (src/ir.cpp) cut off by the end of RAM: the idiom must not run, and
+    # the loop as written faults.  The executors touch cells in different orders (an idiom's guards, merged
     # blocks), so they may report different cells, but each must be past the end.
     bad = []
     progs = {c[0]: c[1] for c in IDIOM_PROGRAMS}
-    for name, prog, rams in (("word", progs["word-divide"], range(10, 46)), ("long", progs["long-divide"], range(10, 96, 2))):
+    for name, prog, rams in (("word", progs["word-divide"], range(10, 46)), ("long", progs["long-divide"], range(10, 96, 2)),
+                             ("word-mul", progs["word-multiply"], range(10, 44)), ("long-mul", progs["long-multiply"], range(10, 100, 2))):
         bfl, b = os.path.join(tmp, name + ".bfl"), os.path.join(tmp, name + ".b")
         open(bfl, "w").write(prog + "\n")
         subprocess.run([BF, "--emit", b, bfl], capture_output=True, timeout=60)
@@ -290,7 +303,7 @@ def fault_cases():
                 bad.append(f"{name} --ram {ram}: " + "; ".join(f"{k} rc={v[0]} out={v[1]!r} {v[2]}" for k, v in res.items()))
         if not faulted or faulted == len(rams):
             bad.append(f"{name}: {faulted} of {len(rams)} RAM sizes faulted")
-    print(("PASS " if not bad else "FAIL ") + "fault-division-at-end")
+    print(("PASS " if not bad else "FAIL ") + "fault-idiom-loops-at-end")
     for x in bad[:6]:
         print("   " + x)
     return fails + bool(bad), len(FAULT_PROGRAMS) + 1

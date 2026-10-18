@@ -1017,6 +1017,43 @@ std::string make_division_loop(int n, std::set<int>* touched = nullptr) {
     return t.s;
 }
 
+// ---- the multiply loop ---------------------------------------------------------------
+// BFL's `*` and `mulshr` of 2- and 4-byte numbers (and mulshr of bytes) are one loop of
+// shift and add, high bit of B first: P = 2P, B <<= 1 with the bit shifted out into X, and
+// when X is set, P += A (a carry chain from each byte of A up to P's top).  Like the
+// division loop it is recognised by its text and the cells besides P, A and B are guards.
+std::string make_multiply_loop(int n, int w, std::set<int>* touched = nullptr) {
+    MultiplyLayout L{n, w};
+    Text t;
+    auto twice = [&](int c, int carry) {     // c *= 2; carry (if >= 0) += 1 when the top bit was set
+        int cnt = c + 3;
+        t.move(c, {{cnt, 1}});
+        t.open(cnt);
+        t.add(cnt, -1);
+        t.add(c, 2);
+        if (carry >= 0) t.if_zero(c, [&] { t.add(carry, 1); });
+        t.close();
+    };
+    std::function<void(int)> inc = [&](int k) {     // P += 256^k
+        t.add(L.p(k), 1);
+        if (k + 1 < w) t.if_zero(L.p(k), [&] { inc(k + 1); });
+    };
+    t.open(0);
+    t.add(0, -1);
+    for (int j = w - 1; j >= 0; j--) twice(L.p(j), j + 1 < w ? L.p(j + 1) : -1);   // high byte first, as for division
+    for (int j = n - 1; j >= 0; j--) twice(L.b(j), j + 1 < n ? L.b(j + 1) : L.x());
+    t.if_nz(L.x(), [&] {
+        for (int k = 0; k < n; k++) {        // P += A_k * 256^k, A_k counted out through P_k's counter
+            int cnt = L.p(k) + 3;
+            t.copy(L.a(k), cnt, L.p(k) + 1);
+            t.open(cnt); t.add(cnt, -1); inc(k); t.close();
+        }
+    });
+    t.close();
+    if (touched) *touched = t.touched;
+    return t.s;
+}
+
 // Does the loop from '[' at b to its ']' at e consist of exactly the commands of t?
 bool text_is(const std::string& src, size_t b, size_t e, const std::string& t) {
     size_t k = 0;
@@ -1053,6 +1090,62 @@ bool match_division(const std::string& src, size_t b, size_t e, Idiom& id) {
     return false;
 }
 
+std::set<int> multiply_touched[5][9];
+
+// The widths BFL multiplies by this loop: B and A of 1, 2 or 4 bytes, P of n to 2n.
+bool match_multiply(const std::string& src, size_t b, size_t e, Idiom& id) {
+    if (e >= src.size() || src[b] != '[' || src[e] != ']') return false;
+    for (int n : {1, 2, 4}) {
+        for (int w = n; w <= 2 * n; w++) {
+            const std::string& t = multiply_loop(n, w);
+            if (e - b + 1 < t.size() || !text_is(src, b, e, t)) continue;
+            MultiplyLayout L{n, w};
+            id = Idiom{};
+            id.kind = IDIOM_MULTIPLY;
+            id.bytes = (uint8_t)n;
+            id.wide = (uint8_t)w;
+            std::set<int> data;
+            for (int k = 0; k < w; k++) { id.cells.push_back(L.p(k)); data.insert(L.p(k)); }
+            for (int k = 0; k < n; k++) { id.cells.push_back(L.a(k)); data.insert(L.a(k)); }
+            for (int k = 0; k < n; k++) { id.cells.push_back(L.b(k)); data.insert(L.b(k)); }
+            for (int c : multiply_touched[n][w]) if (c > 0 && !data.count(c)) id.guards.push_back({c, 0, true});
+            id.lo = 0;
+            id.hi = L.cells() - 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+// A loop on cell 0 whose body is multiply-adds from cells it does not write and one
+// decrement of cell 0 (BFL's byte `*`: x[- y[- d+ t+] t[- y+]] once its inner loops
+// are multiply-adds) adds each source times the pass count to its destination.
+bool match_product(const Code& c, size_t b, size_t e, Idiom& id) {
+    int decs = 0;
+    std::set<int32_t> dst, srcs;
+    for (size_t k = b; k < e; k++) {
+        const Instr& x = c[k];
+        if (x.op == ADD && x.off == 0 && x.arg == -1) { decs++; continue; }
+        if (x.op != MUL || x.off == 0 || x.target == 0 || x.off == x.target) return false;
+        dst.insert(x.off);
+        srcs.insert(x.target);
+    }
+    if (decs != 1 || dst.empty()) return false;
+    for (int32_t s : srcs) if (dst.count(s)) return false;
+    id = Idiom{};
+    id.kind = IDIOM_PRODUCT;
+    for (size_t k = b; k < e; k++) {
+        const Instr& x = c[k];
+        if (x.op != MUL) continue;
+        id.cells.push_back(x.off);
+        id.cells.push_back(x.target);
+        id.factors.push_back((uint8_t)x.arg);
+        id.lo = std::min({id.lo, x.off, x.target});
+        id.hi = std::max({id.hi, x.off, x.target});
+    }
+    return true;
+}
+
 } // namespace
 
 const std::string& division_loop(int n) {
@@ -1060,6 +1153,16 @@ const std::string& division_loop(int n) {
     static std::once_flag once;
     std::call_once(once, [] { for (int k = 2; k <= 8; k++) t[k] = make_division_loop(k, &division_touched[k]); });
     return t[std::clamp(n, 2, 8)];
+}
+
+const std::string& multiply_loop(int n, int w) {
+    static std::string t[5][9];
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (int k = 1; k <= 4; k++) for (int v = k; v <= 2 * k; v++) t[k][v] = make_multiply_loop(k, v, &multiply_touched[k][v]);
+    });
+    n = std::clamp(n, 1, 4);
+    return t[n][std::clamp(w, n, 2 * n)];
 }
 
 // Put an IDIOM instruction at the top of every loop that matches one.
@@ -1077,7 +1180,8 @@ static void find_idioms(Code& c, const std::string& src, std::vector<Idiom>& tab
         size_t j = closer[i];
         if (j == SIZE_MAX || c[j].op != JNZ) continue;
         Idiom dv;
-        if (c[i].src >= 0 && c[j].src > c[i].src && match_division(src, (size_t)c[i].src, (size_t)c[j].src, dv)) {
+        if (c[i].src >= 0 && c[j].src > c[i].src && (match_division(src, (size_t)c[i].src, (size_t)c[j].src, dv) ||
+                                                      match_multiply(src, (size_t)c[i].src, (size_t)c[j].src, dv))) {
             table.push_back(std::move(dv));
             out.push_back({IDIOM, table.back().lo, (int32_t)table.size() - 1, 0, c[i + 1].src});
             continue;
@@ -1089,7 +1193,7 @@ static void find_idioms(Code& c, const std::string& src, std::vector<Idiom>& tab
         }
         if (!simple) continue;
         Idiom id;
-        if (!match_idiom(c, i + 1, j, id)) continue;
+        if (!match_product(c, i + 1, j, id) && !match_idiom(c, i + 1, j, id)) continue;
         table.push_back(std::move(id));
         out.push_back({IDIOM, table.back().lo, (int32_t)table.size() - 1, 0, c[i + 1].src});
     }
@@ -1132,6 +1236,24 @@ bool idiom_exec(const Idiom& d, uint8_t* p) {
         for (int k = 0; k < n; k++) { p[d.cells[(size_t)k]] = (uint8_t)(a >> (8 * k)); p[d.cells[(size_t)(n + k)]] = (uint8_t)(r >> (8 * k)); }
         break;
     }
+    case IDIOM_MULTIPLY: {
+        // x passes of P = 2P + A * (B's top bit), B <<= 1: the first min(x, 8n) shift the top bits
+        // of B out into P all at once, the rest only double P
+        int n = d.bytes, w = d.wide;
+        auto load = [&](size_t at, int len) { uint64_t v = 0; for (int k = len - 1; k >= 0; k--) v = v << 8 | p[d.cells[at + (size_t)k]]; return v; };
+        auto shl = [](uint64_t v, unsigned s) { return s >= 64 ? 0 : v << s; };
+        uint64_t P = load(0, w), A = load((size_t)w, n), B = load((size_t)(w + n), n);
+        unsigned m = std::min(x, 8u * (unsigned)n);
+        uint64_t top = m ? B >> (8 * n - m) : 0;
+        P = shl(shl(P, m) + A * top, x - m);
+        B = shl(B, m);
+        for (int k = 0; k < w; k++) p[d.cells[(size_t)k]] = (uint8_t)(P >> (8 * k));
+        for (int k = 0; k < n; k++) p[d.cells[(size_t)(w + n + k)]] = (uint8_t)(B >> (8 * k));
+        break;
+    }
+    case IDIOM_PRODUCT:
+        for (size_t i = 0; i < d.factors.size(); i++) p[d.cells[2 * i]] = (uint8_t)(p[d.cells[2 * i]] + x * p[d.cells[2 * i + 1]] * d.factors[i]);
+        break;
     }
     p[0] = 0;
     for (const Idiom::Guard& g : d.guards) p[g.off] = g.val;
@@ -1232,7 +1354,7 @@ std::string disassemble(const Program& p) {
         case ENDIF: snprintf(buf, sizeof buf, "ENDIF\n"); break;
         case SCAN:  snprintf(buf, sizeof buf, "SCAN  %+d\n", x.arg); break;
         case IDIOM: {
-            static const char* names[] = {"add", "satsub", "halve", "divmod", "divide"};
+            static const char* names[] = {"add", "satsub", "halve", "divmod", "divide", "multiply", "product"};
             const Idiom& d = p.idioms[(size_t)x.arg];
             std::string cells;
             for (int32_t o : d.cells) cells += (cells.empty() ? "" : ",") + std::to_string(o);
@@ -1240,6 +1362,7 @@ std::string disassemble(const Program& p) {
             for (const Idiom::Guard& gd : d.guards) g += " [" + std::to_string(gd.off) + "]" + (gd.check ? "==" : "=") + std::to_string(gd.val);
             s += std::string("IDIOM ") + names[d.kind] + (d.kind == IDIOM_ADD ? (d.sign > 0 ? "+" : "-") : "") +
                  (d.kind == IDIOM_DIVIDE ? std::to_string(d.bytes) : "") +
+                 (d.kind == IDIOM_MULTIPLY ? std::to_string(d.bytes) + "x" + std::to_string(d.wide) : "") +
                  " [" + cells + "] scratch" + g + " -> " + std::to_string(x.target) + "\n";
             buf[0] = 0;
             break;

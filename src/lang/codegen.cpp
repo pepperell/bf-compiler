@@ -750,55 +750,54 @@ struct Gen {
             release(s);
         }
     }
-    // dst += a * b (mod 2^8n); a and b consumed.  The loop runs once per bit of the
-    // multiplier b up to its highest set bit, so the operands are first arranged to
-    // make b small: for signed values both are negated when that leaves a smaller
-    // non-negative multiplier (the product is unchanged), and the smaller one is b.
-    void mulN(int64_t a, int64_t b, int64_t dst, int n, bool sgn = false) {
-        if (n > 1) {
-            if (sgn) {
-                int64_t s = tmp(); sign_flag(b + n - 1, s);
-                if_nonzero(s, [&] { negN(a, n); negN(b, n); });          // now b >= 0
-                release(s);
-            }
-            int64_t s = tmp();
-            if (sgn) sign_flag(a + n - 1, s);
-            int64_t m = tmpN(n); copyN(a, m, n);                         // m = |a| (for signed)
-            if (sgn) { int64_t s2 = tmp(); copy(s, s2); if_nonzero(s2, [&] { negN(m, n); }); release(s2); }
-            int64_t lt = tmp(); ltN_cells(m, b, n, lt, 1);
-            if_nonzero(lt, [&] {
-                if (sgn) if_nonzero(s, [&] { negN(a, n); negN(b, n); });
-                int64_t t = tmpN(n);
-                moveN(a, t, n); moveN(b, a, n); moveN(t, b, n);
-                releaseN(t, n);
-            });
-            release(lt);
-            releaseN(m, n);
-            release(s);
+    // The multiply loop, bf::multiply_loop(n, w), which the optimiser runs in one step: A and B (n cells
+    // each, consumed) are moved into a block of fresh temporaries laid out as bf::MultiplyLayout says, and
+    // after its 8n passes the block's P holds A * B mod 256^w; take(c, L) moves P out of the block at c.
+    void multiply_block(int64_t a, int64_t b, int n, int w, const std::function<void(int64_t, const bf::MultiplyLayout&)>& take) {
+        bf::MultiplyLayout L{n, w};
+        int64_t c = tmpN(L.cells());
+        for (int k = 0; k < n; k++) { move(a + k, {{c + L.a(k), 1}}); move(b + k, {{c + L.b(k), 1}}); }
+        set(c, 8 * n);
+        go(c);
+        out += bf::multiply_loop(n, w);
+        known.clear();
+        for (int64_t s = c; s < c + L.cells(); s++) if (trackable(s)) known[s] = 0;     // B is shifted out
+        for (int k = 0; k < w; k++) forget(c + L.p(k));
+        for (int k = 0; k < n; k++) forget(c + L.a(k));
+        take(c, L);
+        for (int k = 0; k < n; k++) clear(c + L.a(k));
+        releaseN(c, L.cells());
+        for (int k = 0; k < n; k++) {
+            if (trackable(a + k)) known[a + k] = 0;
+            if (trackable(b + k)) known[b + k] = 0;
         }
-        int64_t f = tmp();
-        nonzeroN(b, f, n);
-        open(f);
-        {
-            clear(f);
-            int64_t bit = tmp();
-            shrN(b, n, false, bit);
-            if_nonzero(bit, [&] { copyN(a, dst, n); });
-            release(bit);
-            shlN(a, n);
-            nonzeroN(b, f, n);
-        }
-        close();
-        release(f);
-        clearN(a, n);
     }
-    // dst += a * k for a constant k; a consumed
+    // dst += a * b (mod 2^8n, the same for signed values); a and b consumed
+    void mulN(int64_t a, int64_t b, int64_t dst, int n) {
+        multiply_block(a, b, n, n, [&](int64_t c, const bf::MultiplyLayout& L) {
+            if (known0N(dst, n)) { for (int k = 0; k < n; k++) move(c + L.p(k), {{dst + k, 1}}); return; }
+            int64_t t = tmpN(n);
+            for (int k = 0; k < n; k++) move(c + L.p(k), {{t + k, 1}});
+            addN(dst, t, n);
+            releaseN(t, n);
+        });
+    }
+    // dst += a * k for a constant k; a consumed.  Up to 7 by copies, shifts and adds; from 8 the
+    // multiply loop is smaller (and runs in one step): for a 16-bit a * 12 about 1 350 commands
+    // against 1 600, and 59 IR instructions against 91.
     void mul_constN(int64_t a, int64_t k, int64_t dst, int n) {
         uint64_t u = (uint64_t)k & (n >= 8 ? ~0ull : ((1ull << (8 * n)) - 1));
         if (u == 0) { clearN(a, n); return; }
         if (u <= 3) {
             for (uint64_t i = 1; i < u; i++) copyN(a, dst, n);
             addN(dst, a, n);
+            return;
+        }
+        if (u >= 8 && n <= 4) {
+            int64_t b = tmpN(n);
+            setN(b, n, (int64_t)u);
+            mulN(a, b, dst, n);
+            releaseN(b, n);
             return;
         }
         int top = 63; while (!((u >> top) & 1)) top--;
@@ -833,13 +832,10 @@ struct Gen {
         if (c >= 0) release(c);
     }
     // dst (n cells, known zero) = mulshr(ea, eb, k) at type t: floor(a * b / 2^k) of the exact product
-    // (2n bytes), in n bytes.  Shift and add over the bits of b, low first: an accumulator of
-    // W = n + k/8 (+1 when k%8) cells gets a2 = a << i added for each set bit i, and a2 doubles every bit.
-    // After each byte of b, while whole bytes of the shift remain, the accumulator's low byte is final and
-    // a2's is zero: both drop it (byte moves), so a2 stays n + 1 cells and the accumulator holds only the
-    // bytes that survive and the one below them.  The last k%8 bits are one pass of byte divisions.  Signed
-    // values are multiplied as magnitudes; for a negative product the accumulator starts at 2^k - 1, so the
-    // shift rounds the magnitude up and its negation is the floor.  The cells used every bit sit at the top.
+    // (2n bytes), in n bytes.  The multiply loop computes the w = n + k/8 (+1 when k%8) low bytes of the
+    // product (at most 2n): the bytes below k/8 are dropped, the n (+1) above them go to acc, and its last
+    // k%8 bits are one pass of byte divisions.  Signed values are multiplied as magnitudes; for a negative
+    // product the result is -(floor(m / 2^k) + 1 when bits shifted out were set), ~h or -h.
     void mulshr(const Expr& ea, const Expr& eb, int k, const Type* t, int64_t dst) {
         mulshr(k, t, dst, [&](int64_t a, int64_t b) { eval_into(ea, a, t); eval_into(eb, b, t); });
     }
@@ -848,89 +844,49 @@ struct Gen {
         int n = std::max(t->size, 1);
         bool sgn = t->is_signed;
         k = std::min(k, 16 * n);                      // floor(a * b / 2^16n) is already 0 or -1
-        int q = k / 8, r = k % 8, W = n + q + (r ? 1 : 0);
-        int64_t neg = sgn ? tmp() : -1, drops = q ? tmp() : -1;
-        int64_t cb = tmp(), f = tmp(), b = tmpN(n), acc = tmpN(W), a = tmpN(n + 1);
+        int q = k / 8, r = k % 8, w = std::min(2 * n, n + q + (r ? 1 : 0));
+        int64_t neg = sgn ? tmp() : -1, a = tmpN(n), b = tmpN(n);
         load(a, b);
+        int64_t e = -1;                               // 1 while the bits shifted out are all zero
         if (sgn) {
-            int64_t s = tmp(), c = tmp(), s2 = tmp();
-            sign_flag(a + n - 1, s);
-            copy(s, c); if_nonzero(c, [&] { negN(a, n); });
+            int64_t s2 = tmp(), c = tmp();
+            sign_flag(a + n - 1, neg);
+            copy(neg, c); if_nonzero(c, [&] { negN(a, n); });
             sign_flag(b + n - 1, s2);
             copy(s2, c); if_nonzero(c, [&] { negN(b, n); });
-            move(s2, {{s, -1}});                       // s != 0: the signs differ
-            release(s2); release(c);
-            if_nonzero(s, [&] {
-                add(neg, 1);
-                for (int i = 0; i < q; i++) add(acc + i, 255);
-                if (r) add(acc + q, (1 << r) - 1);
-            });
-            release(s);
+            release(c);
+            move(s2, {{neg, -1}});                     // neg != 0: the signs differ
+            release(s2);
+            e = tmp();
+            set(e, 1);
         }
-        set(cb, 8);                                    // bits of b's low byte still to come
-        if (q) set(drops, q);
-        set(f, 1);                                     // b == 0 runs once, adding nothing
-        open(f);
-        {
-            clear(f);
-            int64_t h = tmp(), bit = tmp();
-            halve_bit(b, h, bit);
-            move(h, {{b, 1}});
-            int64_t t2 = tmpN(n + 1), t3 = tmpN(n + 1), u = tmp();
-            for (int i = 0; i <= n; i++) { move(a + i, {{t2 + i, 1}, {t3 + i, 1}, {u, 1}}); move(u, {{a + i, 1}}); }
-            release(u);
-            if_nonzero(bit, [&] { add_wide(acc, W, t3, std::min(n + 1, W)); });
-            clearN(t3, n + 1);                         // bit 0, or k = 0 (an n-byte product)
-            releaseN(t3, n + 1);
-            addN(a, t2, n + 1);                        // a2 doubles
-            releaseN(t2, n + 1);
-            release(bit); release(h);
-            add(cb, -1);
-            int64_t z = tmp();
-            iszero8(cb, z);
-            if_nonzero(z, [&] {                        // a byte of b done; its cell is zero
-                add(cb, 8);
-                for (int i = 0; i + 1 < n; i++) move(b + i + 1, {{b + i, 1}});
-                if (q) {
-                    int64_t d = tmp(); copy(drops, d);
-                    if_nonzero(d, [&] {
-                        add(drops, -1);
-                        clear(acc);
-                        for (int i = 0; i + 1 < W; i++) move(acc + i + 1, {{acc + i, 1}});
-                        for (int i = 0; i < n; i++) move(a + i + 1, {{a + i, 1}});
-                    });
-                    release(d);
-                }
-            });
-            release(z);
-            nonzeroN(b, f, n);
-        }
-        close();
-        if (q) {                                       // b ran out before the whole bytes of the shift
-            open(drops);
-            add(drops, -1);
-            clear(acc);
-            for (int i = 0; i + 1 < W; i++) move(acc + i + 1, {{acc + i, 1}});
-            close();
-        }
-        clearN(a, n + 1);
-        releaseN(a, n + 1);
+        int64_t acc = tmpN(n + 1);
+        multiply_block(a, b, n, w, [&](int64_t c, const bf::MultiplyLayout& L) {
+            for (int i = 0; i < w; i++) {
+                int64_t pc = c + L.p(i);
+                if (i >= q) move(pc, {{acc + i - q, 1}});
+                else if (sgn) if_nonzero(pc, [&] { clear(e); });
+                else clear(pc);
+            }
+        });
         if (r) {                                       // acc >>= r: acc[i] = acc[i] / 2^r + (acc[i+1] % 2^r) << (8 - r)
             for (int i = 0; i <= n; i++) {
                 int64_t d = tmp(), qq = tmp(), rr = tmp();
                 set(d, int64_t(1) << r);
                 divmod8(acc + i, d, qq, rr);
                 move(qq, {{acc + i, 1}});
-                if (i) move(rr, {{acc + i - 1, 1 << (8 - r)}}); else clear(rr);
+                if (i) move(rr, {{acc + i - 1, 1 << (8 - r)}});
+                else if (sgn) if_nonzero(rr, [&] { clear(e); });
+                else clear(rr);
                 release(rr); release(qq); release(d);
             }
         }
-        if (sgn) { if_nonzero(neg, [&] { negN(acc, n); }); }
+        if (sgn) if_nonzero(neg, [&] { notN(acc, n); if_nonzero(e, [&] { incN(acc, n); }); });
         moveN(acc, dst, n);
-        releaseN(acc, W);
+        releaseN(acc, n + 1);
+        if (sgn) release(e);
         releaseN(b, n);
-        release(f); release(cb);
-        if (q) release(drops);
+        releaseN(a, n);
         if (sgn) release(neg);
     }
     // q += a / b, r += a % b (unsigned; b == 0 gives q = 0, r = a).  a consumed, b cleared; q and r start at zero.
@@ -1027,7 +983,7 @@ struct Gen {
         if (e.kind == Expr::MulShr) return SharedKind{'m', n, std::min((int)e.value, 16 * n), t->is_signed};
         if (e.kind != Expr::Binary || !(e.text == "*" || e.text == "/" || e.text == "%")) return std::nullopt;
         if (e.a->type->is_ptr() || e.b->type->is_ptr()) return std::nullopt;
-        if (e.text == "*" && (fold(*e.b, true) || fold(*e.a, true))) return std::nullopt;     // a constant factor: shifts and adds
+        if (e.text == "*" && (fold(*e.b, true) || fold(*e.a, true))) return std::nullopt;     // a constant factor: mul_constN
         return SharedKind{e.text[0], n, 0, t->is_signed};
     }
     // acc (kd.n cells) += sign * e for every operation, through one copy of the routine.  The hooks generate
@@ -1075,7 +1031,7 @@ struct Gen {
             if (kd.op == '*') {
                 if (!pos) negN(X, n);
                 else if (NEG >= 0) if_nonzero(NEG, [&] { negN(X, n); });
-                mulN(X, Y, acc, n, kd.sgn);
+                mulN(X, Y, acc, n);
             } else if (kd.op == 'm') {
                 auto from_xy = [&](int64_t a, int64_t b) { moveN(X, a, n); moveN(Y, b, n); };
                 if (P < 0) mulshr(kd.k, t, acc, from_xy);
@@ -2124,7 +2080,7 @@ struct Gen {
             if (k) { int64_t x = tmpN(n); eval_into(*var, x, t); mul_constN(x, *k, dst, n); releaseN(x, n); return; }
             int64_t x = tmpN(n); eval_into(a, x, t);
             int64_t y = tmpN(n); eval_into(b, y, t);
-            mulN(x, y, dst, n, t->is_signed);
+            mulN(x, y, dst, n);
             releaseN(y, n); releaseN(x, n);
             return;
         }
