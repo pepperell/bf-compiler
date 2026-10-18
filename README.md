@@ -123,13 +123,21 @@ changes (run it with `--update-golden` after a deliberate codegen change).
 brainfuck and in BFL. `programs/samples/` holds BFL programs that use the
 language's newer features: a linked list, a binary search tree, a calculator
 with a recursive-descent parser, N queens, merge sort, string handling, the
-integer types, a two-file maze solver and an animated Game of Life; its README
-says what each one shows. `programs/thirdparty/` holds programs by other authors:
-Erik Bosman's `mandelbrot.b`, and 32 programs by Daniel B. Cristofani from
-brainfuck.org (CC BY-SA 4.0) including a self-interpreter, a universal Turing
-machine, Life, tic-tac-toe, quines, sorts and streaming digits of e. Its README
-lists what each one does and what input to give it, and the test suite runs the
-terminating ones through every executor.
+integer types, a two-file maze solver, an animated Game of Life, a revolving cube, a
+starfield and a raytracer; its README says what each one shows.
+`programs/thirdparty/` holds programs by other authors: Erik Bosman's
+`mandelbrot.b`, and 32 programs by Daniel B. Cristofani from brainfuck.org (CC BY-SA
+4.0) including a self-interpreter, a universal Turing machine, Life, tic-tac-toe,
+quines, sorts and streaming digits of e. Its README lists what each one does and what
+input to give it, and the test suite runs the terminating ones through every executor.
+
+![raytracer.bfl: 16 frames of one camera orbit](docs/raytracer.gif)
+
+`programs/samples/raytracer.bfl` on the framebuffer: four reflective spheres, two
+coloured lamps with soft shadows and a checkerboard floor, in fixed-point BFL. A 128x64
+frame takes about 54 ms with the JIT (2.3 s before the loop idioms; see Speed).
+`python tools/rt_gif.py docs/raytracer.gif` renders these 16 frames headless and writes
+the GIF (it needs Pillow).
 
 ## Speed
 

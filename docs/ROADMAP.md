@@ -31,7 +31,7 @@ plus the type system, library and tooling they need.
 | 11 | Arithmetic shared within a block, without the trampoline | 9 |
 | 12 | Faster division | 9 |
 | 13 | Planned: the profiler in the UI | nothing |
-| 14 | Planned: housekeeping (the raytracer animation) | nothing |
+| 14 | Housekeeping (the raytracer animation) | nothing |
 
 One change from the earlier suggestion: better compiler errors move from last to
 phase 1. Pointers, structs and signed types need a real type checker, and today
@@ -576,6 +576,9 @@ Done when: profiling a sample in the UI agrees with `bf --profile`.
 `docs/raytracer.gif` (16 frames of the raytracer) is not committed and was
 recorded when a frame took 2.3 s. Re-record it now that a frame takes 70 ms, and
 commit it with a mention in README.md, or drop it.
+
+**Done**: `tools/rt_gif.py OUT.gif` renders the 16 frames headless (2 s in all, a
+frame about 54 ms); README.md shows the re-recorded `docs/raytracer.gif`.
 
 ## 12. Decisions for you
 
