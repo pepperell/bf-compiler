@@ -1,12 +1,25 @@
 # Brainfuck Machine
 
-A fast brainfuck executor for Windows whose hardware is memory-mapped: LEDs, a numeric
-display, a millisecond clock, a random source, a real serial port and a 128x64 framebuffer
-all live in tape cells just left of the start cell, so a program drives them with the
-same `+`, `-`, `<` and `>` it uses for everything else. Programs are JIT-compiled to x64,
-and a small C-like language, BFL, compiles to brainfuck for writing device drivers. There is
-a Win32 UI with a VT100 terminal, a memory viewer, a debugger and a profiler.
-C++20, MSVC, no dependencies.
+A brainfuck executor for Windows that behaves like a small computer rather than a toy
+interpreter. C++20, MSVC, no dependencies.
+
+- **Memory-mapped hardware.** LEDs, a numeric display, a millisecond clock, a random
+  source, a real serial port and a 128x64 framebuffer live in tape cells just left of the
+  start cell, driven with the same `+`, `-`, `<` and `>` as everything else.
+- **x64 JIT.** Source is optimised to an IR and compiled to machine code at run time;
+  `mandelbrot.b` runs in 0.4 s. Loop idioms recognise multi-byte arithmetic and run whole
+  loops in one step.
+- **Exact device semantics.** Optimised code never touches a register, so a trigger in a
+  loop fires once per iteration exactly as written, in the JIT, interpreter and debugger.
+- **BFL.** A small C-like language with 8/16/32-bit integers, pointers and a heap, structs,
+  strings, recursion and a standard library, compiled to brainfuck with registers by name.
+- **Win32 UI.** Editor, device panel, VT100 terminal with serial-line pacing, live memory
+  viewer and watch list, framebuffer window.
+- **Debugger and profiler.** Step, step over, breakpoints and data breakpoints on cells,
+  variables or registers, working on BFL source or raw brainfuck; per-line instruction
+  counts shown in the editor gutter.
+- **Zero-overhead stop and fault detection.** No poll in generated code: stopping revokes
+  page access, and guard regions catch a pointer leaving the tape with the cell it touched.
 
 ```
 build.bat                      release build -> out\bf.exe, out\bfui.exe
