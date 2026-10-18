@@ -36,6 +36,8 @@
 #include <shellapi.h>
 #include <mmsystem.h>
 #include <windowsx.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -48,6 +50,9 @@
 #include <thread>
 #include <unordered_map>
 
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "uxtheme.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 using namespace bf;
@@ -66,6 +71,7 @@ enum : int {
     ID_NEWLINE, ID_TB_NEWLINE, ID_NEXT_DIAG,
     ID_VIEW_MEM, ID_TERM_FIT, ID_TERM_80, ID_TERM_120, ID_TERM_132, ID_CHECK_HEAP, ID_CHECK_STACK,
     ID_VIEW_ERRORS, ID_ERRLIST, ID_FILESEL, ID_VIEWER, ID_PROFILE, ID_PROFLIST,
+    ID_THEME_SYSTEM, ID_THEME_LIGHT, ID_THEME_DARK,                // in that order (App::theme)
     ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400,  // ID_SER_COM_BASE + n = COMn
     ID_HELP_BASE = 700                                             // ID_HELP_BASE + (int)help::Topic
 };
@@ -76,7 +82,28 @@ const int TERM_COLS[4] = {0, 80, 120, 132};       // ID_TERM_FIT.. ID_TERM_132
 
 constexpr int PANEL_H = 72;
 constexpr int MEM_ROWS = 32, MEM_COLS = 16;
-constexpr COLORREF BP_COLOUR = RGB(255, 150, 150);
+// ---- theme (View > Theme): the colours of everything except the device panel,
+// which is dark in both.  Light uses the system colours where the controls did before.
+struct Theme {
+    bool dark;
+    COLORREF window, text, dim;     // window background (toolbar row, gaps), text, labels
+    COLORREF edit_bg, viewer_bg;    // editor, lists, memory and generated code; the imported-file viewer
+    COLORREF gutter, bp;            // heat gutter background; breakpoint mark (a character's background)
+    COLORREF syntax[6];             // BFL colouring, in Tk order
+    COLORREF term_bg, term_fg;      // the terminal's default colours (palette 0 and 7)
+};
+Theme make_theme(bool dark) {
+    if (dark) return {true, RGB(32, 32, 32), RGB(220, 220, 220), RGB(160, 160, 160), RGB(24, 24, 24), RGB(36, 36, 40),
+                      RGB(44, 44, 48), RGB(150, 44, 44),
+                      {RGB(106, 170, 90), RGB(214, 150, 120), RGB(196, 214, 150), RGB(100, 160, 240), RGB(80, 200, 180), RGB(200, 140, 220)},
+                      RGB(24, 24, 24), RGB(212, 212, 212)};
+    return {false, GetSysColor(COLOR_BTNFACE), GetSysColor(COLOR_WINDOWTEXT), GetSysColor(COLOR_GRAYTEXT), GetSysColor(COLOR_WINDOW), RGB(246, 246, 240),
+            RGB(232, 232, 228), RGB(255, 150, 150),
+            {RGB(0, 128, 0), RGB(163, 21, 21), RGB(152, 80, 0), RGB(0, 0, 200), RGB(0, 128, 128), RGB(140, 0, 160)},
+            RGB(0, 0, 0), RGB(204, 204, 204)};
+}
+Theme th = make_theme(false);
+HBRUSH br_window = nullptr, br_edit = nullptr;      // th.window and th.edit_bg
 
 enum class Mode { Idle, Running, DebugPaused, DebugRunning };
 
@@ -175,6 +202,7 @@ struct App {
     std::vector<ProfItem> prof_items;
     HWND proflist = nullptr;                      // profile list pane (in the error list's place)
     int  heat_w = 0;                              // gutter width while a profile is shown
+    int  theme = 0;                               // View > Theme: 0 as Windows' app theme, 1 light, 2 dark
 } app;
 
 int px(int v) { return MulDiv(v, (int)app.dpi, 96); }
@@ -463,7 +491,7 @@ void mark_char(HWND ed, int32_t pos, bool on) {
     CHARFORMAT2W cf{};
     cf.cbSize = sizeof cf;
     cf.dwMask = CFM_BACKCOLOR;
-    if (on) cf.crBackColor = BP_COLOUR; else cf.dwEffects = CFE_AUTOBACKCOLOR;
+    if (on) cf.crBackColor = th.bp; else cf.dwEffects = CFE_AUTOBACKCOLOR;
     SendMessageW(ed, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
     SendMessageW(ed, EM_EXSETSEL, 0, (LPARAM)&save);
     SendMessageW(ed, WM_SETREDRAW, TRUE, 0);
@@ -474,7 +502,8 @@ void mark_bp(int32_t pos, bool on) { mark_char(app.editor, pos, on); }
 
 // ---- syntax colouring (BFL) ----------------------------------------------------------------
 // Only the text colour is set, through the Text Object Model with undo suspended,
-// so the breakpoint backgrounds and the undo history are left alone.
+// so the breakpoint backgrounds and the undo history are left alone.  Plain text
+// is the automatic colour in the light theme (as typed text is) and th.text in the dark.
 ITextDocument* text_doc(HWND ed) {
     IRichEditOle* ole = nullptr;
     if (!SendMessageW(ed, EM_GETOLEINTERFACE, 0, (LPARAM)&ole) || !ole) return nullptr;
@@ -485,17 +514,7 @@ ITextDocument* text_doc(HWND ed) {
     return doc;
 }
 enum class Tk { Comment, String, Number, Keyword, Type, Register };
-COLORREF tk_colour(Tk k) {
-    switch (k) {
-    case Tk::Comment:  return RGB(0, 128, 0);
-    case Tk::String:   return RGB(163, 21, 21);
-    case Tk::Number:   return RGB(152, 80, 0);
-    case Tk::Keyword:  return RGB(0, 0, 200);
-    case Tk::Type:     return RGB(0, 128, 128);
-    case Tk::Register: return RGB(140, 0, 160);
-    }
-    return 0;
-}
+COLORREF tk_colour(Tk k) { return th.syntax[(int)k]; }
 bool bfl_word(const std::wstring& w, Tk& k) {
     static const std::set<std::wstring> types = {L"byte", L"sbyte", L"word", L"int", L"dword", L"long", L"string"};
     static const std::set<std::wstring> kws = {L"const", L"proc", L"rec", L"ref", L"if", L"else", L"while", L"for", L"break", L"continue",
@@ -551,7 +570,7 @@ void colour_source(HWND ed, bool bfl) {
         if (SUCCEEDED(r->GetFont(&f)) && f) { f->SetForeColor(colour); f->Release(); }
         r->Release();
     };
-    paint(0, t.size(), tomAutoColor);
+    paint(0, t.size(), th.dark ? (long)th.text : tomAutoColor);
     if (bfl) bfl_tokens(t, [&](size_t a, size_t b, Tk k) { paint(a, b, (long)tk_colour(k)); });
     doc->Unfreeze(&frozen);
     doc->Undo(tomResume, nullptr);
@@ -567,7 +586,7 @@ void collect_bps(const std::wstring& text, int32_t a, int32_t b, std::set<int32_
     CHARFORMAT2W cf{}; cf.cbSize = sizeof cf;
     SendMessageW(app.editor, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
     if (cf.dwMask & CFM_BACKCOLOR) {                     // uniform over the range
-        if (!(cf.dwEffects & CFE_AUTOBACKCOLOR) && cf.crBackColor == BP_COLOUR)
+        if (!(cf.dwEffects & CFE_AUTOBACKCOLOR) && cf.crBackColor == th.bp)
             for (int32_t i = a; i < b; i++) if (is_bp_char(text[i])) out.insert(i);
         return;
     }
@@ -969,10 +988,13 @@ void export_bf() {
 // and the top lines are listed in the pane under the editor (in the error list's
 // place).  The next edit or run clears it.
 std::wstring result_text(const RunResult& r);
-// Heat scale by a line's count relative to the hottest line: pale yellow, orange, red.
+// Heat scale by a line's count relative to the hottest line: pale yellow, orange, red
+// on the light theme; dim amber, orange, red on the dark, so cool lines stay quiet there.
 COLORREF heat_colour(double t) {
     t = std::sqrt(std::clamp(t, 0.0, 1.0));           // spreads out the cooler lines
-    static const int stop[3][3] = {{255, 244, 196}, {255, 170, 60}, {215, 40, 30}};
+    static const int light[3][3] = {{255, 244, 196}, {255, 170, 60}, {215, 40, 30}};
+    static const int dark[3][3] = {{78, 64, 30}, {178, 100, 24}, {222, 48, 36}};
+    const int (*stop)[3] = th.dark ? dark : light;
     int k = t < 0.5 ? 0 : 1;
     double u = t < 0.5 ? t * 2 : t * 2 - 1;
     auto mix = [&](int c) { return (int)(stop[k][c] + (stop[k + 1][c] - stop[k][c]) * u + 0.5); };
@@ -987,7 +1009,7 @@ void paint_heat(HWND ed) {
     RECT cr; GetClientRect(ed, &cr);
     HDC dc = GetDC(ed);
     RECT g{0, 0, app.heat_w - px(4), cr.bottom};
-    HBRUSH gb = CreateSolidBrush(RGB(232, 232, 228));
+    HBRUSH gb = CreateSolidBrush(th.gutter);
     FillRect(dc, &g, gb);
     DeleteObject(gb);
     HFONT old = (HFONT)SelectObject(dc, app.mono);
@@ -1012,7 +1034,7 @@ void paint_heat(HWND ed) {
             double share = 100.0 * (double)it->second / (double)app.prof_total;
             wchar_t b[16];
             if (share >= 0.1) swprintf(b, 16, L"%.1f%%", share); else wcscpy(b, L"<0.1%");
-            SetTextColor(dc, std::sqrt(t) > 0.75 ? RGB(255, 255, 255) : RGB(40, 30, 20));
+            SetTextColor(dc, th.dark ? RGB(240, 236, 228) : std::sqrt(t) > 0.75 ? RGB(255, 255, 255) : RGB(40, 30, 20));
             r.right -= px(4);
             DrawTextW(dc, b, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
         }
@@ -1375,6 +1397,8 @@ void fb_show(bool show) {
 }
 
 // ---- generated brainfuck window (BFL mode) ------------------------------------------------------
+LRESULT edit_colours(HDC dc);
+LRESULT window_colours(HDC dc);
 LRESULT CALLBACK gen_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_SIZE: {
@@ -1408,8 +1432,13 @@ LRESULT CALLBACK gen_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_CTLCOLORSTATIC:
-        if ((HWND)l == app.genedit) { SetBkColor((HDC)w, RGB(255, 255, 255)); return (LRESULT)GetStockObject(WHITE_BRUSH); }
+        if ((HWND)l == app.genedit) return edit_colours((HDC)w);
+        if (th.dark) return window_colours((HDC)w);
         break;
+    case WM_CTLCOLORBTN:
+        if (th.dark) return window_colours((HDC)w);
+        break;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, br_window); return 1; }
     case WM_SETFOCUS: SetFocus(app.genedit); return 0;
     case WM_CLOSE: ShowWindow(h, SW_HIDE); CheckMenuItem(app.menu, ID_VIEW_GEN, MF_UNCHECKED); return 0;
     }
@@ -1618,6 +1647,174 @@ void set_term_cols(int cols, bool grow) {
     set_status(buf);
 }
 
+// ---- theme (View > Theme) -------------------------------------------------------------------
+bool windows_dark() {                         // Settings > Personalisation > Colours > app mode
+    DWORD v = 1, n = sizeof v;
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &n) == ERROR_SUCCESS && v == 0;
+}
+// Popup menus follow uxtheme's preferred app mode, ordinal 135 (Windows 10 1903 and
+// later; undocumented, so skipped when missing).  Windows draws the menu bar light in
+// any mode, so wnd_proc paints it (WM_UAHDRAWMENU*).
+void dark_menus(bool dark) {
+    using SetMode = int(WINAPI*)(int);
+    using Flush = void(WINAPI*)();
+    static HMODULE ux = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static SetMode set_mode = ux ? (SetMode)(void*)GetProcAddress(ux, MAKEINTRESOURCEA(135)) : nullptr;
+    static Flush flush = ux ? (Flush)(void*)GetProcAddress(ux, MAKEINTRESOURCEA(136)) : nullptr;
+    if (set_mode) set_mode(dark ? 2 : 0);                // ForceDark, Default
+    if (flush) flush();
+}
+void dark_frame(HWND h) {
+    BOOL d = th.dark;
+    DwmSetWindowAttribute(h, 20, &d, sizeof d);           // DWMWA_USE_IMMERSIVE_DARK_MODE: the title bar
+}
+// A control's visual style: in the dark theme Windows' dark style for its class, or
+// none ("") for check boxes and radio buttons, whose themed text ignores WM_CTLCOLOR*;
+// in the light theme the default.
+void style_control(HWND c, const wchar_t* dark_style) {
+    if (!c) return;
+    SetWindowTheme(c, th.dark ? dark_style : nullptr, th.dark && !*dark_style ? L"" : nullptr);
+}
+// A list view's header draws its text dark in any style: in the dark theme the list
+// (the header's parent) sets the colour through custom draw.
+LRESULT CALLBACK list_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (m == WM_NCDESTROY) RemoveWindowSubclass(h, list_proc, 4);
+    if (m == WM_NOTIFY && th.dark && ((NMHDR*)l)->code == NM_CUSTOMDRAW && ((NMHDR*)l)->hwndFrom == ListView_GetHeader(h)) {
+        auto* cd = (NMCUSTOMDRAW*)l;
+        if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+        if (cd->dwDrawStage == CDDS_ITEMPREPAINT) { SetTextColor(cd->hdc, th.dim); return CDRF_DODEFAULT; }
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+void style_list(HWND lv) {
+    SetWindowSubclass(lv, list_proc, 4, 0);              // again is harmless: the same id replaces it
+    SendMessageW(lv, LVM_SETBKCOLOR, 0, th.edit_bg);
+    SendMessageW(lv, LVM_SETTEXTBKCOLOR, 0, th.edit_bg);
+    SendMessageW(lv, LVM_SETTEXTCOLOR, 0, th.text);
+    style_control(lv, L"DarkMode_Explorer");
+    style_control(ListView_GetHeader(lv), L"DarkMode_ItemsView");
+}
+void style_rich(HWND ed, COLORREF bg) {
+    SendMessageW(ed, EM_SETBKGNDCOLOR, 0, bg);
+    CHARFORMAT2W cf{}; cf.cbSize = sizeof cf; cf.dwMask = CFM_COLOR;
+    if (th.dark) cf.crTextColor = th.text; else cf.dwEffects = CFE_AUTOCOLOR;
+    SendMessageW(ed, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);       // what typing into empty text gets
+    style_control(ed, L"DarkMode_Explorer");
+}
+// WM_CTLCOLOR*: a read-only edit (the memory viewer, the generated code) on the edit
+// background; in the dark theme the other statics, check boxes and edits too.
+LRESULT edit_colours(HDC dc) {
+    SetTextColor(dc, th.text);
+    SetBkColor(dc, th.edit_bg);
+    return (LRESULT)br_edit;
+}
+LRESULT window_colours(HDC dc) {
+    SetTextColor(dc, th.text);
+    SetBkColor(dc, th.window);
+    return (LRESULT)br_window;
+}
+
+void set_theme(int mode) {
+    app.theme = std::clamp(mode, 0, 2);
+    CheckMenuRadioItem(app.menu, ID_THEME_SYSTEM, ID_THEME_DARK, ID_THEME_SYSTEM + app.theme, MF_BYCOMMAND);
+    bool dark = app.theme == 2 || (app.theme == 0 && windows_dark());
+    bool changed = !br_window || dark != th.dark;
+    POINT scroll{};                                       // re-marking moves the selection about: keep the view
+    SendMessageW(app.editor, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
+    if (changed && br_window) sync_bps_from_editor(editor_text());     // the marks are a colour: read them under the old one
+    th = make_theme(dark);
+    if (br_window) { DeleteObject(br_window); DeleteObject(br_edit); }
+    br_window = CreateSolidBrush(th.window);
+    br_edit = CreateSolidBrush(th.edit_bg);
+    dark_menus(dark);
+    for (HWND w : {app.wnd, app.genwnd, app.fbwnd}) if (w) dark_frame(w);
+    help::set_dark(dark);
+    style_rich(app.editor, th.edit_bg);
+    style_rich(app.viewer, th.viewer_bg);
+    for (HWND lv : {app.errlist, app.proflist, app.watchlist}) style_list(lv);
+    for (HWND c : {app.memview, app.mem_addr, app.console, app.genedit}) style_control(c, L"DarkMode_Explorer");
+    for (HWND b : app.tb_buttons) style_control(b, L"DarkMode_Explorer");
+    for (HWND b : app.mem_buttons) style_control(b, L"DarkMode_Explorer");
+    for (HWND b : {app.watch_add, app.watch_ptr, app.watch_remove, app.gen_copy}) style_control(b, L"DarkMode_Explorer");
+    for (HWND b : {app.mem_auto, app.tb_newline, app.watch_dev, app.gen_annotated, app.gen_compact}) style_control(b, L"");
+    for (HWND c : {app.tb_speed, app.filesel}) style_control(c, L"DarkMode_CFD");
+    term::set_default_colours(app.console, th.term_bg, th.term_fg);
+    if (changed) {
+        colour_source(app.editor, app.lang);
+        for (int32_t p : app.bps) mark_bp(p, true);
+        SendMessageW(app.editor, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
+        if (view_loaded > 0) {                            // the imported file in the viewer (read-only: its marks stay put)
+            SendMessageW(app.viewer, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
+            colour_source(app.viewer, true);
+            std::wstring text = rich_text(app.viewer);
+            for (const auto& bp : app.ext_bps) if (bp.first == app.lr.files[(size_t)view_loaded]) mark_char(app.viewer, first_nonblank(text, bp.second), true);
+            SendMessageW(app.viewer, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
+        }
+    }
+    DrawMenuBar(app.wnd);
+    for (HWND w : {app.wnd, app.genwnd}) if (w) RedrawWindow(w, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+}
+
+// The status bar in the dark theme: its visual style paints it light, so it is painted here.
+LRESULT CALLBACK status_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (m == WM_NCDESTROY) RemoveWindowSubclass(h, status_proc, 3);
+    if (th.dark && m == WM_ERASEBKGND) return 1;
+    if (th.dark && m == WM_PAINT) {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        FillRect(dc, &rc, br_window);
+        std::wstring t((size_t)LOWORD(SendMessageW(h, SB_GETTEXTLENGTHW, 0, 0)) + 1, 0);
+        SendMessageW(h, SB_GETTEXTW, 0, (LPARAM)t.data());
+        HFONT old = (HFONT)SelectObject(dc, app.ui_font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, th.text);
+        rc.left += px(4); rc.right -= px(16);
+        DrawTextW(dc, t.c_str(), -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, old);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+
+// The menu bar in the dark theme (undocumented messages Windows sends before drawing
+// the bar and each item; the structures are uxtheme's UAHMENU and UAHDRAWMENUITEM).
+constexpr UINT WM_UAHDRAWMENU = 0x0091, WM_UAHDRAWMENUITEM = 0x0092;
+struct UahMenu { HMENU menu; HDC dc; DWORD flags; };
+struct UahDrawMenuItem { DRAWITEMSTRUCT dis; UahMenu um; int pos; DWORD metrics[8]; DWORD popup[5]; };
+RECT menu_bar_rect(HWND h) {                          // in window coordinates
+    MENUBARINFO mbi{}; mbi.cbSize = sizeof mbi;
+    GetMenuBarInfo(h, OBJID_MENU, 0, &mbi);
+    RECT wr; GetWindowRect(h, &wr);
+    OffsetRect(&mbi.rcBar, -wr.left, -wr.top);
+    return mbi.rcBar;
+}
+void paint_menu_item(const UahDrawMenuItem& d) {
+    wchar_t text[128] = L"";
+    MENUITEMINFOW mi{}; mi.cbSize = sizeof mi; mi.fMask = MIIM_STRING; mi.dwTypeData = text; mi.cch = 127;
+    GetMenuItemInfoW(d.um.menu, (UINT)d.pos, TRUE, &mi);
+    UINT st = d.dis.itemState;
+    HBRUSH b = CreateSolidBrush(st & (ODS_HOTLIGHT | ODS_SELECTED) ? RGB(62, 62, 66) : th.window);
+    FillRect(d.um.dc, &d.dis.rcItem, b);
+    DeleteObject(b);
+    SetBkMode(d.um.dc, TRANSPARENT);
+    SetTextColor(d.um.dc, st & (ODS_GRAYED | ODS_DISABLED | ODS_INACTIVE) ? th.dim : th.text);
+    RECT r = d.dis.rcItem;
+    DrawTextW(d.um.dc, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | (st & ODS_NOACCEL ? DT_HIDEPREFIX : 0));
+}
+// The one-pixel light line Windows draws between the menu bar and the client area.
+void paint_menu_line(HWND h) {
+    RECT r; GetClientRect(h, &r);
+    MapWindowPoints(h, nullptr, (POINT*)&r, 2);
+    RECT wr; GetWindowRect(h, &wr);
+    OffsetRect(&r, -wr.left, -wr.top);
+    r.bottom = r.top; r.top--;
+    HDC dc = GetWindowDC(h);
+    FillRect(dc, &r, br_window);
+    ReleaseDC(h, dc);
+}
+
 // ---- settings: %APPDATA%\bfmachine\settings.ini (BFUI_SETTINGS overrides the path) ----------
 void settings_init() {
     wchar_t buf[MAX_PATH];
@@ -1643,6 +1840,7 @@ void ini_put(const wchar_t* k, const std::wstring& v) {
 void ini_put(const wchar_t* k, int v) { ini_put(k, std::to_wstring(v)); }
 
 void apply_settings() {
+    set_theme(ini_int(L"theme", 0));
     set_newline(ini_int(L"newline", 1) != 0);
     set_baud_index(std::clamp(ini_int(L"terminal_speed", 0), 0, 4));
     set_interp(ini_int(L"interpreter", 0) != 0);
@@ -1685,6 +1883,7 @@ void save_settings() {
     ini_put(L"memory_viewer", app.show_mem ? 1 : 0);
     ini_put(L"console_height", MulDiv(app.console_h, 96, (int)app.dpi));
     ini_put(L"generated_compact", app.gen_is_compact ? 1 : 0);
+    ini_put(L"theme", app.theme);
     ini_put(L"last_file", app.path);
     WINDOWPLACEMENT wp{}; wp.length = sizeof wp;
     if (GetWindowPlacement(app.wnd, &wp)) {
@@ -1781,6 +1980,11 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(tcols, MF_STRING, ID_TERM_120, L"&120 columns");
         AppendMenuW(tcols, MF_STRING, ID_TERM_132, L"1&32 columns");
         AppendMenuW(view, MF_POPUP, (UINT_PTR)tcols, L"&Terminal width");
+        HMENU theme = CreatePopupMenu();
+        AppendMenuW(theme, MF_STRING | MF_CHECKED, ID_THEME_SYSTEM, L"&Follow Windows (app mode)");
+        AppendMenuW(theme, MF_STRING, ID_THEME_LIGHT, L"&Light");
+        AppendMenuW(theme, MF_STRING, ID_THEME_DARK, L"&Dark");
+        AppendMenuW(view, MF_POPUP, (UINT_PTR)theme, L"T&heme");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)view, L"&View");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)devices, L"De&vices");
         AppendMenuW(app.menu, MF_POPUP, (UINT_PTR)help, L"&Help");
@@ -1876,6 +2080,8 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         app.watch_dev = make(L"BUTTON", L"Break on entering device window", BS_AUTOCHECKBOX, ID_WATCH_DEV, app.ui_font);
 
         app.status = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, h, nullptr, nullptr, nullptr);
+        SetWindowSubclass(app.status, status_proc, 3, 0);
+        set_theme(ini_int(L"theme", 0));                 // before the window is first shown
         set_status(L"Type a program, open one (Ctrl+O) or drop a .b / .bfl file onto the window. F5 runs, Ctrl+F5 debugs.");
         DragAcceptFiles(h, TRUE);
         update_title();
@@ -1894,9 +2100,28 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_ERASEBKGND: {
         RECT rc; GetClientRect(h, &rc);
         rc.top = px(PANEL_H);
-        FillRect((HDC)w, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
+        FillRect((HDC)w, &rc, br_window);
         return 1;
     }
+    case WM_UAHDRAWMENU: {
+        if (!th.dark) break;
+        RECT r = menu_bar_rect(h);
+        FillRect(((UahMenu*)l)->dc, &r, br_window);
+        return TRUE;
+    }
+    case WM_UAHDRAWMENUITEM:
+        if (!th.dark) break;
+        paint_menu_item(*(UahDrawMenuItem*)l);
+        return TRUE;
+    case WM_NCPAINT:
+    case WM_NCACTIVATE: {
+        LRESULT r = DefWindowProcW(h, m, w, l);
+        if (th.dark) paint_menu_line(h);
+        return r;
+    }
+    case WM_SETTINGCHANGE:
+        if (app.theme == 0 && l && wcscmp((const wchar_t*)l, L"ImmersiveColorSet") == 0) set_theme(0);
+        break;
     case WM_SETFOCUS: SetFocus(app.editor); return 0;
     case WM_LBUTTONDOWN: {
         POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -1919,7 +2144,15 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     }
     case WM_CTLCOLORSTATIC:
-        if ((HWND)l == app.memview) { SetBkColor((HDC)w, RGB(255, 255, 255)); return (LRESULT)GetStockObject(WHITE_BRUSH); }
+        if ((HWND)l == app.memview) return edit_colours((HDC)w);
+        if (th.dark) return window_colours((HDC)w);
+        break;
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        if (th.dark) return edit_colours((HDC)w);
+        break;
+    case WM_CTLCOLORBTN:
+        if (th.dark) return window_colours((HDC)w);
         break;
     case WM_TIMER:
         if (w == TIMER_MEM) refresh_memory();
@@ -1945,6 +2178,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (id == ID_VIEW_MEM) { set_show_mem(!app.show_mem); return 0; }
         if (id == ID_VIEW_ERRORS) { set_show_errors(!app.show_errors); return 0; }
+        if (id >= ID_THEME_SYSTEM && id <= ID_THEME_DARK) { set_theme(id - ID_THEME_SYSTEM); return 0; }
         if (id >= ID_TERM_FIT && id <= ID_TERM_132) { set_term_cols(TERM_COLS[id - ID_TERM_FIT], true); return 0; }
         if (id == ID_CHECK_HEAP) { set_check_heap(!app.check_heap); return 0; }
         if (id == ID_CHECK_STACK) { set_check_stack(!app.check_stack); return 0; }

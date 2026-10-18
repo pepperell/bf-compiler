@@ -167,8 +167,9 @@ public:
     const Config& config() const { return cfg_; }
 
     void      reset();                           // zero RAM
-    // When set, run() uses the interpreter and counts how often each optimised
-    // instruction executes (resized to the program).
+    // When set, run() uses the interpreter and counts how often each instruction
+    // executes: code.size() counts for the optimised code, then literal.size() for
+    // the literal program (which runs while the pointer can reach the device window).
     std::vector<uint64_t>* profile = nullptr;
     RunResult run(const Program& p, bool use_jit = true);
 

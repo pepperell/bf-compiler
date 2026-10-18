@@ -46,6 +46,7 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
     int32_t start = pc;
     int64_t executed = 0;
     int64_t last_p = p;
+    uint64_t* prof = c->prog == c->lit ? c->lit_prof : c->prof;   // the literal program counts in its own part
 
     for (;;) {
         if (c->stop) {
@@ -81,7 +82,7 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
             last_p = p;
         }
         executed++;
-        if (c->prof && c->prog != c->lit) c->prof[pc]++;
+        if (prof) prof[pc]++;
         const Instr& x = code[pc];
         switch (x.op) {
         case ADD:

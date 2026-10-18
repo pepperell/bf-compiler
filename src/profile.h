@@ -18,6 +18,14 @@ namespace bf {
 // file -1: line is the brainfuck byte offset, or -1 for code outside statements.
 struct ProfileRow { uint64_t count; int file, line; };
 
+// The instruction counts[i] belongs to: Machine::profile holds the optimised code's
+// counts, then the literal program's (run while the pointer can reach the device window).
+inline const Instr* profile_instr(const Program& prog, size_t i) {
+    if (i < prog.code.size()) return &prog.code[i];
+    i -= prog.code.size();
+    return i < prog.literal.size() ? &prog.literal[i] : nullptr;
+}
+
 inline uint64_t profile_total(const std::vector<uint64_t>& counts) {
     uint64_t total = 0;
     for (uint64_t n : counts) total += n;
@@ -29,7 +37,8 @@ inline std::string profile_by_kind(const Program& prog, const std::vector<uint64
     static const char* names[] = {"ADD", "SET", "MUL", "MOVE", "OUT", "IN", "JZ", "JNZ", "ENDIF", "SCAN", "IDIOM", "LOOPX", "END"};
     uint64_t total = profile_total(counts);
     uint64_t per[16] = {};
-    for (size_t pc = 0; pc < counts.size() && pc < prog.code.size(); pc++) per[prog.code[pc].op] += counts[pc];
+    for (size_t i = 0; i < counts.size(); i++)
+        if (const Instr* x = profile_instr(prog, i)) per[x->op] += counts[i];
     std::string s;
     char buf[48];
     for (int k = 0; k <= END; k++)
@@ -38,7 +47,9 @@ inline std::string profile_by_kind(const Program& prog, const std::vector<uint64
 }
 
 // Each instruction's count goes to the innermost statement whose generated range
-// holds its source offset (lr given), or to that offset (plain brainfuck).
+// holds its source offset (lr given), or to that offset (plain brainfuck).  The
+// literal program's instructions carry their brainfuck offsets too, so its counts
+// go to the same statements.
 // Rows come most executed first.
 inline std::vector<ProfileRow> profile_rows(const Program& prog, const std::vector<uint64_t>& counts, const bfl::Result* lr) {
     std::map<std::pair<int, int>, uint64_t> by;          // (file, line) or (-1, source offset)
@@ -51,9 +62,10 @@ inline std::vector<ProfileRow> profile_rows(const Program& prog, const std::vect
             st.push_back((int)i);
         }
     }
-    for (size_t pc = 0; pc < counts.size() && pc < prog.code.size(); pc++) {
-        if (!counts[pc]) continue;
-        int32_t off = prog.code[pc].src;
+    for (size_t pc = 0; pc < counts.size(); pc++) {
+        const Instr* x = profile_instr(prog, pc);
+        if (!counts[pc] || !x) continue;
+        int32_t off = x->src;
         if (!lr) { by[{-1, off}] += counts[pc]; continue; }
         auto it = std::upper_bound(lr->stmts.begin(), lr->stmts.end(), off,
                                    [](int32_t o, const bfl::StmtRange& r) { return o < r.start; });

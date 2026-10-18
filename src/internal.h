@@ -25,6 +25,7 @@ struct Ctx {
     const Program* prog;          // the code being interpreted (optimised or literal)
     const Idiom*   idioms;        // of the optimised program
     uint64_t*      prof;          // per optimised pc execution counts, or nullptr
+    uint64_t*      lit_prof;      // per literal pc execution counts (follow prof's), or nullptr
     const uint8_t* plain;         // per device-window cell: 1 for a plain register (Device::plain)
     ConsoleIo*     console;
     const void* const* labels;    // per IR index: non-null where native code can resume

@@ -15,5 +15,7 @@ const std::vector<Entry>& topics();          // built once; the memory map comes
 
 // Show (or raise) the help window on the given topic.
 void show(HWND owner, HINSTANCE inst, HFONT mono, HFONT ui, Topic topic);
+// Dark or light colours for the help window (View > Theme), now and when it is created.
+void set_dark(bool dark);
 
 } // namespace help

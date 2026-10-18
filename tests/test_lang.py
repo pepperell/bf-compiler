@@ -717,6 +717,40 @@ def share_map():
     return ok
 
 
+PROFILE_DEVICES_SRC = """byte i = 0;
+byte s = 0;
+while (i < 40) {
+    LEDS = i;
+    FB_X = i; FB_Y = i >> 1; FB_COLOR = i * 3;
+    pulse FB_PLOT;
+    s = s + i;
+    i++;
+}
+print s;
+"""
+
+
+def profile_devices():
+    """bf --profile counts the instructions the literal program runs while the pointer can reach the
+    device window: the lines writing LEDS and the framebuffer registers have counts, and the rows add
+    up to the total."""
+    src = os.path.join(TMP, "profile_devices.bfl")
+    open(src, "w", newline="\n").write(PROFILE_DEVICES_SRC)
+    r = subprocess.run([BF, "--quiet-devices", "--profile", src], capture_output=True, timeout=60)
+    text = (r.stdout + r.stderr).decode("latin-1")
+    m = re.search(r"profile: (\d+) IR instructions", text)
+    rows = {}
+    for n, where in re.findall(r"^\s*(\d+)\s+[\d.]+%\s+(\S+)", text, re.M):
+        rows[where] = rows.get(where, 0) + int(n)
+    lines = {int(k): v for k, v in rows.items() if k.isdigit()}
+    ok = (r.returncode == 0 and r.stdout.startswith(b"12") and m is not None and sum(rows.values()) == int(m.group(1))
+          and all(lines.get(l, 0) > 0 for l in (3, 4, 5, 6, 7, 8)))
+    print(("PASS " if ok else "FAIL ") + "profile-devices")
+    if not ok:
+        print("   " + text.replace("\n", "\n   "))
+    return ok
+
+
 SHARE_SETTING_SRC = """long a = long(in) * 1000; long b = long(in) - 7;
 long x = a * b + 5; long y = a / b; long z = mulshr(a, b, 3) - 1; long w = x * y;
 long k = 100000; long m = 7; long p = k / m; long q = p / m; long r = k * m; long u = r * p;
@@ -788,6 +822,8 @@ def main():
         fails += 1
     if not share_setting():
         fails += 1
+    if not profile_devices():
+        fails += 1
     if not shared_fuzz():
         fails += 1
     if not bfl_fuzz():
@@ -844,7 +880,7 @@ def main():
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1
-    total = len(CASES) + 8 + len(errors) + len(DIAGS) + len(GRIDS) + len(MULSHR_GRIDS) + n_samples
+    total = len(CASES) + 9 + len(errors) + len(DIAGS) + len(GRIDS) + len(MULSHR_GRIDS) + n_samples
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

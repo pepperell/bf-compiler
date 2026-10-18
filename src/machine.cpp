@@ -186,7 +186,12 @@ RunResult Machine::run(const Program& p, bool use_jit) {
     ctx.temp_bp = -1;             // no debugger features in a normal run
     ctx.watch_hit = -1;
 
-    if (profile) { use_jit = false; profile->assign(p.code.size(), 0); ctx.prof = profile->data(); }
+    if (profile) {
+        use_jit = false;
+        profile->assign(p.code.size() + p.literal.size(), 0);
+        ctx.prof = profile->data();
+        ctx.lit_prof = ctx.prof + p.code.size();
+    }
     JitCode jit;
     if (use_jit) {
         if (!jit_compile(p, jit)) { r.message = "jit: " + jit.error; return r; }

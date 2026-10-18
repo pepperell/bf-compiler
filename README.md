@@ -21,10 +21,14 @@ Ctrl+S saves, Ctrl+R reloads from disk, Ctrl+L clears the terminal. Dropping a `
 the window loads and runs it. Drag the bar between editor and terminal to resize them.
 View > Memory viewer (Ctrl+M) hides the memory column to give the editor and terminal
 the full width, and View > Terminal width fixes the terminal at 80, 120 or 132 columns
-(`hanoi.b` needs about 120) instead of fitting the window.
+(`hanoi.b` needs about 120) instead of fitting the window. View > Theme picks light or
+dark colours for the editor, the imported-file viewer, the generated brainfuck, the memory
+viewer, the lists, the menus, the help and the terminal's default colours; by default it
+follows the Windows app mode (Settings > Personalisation > Colours) and changes with it.
+Syntax colours, breakpoint marks and the profiler's heat gutter have a set for each theme.
 
 The UI remembers its settings in `%APPDATA%\bfmachine\settings.ini`: newline mode,
-terminal speed and width, interpreter choice, the check options, window placement,
+terminal speed and width, interpreter choice, the check options, the theme, window placement,
 terminal height, which panes are shown and the last file. Started without a file, it
 reopens the last one without running it. (The environment variable `BFUI_SETTINGS`
 names a different settings file.)
@@ -74,8 +78,10 @@ The API behind this is `bf::Debugger` in `src/bf.h`.
 Run > Profile (Ctrl+P) runs the editor contents on the interpreter and counts the IR
 instructions executed for each source line: for BFL, the innermost statement that starts
 on the line, the same attribution as `bf --profile` (`src/profile.h` is shared by both).
-When the program ends, or Shift+F5 stops one that runs forever, a gutter at the left of
-the editor colours each line by its share of all instructions (pale yellow to red) and
+Instructions the literal program runs while the pointer can reach the device window
+(see "Memory map" below) count too, to the same lines. When the program ends, or Shift+F5
+stops one that runs forever, a gutter at the left of the editor colours each line by its
+share of all instructions (pale yellow to red; dim amber to red in the dark theme) and
 prints the percentage, and the pane under the editor lists the lines that executed the
 most with their counts; double-click a row to go to the line. For a multi-file program the
 File box shows each file's share and an imported file picked there has the gutter too.
