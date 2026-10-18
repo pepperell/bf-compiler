@@ -311,3 +311,8 @@ does) as status "fault", with the cell it touched, as the interpreter does.
 `rel` is the offset within the mapped range (and `plain(rel)` for registers that behave
 like memory), and call `Machine::map(addr, size, &dev)`. Device
 code runs on the executor thread; use the thread-safe patterns in `devices.h` for UI work.
+
+## Licence
+
+MIT; see `LICENSE`. The third-party brainfuck programs in `programs/thirdparty/` keep their
+authors' own terms, listed in `programs/thirdparty/README.md`.
