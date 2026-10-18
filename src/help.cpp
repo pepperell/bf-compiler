@@ -2,6 +2,10 @@
 #include "help.h"
 #include "registers.h"
 #include <commctrl.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 namespace help {
 
@@ -57,9 +61,13 @@ VIEW AND SETTINGS
 View > Memory viewer (Ctrl+M) hides the memory column so the editor and the
 terminal get the full width.  View > Terminal width fixes the terminal at 80,
 120 or 132 columns instead of fitting the window.  View > Error list shows or
-hides the BFL error list under the editor.  Settings (newline mode, terminal
-speed and width, interpreter, check options, window placement, terminal
-height, panes and the last file) are kept in %APPDATA%\bfmachine\settings.ini.
+hides the BFL error list under the editor.  View > Theme picks light or dark
+colours (editor, viewer, generated code, memory viewer, lists, menus, this
+help and the terminal's defaults); "Follow Windows" (the default) uses the
+Windows app mode and changes with it.  Settings (newline mode, terminal
+speed and width, interpreter, check options, theme, window placement,
+terminal height, panes and the last file) are kept in
+%APPDATA%\bfmachine\settings.ini.
 Started without a file, the program reopens the last one without running it.
 
 HOW A RUN WORKS
@@ -241,9 +249,11 @@ so they are far slower than a normal run.  Use them for logic, not timing.
 PROFILER
   Run > Profile (Ctrl+P) runs the editor contents on the interpreter and
   counts the IR instructions each source line executes, the same counts as
-  bf --profile.  When the program ends (or Shift+F5 stops it) a gutter at the
-  left of the editor shows each line's share of all instructions on a heat
-  scale from pale yellow to red, and the pane under the editor lists the
+  bf --profile, including those the literal program runs while the pointer
+  can reach the device window.  When the program ends (or Shift+F5 stops it)
+  a gutter at the left of the editor shows each line's share of all
+  instructions on a heat scale from pale yellow to red (dim amber to red in
+  the dark theme), and the pane under the editor lists the
   lines that executed the most, with their counts; double-click a row to go
   to its line.  For a BFL program a line is the innermost statement starting
   there; the row (outside statements) is code such as the dispatcher of
@@ -292,7 +302,8 @@ const wchar_t* CLI_TEXT = LR"(COMMAND LINE: bf.exe
   --regs           print the memory map as a Markdown table and exit
   --time           print run time and status to stderr
   --profile        run in the interpreter, then list where the executed
-                   instructions went (by BFL statement for a .bfl file);
+                   instructions went (by BFL statement for a .bfl file,
+                   device-window code run command by command included);
                    Run > Profile in this window shows the same counts
   --eof MODE       ',' at end of input: nochange (default), 0, 255
   --ram N          RAM cells (default 1048576)
@@ -324,8 +335,10 @@ const wchar_t* LANGUAGE_TEXT = LR"(BFL - A LOW-LEVEL LANGUAGE THAT COMPILES TO B
 Files ending in .bfl are compiled to brainfuck before they run (Run > Source
 is BFL turns this on for other names).  Ctrl+B shows the generated brainfuck,
 either annotated (a "# L12: source" comment before each statement, indented
-by nesting) or compacted to the commands alone as one continuous string;
-Copy puts the shown form on the clipboard and File > Export writes a .b file.  The debugger steps by statement: F11
+by nesting) or compacted to the commands alone as one continuous string
+(while a program runs or is being debugged, the code of that program: edits
+are compiled at the next run); Copy puts the shown form on the clipboard and
+File > Export writes a .b file (not during a run).  The debugger steps by statement: F11
 steps into a procedure call, F10 steps over it, F9 sets a breakpoint on the
 statement at the caret, and the watch list is filled with the program's
 global variables.  The editor colours keywords, types, numbers, strings,
@@ -496,6 +509,17 @@ HWND g_wnd = nullptr, g_list = nullptr, g_text = nullptr;
 HFONT g_mono = nullptr, g_ui = nullptr;
 UINT g_dpi = 96;
 int px(int v) { return MulDiv(v, (int)g_dpi, 96); }
+bool g_dark = false;
+HBRUSH g_back = nullptr, g_pane = nullptr;      // window and text/list backgrounds of the dark theme
+COLORREF pane_bg() { return g_dark ? RGB(24, 24, 24) : GetSysColor(COLOR_WINDOW); }
+
+void apply_theme() {
+    if (!g_wnd) return;
+    BOOL d = g_dark;
+    DwmSetWindowAttribute(g_wnd, 20, &d, sizeof d);             // DWMWA_USE_IMMERSIVE_DARK_MODE
+    for (HWND c : {g_list, g_text}) SetWindowTheme(c, g_dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+    RedrawWindow(g_wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+}
 
 void select_topic(int i) {
     const auto& t = topics();
@@ -527,8 +551,16 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_SIZE: layout(); return 0;
     case WM_CTLCOLORSTATIC:
-        if ((HWND)l == g_text) { SetBkColor((HDC)w, RGB(255, 255, 255)); return (LRESULT)GetStockObject(WHITE_BRUSH); }
-        break;
+    case WM_CTLCOLORLISTBOX:
+        if (m == WM_CTLCOLORSTATIC && (HWND)l != g_text) break;
+        if (!g_dark) { if (m == WM_CTLCOLORLISTBOX) break; SetBkColor((HDC)w, RGB(255, 255, 255)); return (LRESULT)GetStockObject(WHITE_BRUSH); }
+        SetTextColor((HDC)w, RGB(220, 220, 220));
+        SetBkColor((HDC)w, pane_bg());
+        return (LRESULT)g_pane;
+    case WM_ERASEBKGND:
+        if (!g_dark) break;
+        { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, g_back); }
+        return 1;
     case WM_COMMAND:
         if (LOWORD(w) == 1 && HIWORD(w) == LBN_SELCHANGE) select_topic((int)SendMessageW(g_list, LB_GETCURSEL, 0, 0));
         return 0;
@@ -545,6 +577,12 @@ const std::vector<Entry>& topics() {
     return t;
 }
 
+void set_dark(bool dark) {
+    g_dark = dark;
+    if (!g_back) { g_back = CreateSolidBrush(RGB(32, 32, 32)); g_pane = CreateSolidBrush(RGB(24, 24, 24)); }
+    apply_theme();
+}
+
 void show(HWND owner, HINSTANCE inst, HFONT mono, HFONT ui, Topic topic) {
     g_mono = mono; g_ui = ui;
     if (!g_wnd) {
@@ -558,6 +596,7 @@ void show(HWND owner, HINSTANCE inst, HFONT mono, HFONT ui, Topic topic) {
         UINT dpi = GetDpiForWindow(owner);
         CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Help", WS_OVERLAPPEDWINDOW,
                         CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(900, dpi, 96), MulDiv(640, dpi, 96), owner, nullptr, inst, nullptr);
+        apply_theme();
     }
     select_topic(topic);
     ShowWindow(g_wnd, SW_SHOW);

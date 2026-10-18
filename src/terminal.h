@@ -38,5 +38,8 @@ void set_columns(HWND h, int cols);
 int  columns_setting(HWND h);
 void get_size(HWND h, int& cols, int& rows);
 void get_cell_size(HWND h, int& cw, int& ch);         // pixel size of one character cell
+// The default background and text colours (palette entries 0 and 7, black and grey
+// unless set), so the terminal can follow the window's theme.
+void set_default_colours(HWND h, COLORREF bg, COLORREF fg);
 
 } // namespace term

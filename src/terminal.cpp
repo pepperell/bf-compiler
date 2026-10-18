@@ -40,6 +40,7 @@ struct Term {
     bool  priv = false;
     int   view = 0;                           // lines scrolled back into history
     std::function<void(uint8_t)> on_key;
+    COLORREF def_bg = RGB(0, 0, 0), def_fg = RGB(204, 204, 204);   // palette 0 and 7 (set_default_colours)
 
     Line blank_line() const { Line l(cols); for (auto& c : l) { c.bg = cur.bg; } return l; }
 
@@ -271,7 +272,9 @@ struct Term {
     }
 
     // ---- painting -------------------------------------------------------------------
-    static COLORREF colour(uint8_t i) {
+    COLORREF colour(uint8_t i) const {
+        if (i == 0) return def_bg;
+        if (i == 7) return def_fg;
         static const COLORREF base[16] = {
             RGB(0, 0, 0), RGB(205, 49, 49), RGB(13, 188, 121), RGB(229, 229, 16), RGB(36, 114, 200), RGB(188, 63, 188), RGB(17, 168, 205), RGB(204, 204, 204),
             RGB(102, 102, 102), RGB(241, 76, 76), RGB(35, 209, 139), RGB(245, 245, 67), RGB(59, 142, 234), RGB(214, 112, 214), RGB(41, 184, 219), RGB(255, 255, 255)};
@@ -320,7 +323,8 @@ struct Term {
         }
         if (fixed_cols > 0 && cols * cw < rc.right) {          // shade the area past a fixed right margin
             RECT past{cols * cw, 0, rc.right, rc.bottom};
-            HBRUSH b = CreateSolidBrush(RGB(48, 48, 52));
+            auto up = [](int c, int d) { return std::min(255, c + d); };   // a little lighter than the background
+            HBRUSH b = CreateSolidBrush(RGB(up(GetRValue(def_bg), 48), up(GetGValue(def_bg), 48), up(GetBValue(def_bg), 52)));
             FillRect(mem, &past, b);
             DeleteObject(b);
         }
@@ -438,6 +442,9 @@ void set_columns(HWND h, int cols) {
         if (t->win_w > 0) { int w = t->win_w, hh = t->win_h; t->win_w = -1; t->cols = -1; t->resize_to(w, hh); }
         InvalidateRect(h, nullptr, FALSE);
     }
+}
+void set_default_colours(HWND h, COLORREF bg, COLORREF fg) {
+    if (Term* t = get(h)) { t->def_bg = bg; t->def_fg = fg; InvalidateRect(h, nullptr, FALSE); }
 }
 int columns_setting(HWND h) { Term* t = get(h); return t ? t->fixed_cols : 0; }
 void get_size(HWND h, int& cols, int& rows) { Term* t = get(h); cols = t ? t->cols : 0; rows = t ? t->rows : 0; }
