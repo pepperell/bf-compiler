@@ -127,8 +127,10 @@ name, whole and typed, and ticking one makes it a data breakpoint. For BFL the d
 works on the source, including imported files.
 
 **Profiler.** Run > Profile (Ctrl+P) counts IR instructions per source line and colours
-the editor gutter by share; `bf --profile` does the same on the console.
+the editor gutter by share; `bf --profile` does the same on the console. Code run while
+the pointer can reach the device window counts too.
 
+View > Theme picks light or dark colours, or follows the Windows app mode (the default).
 Settings persist in `%APPDATA%\bfmachine\settings.ini`.
 
 ## Speed
