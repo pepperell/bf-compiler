@@ -300,7 +300,9 @@ Rules:
   stays a `word`. `byte + byte` wraps at 256: write `word(a) + b` for a 16-bit sum.
 - **Shifts** have the type of their left operand. `>>` is arithmetic (copies the
   sign bit) on signed types and logical on unsigned ones. Shifting by the width
-  or more gives 0, or -1 for a negative signed value shifted right.
+  or more gives 0, or -1 for a negative signed value shifted right; so does a
+  negative count. The count keeps its own type, so `b << w` with `w` a `word`
+  holding 256 is 0.
 - **Division** truncates towards zero, and `%` takes the sign of the dividend,
   as in C: `-7 / 2` is -3 and `-7 % 2` is -1. Division by zero gives 0 and the
   remainder is the dividend.

@@ -1,6 +1,6 @@
 # Roadmap: BFL towards modern programming
 
-Status: implemented (phases 0 to 8); phases 9 to 14 are planned (section 11).
+Status: implemented (phases 0 to 9); phases 10 to 14 are planned (section 11).
 Hardware and devices are out of scope here. The sections below are the plan as
 written. Where the result differs, docs/HEAP.md (phase 0), docs/TRAMPOLINE.md
 (phase 7) and the note under phase 8 say what was built, and docs/LANG.md
@@ -26,7 +26,7 @@ plus the type system, library and tooling they need.
 | 6 | Imports and the standard library | 1, 5 |
 | 7 | Recursion on the heap: frames in memory, restrictions lifted | 3, 4 |
 | 8 | Tooling: settings, terminal width, syntax colouring, multi-file debugging | 6 |
-| 9 | Planned: a differential fuzzer for the optimiser and JIT | nothing |
+| 9 | A differential fuzzer for the compiler, the optimiser and the JIT | nothing |
 | 10 | Planned: fused multiply-and-shift for fixed-point arithmetic | 9 |
 | 11 | Planned: arithmetic shared within a block, without the trampoline | 9 |
 | 12 | Planned: faster division | 9 |
@@ -233,7 +233,7 @@ touches breakpoint backgrounds nor fills the undo history. Watch rows show
 multi-byte, signed and pointer values whole. Run > Check heap accesses and Run >
 Check recursion stack match the `bf` flags.
 
-## 11. Next: phases 9 to 14 (planned)
+## 11. Phases 9 to 14 (9 built, the rest planned)
 
 After phase 8 the optimiser learnt loop idioms (multi-byte carries, compares,
 halving and byte division each run in one step), known cell values carried
@@ -266,6 +266,39 @@ that made the same source compile differently now and then.
 
 Done when: a long run (thousands of programs) finds nothing, and every bug it
 found has a minimal regression test.
+
+**Built** as `tests/fuzz.py`. The BFL generator builds a program tree, and a
+model of the language in Python runs that tree: sema's typing rules, constant
+folding, conversions, division and shifts. The tree is printed as source,
+compiled twice (the two outputs must be identical), compiled once more with
+`BFL_NO_LAYOUT`, and run by eight executors: the JIT and the interpreter, each
+optimised, unoptimised, and without idioms or without block rebuilding. Each
+output is compared with the model's. The brainfuck is also run with a cell of
+the program poked first and compared with the unoptimised run. Programs include
+recursive procedures as well as inlined ones, and pointers into heap arrays. The
+brainfuck generator aims at multiplies, ifs, carries and scans, and is checked
+against a Python interpreter. Failures are shrunk: statements and expressions
+for BFL, delta debugging for brainfuck. `tests/test.py` runs 60 brainfuck seeds
+and `tests/test_lang.py` runs 16 BFL seeds.
+
+All the bugs it found were in the compiler, not the optimiser or the JIT. Each
+has a case in `tests/test_lang.py`:
+
+- A shift count was taken modulo 256 at run time, converted to the left
+  operand's type when known at compile time, and ignored when negative, so
+  `b << w` with `w` a `word` holding 256 gave `b`. Sema's folding of a negative
+  constant count was undefined behaviour in C++, and turned into wrong constants
+  and spurious "does not fit" errors. A count that is negative or at least the
+  width now shifts everything out everywhere (`shift-count-out-of-range`).
+- A sum folded nested `+` and `-` into one list of terms across types, so in
+  `long - (byte - 1)` the byte part never wrapped (`narrow-part-of-wide-sum`).
+- `break` and `return` in a `for` loop still ran the step, so a counter read
+  after `break` was one too high. In a trampolined procedure the step wrote a
+  frame cell that the return had just cleared, and the stale cell later
+  corrupted a result (`for-break-skips-step`).
+
+The final run of 5000 BFL and 3000 brainfuck programs (seed 100000) found
+nothing.
 
 ### Phase 10: fused multiply-and-shift
 

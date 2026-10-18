@@ -409,6 +409,20 @@ case("logic-short-circuit", "byte a = 0; byte b = 1; if (a && in == 'z') { out '
 case("not", "byte a = in; byte b = !a; byte c = !!a; print b, c; out !a + 'A';", b"01A", b"\x07")
 case("neg-and-complement", "byte a = in; byte b = -a; byte c = ~a; print b, \" \", c;", b"253 252", b"\x03")
 case("shift-var", "byte a = in; byte n = in; print a << n, \" \", a >> n;", b"200 3", b"\x19\x03")
+# found by tests/fuzz.py: a count of 256 or more, or a negative one, shifts everything out, whether
+# the count is known at compile time or not (it was once taken modulo 256, or as the left operand's type)
+case("shift-count-out-of-range", "word w = in; w = w * 256 + in; int n = in; n -= 1; byte b = 3; word x = 5; long l = -5; int s = -3;"
+     " print b << w, \" \", x << w, \" \", l >> w, \" \", s >> n, \" \", x >> n; w = 256; print \" \", b << w, \" \", x << w;"
+     " print \" \", b >> (-1), \" \", l >> (-1), \" \", 1 << (-1);", b"0 0 -1 -1 0 0 0 0 -1 0", b"\x01\x00\x00")
+# found by tests/fuzz.py: a part of a sum narrower than the sum wraps at its own width first
+case("narrow-part-of-wide-sum", "byte g = 0; byte b = 1; long l = in; word w = l - (g - 1); print w, \" \"; long z = l - l; print z + (-b);",
+     b"65393 255", b"p")
+# found by tests/fuzz.py: break and return leave a for loop without its step (in a trampolined
+# procedure the step once wrote a cell of the frame the return had just cleared)
+case("for-break-skips-step", "byte c; for (c = 0; c < 5; c++) { if (c == 2) { break; } } print c, \" \";"
+     " for (c = 0; c < 5; c++) { if (c < 4) { continue; } break; } print c, \" \";"
+     " rec proc word f(byte n) { byte d; for (d = 0; d < 2; d++) { return 7; } if (n != 0) { f(n - 1); } return 9; } print f(1);",
+     b"2 4 7")
 case("mul-const", "byte a = in; print a * 10, \" \", 7 * a;", b"230 161", b"\x17")
 case("div-zero", "byte a = in; print a / 0, \" \", a % 0;", b"0 23", b"\x17")   # defined as 0 and a
 case("array-const-index", "byte a[4]; a[0] = 'a'; a[1] = a[0] + 1; a[3] = a[1] + 2; a[2] = a[3] - 1; out a[0], a[1], a[2], a[3];", b"abcd")
@@ -607,12 +621,31 @@ def shared_fuzz():
     return ok
 
 
+def bfl_fuzz():
+    """A few programs of tests/fuzz.py: random BFL checked against a model of the
+    language in Python, through every executor."""
+    sys.path.insert(0, os.path.dirname(__file__))
+    sys.dont_write_bytecode = True
+    import fuzz
+    results = fuzz.run_cases(BF, 16, 0, 9000, TMP, log=lambda m: None)
+    bad = [r for r in results if r.status == "fail"]
+    ran = sum(r.status != "skip" for r in results)
+    ok = not bad and ran >= 12
+    print(("PASS " if ok else "FAIL ") + f"fuzz-bfl ({ran} random programs)")
+    for r in bad:
+        print(f"   seed {r.seed}: " + "; ".join(str(f) for f in r.fails[:3]))
+        print(f"   (python tests/fuzz.py --replay bfl {r.seed})")
+    return ok
+
+
 def main():
     update = "--update-golden" in sys.argv
     fails = 0
     if not deterministic():
         fails += 1
     if not shared_fuzz():
+        fails += 1
+    if not bfl_fuzz():
         fails += 1
     if not golden(update):
         fails += 1
@@ -659,7 +692,7 @@ def main():
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1
-    total = len(CASES) + 5 + len(errors) + len(DIAGS) + len(GRIDS) + n_samples
+    total = len(CASES) + 6 + len(errors) + len(DIAGS) + len(GRIDS) + n_samples
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

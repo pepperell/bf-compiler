@@ -719,6 +719,20 @@ struct Gen {
         releaseN(b, n); releaseN(h, n);
         if (sgn) { if_nonzero(s, [&] { add(w + n - 1, 128); }); release(s); }
     }
+    // The count of a shift into the zero cell n: the right operand's value, or 255 when that is
+    // negative or above 255.  Either way every bit is shifted out, as by a count of the width or
+    // more, instead of the count being taken modulo 256.
+    void eval_count(const Expr& b, int64_t n) {
+        int sz = b.type && b.type->is_int() ? b.type->size : 1;
+        if (sz <= 1) { eval8(b, n); return; }
+        int64_t c = tmpN(sz); eval_into(b, c, b.type);
+        move(c, {{n, 1}});
+        int64_t f = tmp();
+        for (int k = 1; k < sz; k++) if_nonzero(c + k, [&] { set(f, 1); });
+        if_nonzero(f, [&] { clear(n); add(n, -1); });
+        release(f);
+        drop(c, sz);
+    }
     // w shifted by m whole bytes (left, or right with the sign copied when sgn): byte moves, no bit loops
     void shift_bytes(int64_t w, int n, int m, bool left, bool sgn) {
         int64_t s = -1;
@@ -973,7 +987,8 @@ struct Gen {
             const Type* ot = conv_type(e.optype ? e.optype : t);
             auto a = fold(*e.a, use_known), b = fold(*e.b, use_known);
             if (!a || !b) return std::nullopt;
-            int64_t x = wrap(*a, ot), y = wrap(*b, ot);
+            bool shift = o == "<<" || o == ">>";
+            int64_t x = wrap(*a, ot), y = shift ? *b : wrap(*b, ot);     // a shift count keeps its own type
             if (o == "==") return x == y;
             if (o == "!=") return x != y;
             if (o == "<") return x < y;
@@ -1194,16 +1209,19 @@ struct Gen {
     }
 
     // ---- expressions: byte path -------------------------------------------------------------------
-    // Flatten a chain of + and - (and unary -) on integers into signed terms plus one constant.
-    void collect_terms(const Expr& e, int sign, std::vector<std::pair<const Expr*, int>>& terms, int64_t& constant) {
+    // Flatten a chain of + and - (and unary -) on integers into signed terms plus one constant,
+    // for a sum `width` bytes wide.  A narrower part of the chain wraps at its own width before it is
+    // widened, so it stays one term.
+    void collect_terms(const Expr& e, int sign, std::vector<std::pair<const Expr*, int>>& terms, int64_t& constant, int width = 1) {
         if (auto v = fold(e, true)) { constant += sign * *v; return; }
-        if (e.kind == Expr::Binary && (e.text == "+" || e.text == "-") && e.type && e.type->is_int()
+        bool wide_enough = sz(e) >= width;
+        if (wide_enough && e.kind == Expr::Binary && (e.text == "+" || e.text == "-") && e.type && e.type->is_int()
             && e.a->type && e.a->type->is_int() && e.b->type && e.b->type->is_int()) {
-            collect_terms(*e.a, sign, terms, constant);
-            collect_terms(*e.b, e.text == "+" ? sign : -sign, terms, constant);
+            collect_terms(*e.a, sign, terms, constant, width);
+            collect_terms(*e.b, e.text == "+" ? sign : -sign, terms, constant, width);
             return;
         }
-        if (e.kind == Expr::Unary && e.text == "-") { collect_terms(*e.a, -sign, terms, constant); return; }
+        if (wide_enough && e.kind == Expr::Unary && e.text == "-") { collect_terms(*e.a, -sign, terms, constant, width); return; }
         terms.emplace_back(&e, sign);
     }
     static bool is_cmp(const std::string& o) { return o == "==" || o == "!=" || o == "<" || o == "<=" || o == ">" || o == ">="; }
@@ -1328,12 +1346,12 @@ struct Gen {
             if (o == "<<") {
                 if (auto k = fold(b, true)) {
                     int64_t t = tmp(); eval8(a, t);
-                    if (*k >= 8) clear(t); else for (int64_t i = 0; i < *k; i++) double8(t);
+                    if (*k >= 8 || *k < 0) clear(t); else for (int64_t i = 0; i < *k; i++) double8(t);
                     move(t, {{dst, sign}});
                     release(t);
                     return;
                 }
-                int64_t n = tmp(); eval8(b, n);
+                int64_t n = tmp(); eval_count(b, n);
                 int64_t t = tmp(); eval8(a, t);
                 open(n); add(n, -1); double8(t); close();
                 move(t, {{dst, sign}});
@@ -1343,12 +1361,12 @@ struct Gen {
             if (o == ">>" && narrow && !e.type->is_signed) {
                 if (auto k = fold(b, true)) {
                     int64_t t = tmp(); eval8(a, t);
-                    if (*k >= 8) clear(t); else for (int64_t i = 0; i < *k; i++) halve8(t);
+                    if (*k >= 8 || *k < 0) clear(t); else for (int64_t i = 0; i < *k; i++) halve8(t);
                     move(t, {{dst, sign}});
                     release(t);
                     return;
                 }
-                int64_t n = tmp(); eval8(b, n);
+                int64_t n = tmp(); eval_count(b, n);
                 int64_t t = tmp(); eval8(a, t);
                 open(n); add(n, -1); halve8(t); close();
                 move(t, {{dst, sign}});
@@ -1580,7 +1598,7 @@ struct Gen {
         }
         if (o == "+" || o == "-") {
             std::vector<std::pair<const Expr*, int>> terms; int64_t constant = 0;
-            collect_terms(e, 1, terms, constant);
+            collect_terms(e, 1, terms, constant, n);
             for (auto& tm : terms) {
                 if (known0N(dst, n) && tm.second > 0) { eval_into(*tm.first, dst, t); continue; }
                 int64_t x = tmpN(n); eval_into(*tm.first, x, t);
@@ -1613,7 +1631,7 @@ struct Gen {
             bool left = o == "<<";
             if (auto k = fold(b, true)) {
                 eval_into(a, dst, t);
-                if (*k >= 8 * n) { if (left || !t->is_signed) clearN(dst, n); else shift_bytes(dst, n, n, false, true); }
+                if (*k >= 8 * n || *k < 0) { if (left || !t->is_signed) clearN(dst, n); else shift_bytes(dst, n, n, false, true); }
                 else {
                     int m = (int)(*k / 8);                       // whole bytes first, then single bits
                     if (m) shift_bytes(dst, n, m, left, t->is_signed);
@@ -1621,7 +1639,7 @@ struct Gen {
                 }
                 return;
             }
-            int64_t c = tmp(); eval8(b, c);
+            int64_t c = tmp(); eval_count(b, c);
             eval_into(a, dst, t);
             open(c); add(c, -1); if (left) shlN(dst, n); else shrN(dst, n, t->is_signed); close();
             release(c);
@@ -1902,7 +1920,14 @@ struct Gen {
             ctxs.push_back(lc);
             gen_scope(body);
             ctxs.pop_back();
-            if (step) gen_stmt(*step);
+            if (step && !needs) gen_stmt(*step);
+            else if (step) {
+                // not after a break or a return (continue still steps)
+                int64_t go_on = tmp(); set(go_on, 1);
+                int64_t b = tmp(); copy(lc.brk, b); if_nonzero(b, [&] { clear(go_on); }); release(b);
+                if_nonzero(go_on, [&] { gen_stmt(*step); });
+                release(go_on);
+            }
             if (!folded) { clear(c); eval_cond(*cond, c); }
             if (needs) { int64_t t = tmp(); copy(lc.brk, t); if_nonzero(t, [&] { clear(c); }); release(t); }
         }

@@ -8,7 +8,7 @@ are avoided: the order of side effects when a call sits inside an expression
 parameters, which are copy-in / copy-out through the trampoline (so a procedure
 with ref parameters touches no globals, and no variable is passed to two of them).
 
-    python testsuzz_shared.py [count] [first_seed]     (tests	est_lang.py runs a few)
+    python tests/fuzz_shared.py [count] [first_seed]     (tests/test_lang.py runs a few)
 """
 import os
 import random

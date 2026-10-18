@@ -219,11 +219,11 @@ struct Sema {
     static std::optional<int64_t> fold_binary(const std::string& o, int64_t a, int64_t b) {
         if (o == "+") return a + b;
         if (o == "-") return a - b;
-        if (o == "*") return a * b;
+        if (o == "*") return (int64_t)((uint64_t)a * (uint64_t)b);
         if (o == "/") return b ? a / b : 0;
         if (o == "%") return b ? a % b : a;
-        if (o == "<<") return b >= 32 ? 0 : a << b;
-        if (o == ">>") return b >= 32 ? (a < 0 ? -1 : 0) : a >> b;
+        if (o == "<<") return (b >= 32 || b < 0) ? 0 : (int64_t)((uint64_t)a << b);
+        if (o == ">>") return (b >= 32 || b < 0) ? (a < 0 ? -1 : 0) : a >> b;
         if (o == "&") return a & b;
         if (o == "|") return a | b;
         if (o == "^") return a ^ b;

@@ -12,6 +12,7 @@ out\bf.exe [options] prog.b    console runner   (bf --help for options)
 out\bf.exe prog.bfl            compile a BFL program to brainfuck and run it
 out\bfui.exe [prog.b|prog.bfl] Windows UI
 python tests\test_lang.py      BFL compiler suite (arithmetic grids, devices, golden files)
+python tests\fuzz.py          random BFL and brainfuck through every executor (--help for options)
 ```
 
 The UI has a device panel (lamps, number display), a source editor, a VT100 terminal and a

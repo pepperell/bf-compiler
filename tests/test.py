@@ -229,10 +229,29 @@ def idiom_cases():
     return fails, len(IDIOM_PROGRAMS)
 
 
+def bf_fuzz():
+    """A few programs of tests/fuzz.py: random brainfuck aimed at the loops the
+    optimiser rewrites, through every executor, against the reference interpreter."""
+    import tempfile
+    sys.path.insert(0, os.path.dirname(__file__))
+    sys.dont_write_bytecode = True
+    import fuzz
+    results = fuzz.run_cases(BF, 0, 60, 9000, tempfile.mkdtemp(), log=lambda m: None)
+    bad = [r for r in results if r.status == "fail"]
+    ran = sum(r.status != "skip" for r in results)
+    ok = not bad and ran >= 50
+    print(("PASS " if ok else "FAIL ") + f"fuzz-bf ({ran} random programs)")
+    for r in bad:
+        print(f"   seed {r.seed}: " + "; ".join(str(f) for f in r.fails[:3]))
+        print(f"   (python tests/fuzz.py --replay bf {r.seed})")
+    return 0 if ok else 1
+
+
 def main():
     fails = 0
     idiom_fails, idiom_n = idiom_cases()
     fails += idiom_fails
+    fails += bf_fuzz()
     ok, why = readme_matches_regs()
     print(("PASS " if ok else "FAIL ") + "readme-register-table")
     if not ok:
@@ -263,7 +282,7 @@ def main():
             print("   expected:", expected)
             for k, v in results.items():
                 print(f"   {k}: rc={v[0]} out={v[1]!r} err={v[2]!r}")
-    total = len(CASES) + 1 + len(THIRDPARTY) + idiom_n
+    total = len(CASES) + 2 + len(THIRDPARTY) + idiom_n
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 
