@@ -143,7 +143,7 @@ int32_t interp_run(Ctx* c, int32_t pc, bool until_label) {
         continue;
     oob:
         c->status = (int32_t)Status::Fault;
-        c->fault_ptr = (uintptr_t)(p + x.off);
+        c->fault_ptr = (uintptr_t)c->tape + (uintptr_t)p;   // an address, as the JIT reports it (its R12)
         c->msg = "pointer left the tape";
         break;
     }

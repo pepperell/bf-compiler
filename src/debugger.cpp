@@ -98,7 +98,7 @@ struct Debugger::Impl {
             result.status = (Status)ctx.status;
             result.seconds = elapsed;
             result.ptr = (int64_t)(ctx.ptr - ctx.tape);
-            if (result.status == Status::Fault) result.message = ctx.msg + " (cell " + std::to_string((int64_t)(ctx.fault_ptr)) + ")";
+            if (result.status == Status::Fault) result.message = ctx.msg + " (cell " + std::to_string((int64_t)(ctx.fault_ptr - (uintptr_t)ctx.tape)) + ")";
             if (ctx.console) ctx.console->flush();
             finished = true;
             if (on_event) on_event(Event::Finished);
