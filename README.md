@@ -1,221 +1,32 @@
 # Brainfuck Machine
 
-A fast brainfuck executor for Windows with memory-mapped hardware and a Win32 front end.
+A fast brainfuck executor for Windows whose hardware is memory-mapped: LEDs, a numeric
+display, a millisecond clock, a random source, a real serial port and a 128x64 framebuffer
+all live in tape cells just left of the start cell, so a program drives them with the
+same `+`, `-`, `<` and `>` it uses for everything else. Programs are JIT-compiled to x64,
+and a small C-like language, BFL, compiles to brainfuck for writing device drivers. There is
+a Win32 UI with a VT100 terminal, a memory viewer, a debugger and a profiler.
 C++20, MSVC, no dependencies.
 
 ```
 build.bat                      release build -> out\bf.exe, out\bfui.exe
 build.bat debug                unoptimised build with symbols
-python tests\test.py           correctness suite (JIT, interpreter, unoptimised, Python reference)
 
 out\bf.exe [options] prog.b    console runner   (bf --help for options)
 out\bf.exe prog.bfl            compile a BFL program to brainfuck and run it
 out\bfui.exe [prog.b|prog.bfl] Windows UI
+
+python tests\test.py           correctness suite (JIT, interpreter, unoptimised, Python reference)
 python tests\test_lang.py      BFL compiler suite (arithmetic grids, devices, golden files)
-python tests\fuzz.py          random BFL and brainfuck through every executor (--help for options)
+python tests\fuzz.py           random BFL and brainfuck through every executor
 ```
-
-The UI has a device panel (lamps, number display), a source editor, a VT100 terminal and a
-memory viewer. F5 compiles and runs whatever is in the editor; Shift+F5 stops; Ctrl+O opens,
-Ctrl+S saves, Ctrl+R reloads from disk, Ctrl+L clears the terminal. Dropping a `.b` file on
-the window loads and runs it. Drag the bar between editor and terminal to resize them.
-View > Memory viewer (Ctrl+M) hides the memory column to give the editor and terminal
-the full width, and View > Terminal width fixes the terminal at 80, 120 or 132 columns
-(`hanoi.b` needs about 120) instead of fitting the window.
-
-The UI remembers its settings in `%APPDATA%\bfmachine\settings.ini`: newline mode,
-terminal speed and width, interpreter choice, the check options, window placement,
-terminal height, which panes are shown and the last file. Started without a file, it
-reopens the last one without running it. (The environment variable `BFUI_SETTINGS`
-names a different settings file.)
-
-The terminal (`src/terminal.cpp`) is a real VT100/ANSI emulator: cursor addressing, erase
-display and line, scroll regions, insert and delete, SGR colours and attributes, cursor
-show/hide, and a scrollback for plain output. It starts 25 rows tall so classic 80x24
-programs such as `hanoi.b` draw correctly. Keys typed into it feed `,` and the keyboard
-registers; arrows and function keys arrive as VT sequences. Run > Terminal speed paces
-output like a serial line (115200 down to 2400 baud) so animations that finish in
-milliseconds at full speed become visible. Newline mode (on by default; Run menu or
-the "LF = new line" toolbar box) makes LF also return to column 1, as a Unix
-terminal driver does, so programs that end lines with LF alone print correctly.
-Turn it off for strict VT100 behaviour; programs can also set it with `ESC[20h` /
-`ESC[20l`.
-
-The memory viewer shows a hex dump of any tape region (type a hex address and press Enter,
-or use the Start / Dev / Ptr buttons), refreshes live while the program runs, marks
-device-window rows with `D` and brackets the pointer cell.
-
-### Debugger
-
-Ctrl+F5 (or the Debug button) starts the editor contents paused on the first command.
-F11 steps one command, F10 steps over a `[` loop (runs it to the matching `]`), Ctrl+F10
-runs to the command at the caret, F5 continues, F6 pauses a running program, Shift+F5 stops.
-F9 toggles a breakpoint on the command at the caret (or the next command on that line);
-breakpoints show as a red background and survive edits because they live in the text
-formatting. The current command is highlighted in the editor, the status bar shows why
-the program paused, its line and column and the current cell's value, and the memory
-viewer follows the pointer.
-
-The watch list under the memory viewer shows chosen cells live in hex, decimal and as a
-character (add one from the viewer's address box or at the pointer). For a BFL program it
-is filled with the global variables by name, each shown whole: 16 and 32-bit values in
-one row, signed types as negative numbers, pointers with the heap byte they point at,
-and array elements of any width. Ticking a row makes
-it a data breakpoint: the program pauses as soon as that cell is written, which works for
-device registers too. "Break on entering device window" pauses when the pointer first
-moves into the device cells.
-
-Debug sessions run on the interpreter with one IR instruction per source command, so
-they are much slower than a normal run; use them for logic, not for timing.
-The API behind this is `bf::Debugger` in `src/bf.h`.
-
-### Profiler
-
-Run > Profile (Ctrl+P) runs the editor contents on the interpreter and counts the IR
-instructions executed for each source line: for BFL, the innermost statement that starts
-on the line, the same attribution as `bf --profile` (`src/profile.h` is shared by both).
-When the program ends, or Shift+F5 stops one that runs forever, a gutter at the left of
-the editor colours each line by its share of all instructions (pale yellow to red) and
-prints the percentage, and the pane under the editor lists the lines that executed the
-most with their counts; double-click a row to go to the line. For a multi-file program the
-File box shows each file's share and an imported file picked there has the gutter too.
-For plain brainfuck the list gives each instruction's line and column. The next edit or
-run clears the profile.
-
-## BFL: a language that compiles to brainfuck
-
-Writing device drivers by counting `<` is tedious, so there is a small unsigned
-low-level language, BFL (`docs/LANG.md`, Help > BFL language). A `.bfl` file is
-compiled to brainfuck by `src/lang/` inside `bf.exe` and `bfui.exe`, then run like
-any other program. The compiler always knows where the pointer is: every variable
-has a fixed cell, procedures are inlined, and registers are addressed by name from
-`src/registers.h`, which also says how each one may be touched (latch, status,
-write-only).
-
-```
-proc wait_ms(byte ms) {
-    pulse TICK_LATCH;
-    byte start = TICKS0;
-    byte elapsed = 0;
-    while (elapsed < ms) { pulse TICK_LATCH; elapsed = TICKS0 - start; }
-}
-byte led = 1;
-while (led) { LEDS = led; wait_ms(60); led = led << 1; }
-halt;
-```
-
-Signed and unsigned 8, 16 and 32-bit integers, pointers into a heap of up to
-64 KB with `new` and `free`, structs, strings, arrays of any type,
-`if`/`while`/`for`/`break`, the usual operators, `out`/`print`/`in`/`input`,
-`pulse` for trigger registers, `asm { }` for raw brainfuck, `import` with a
-standard library in `lib/` (strings, math, io, memory), procedures with return
-values, and recursion:
-`rec proc` compiles a procedure as a trampoline with an explicit stack array
-(`docs/TRAMPOLINE.md`), so `programs/hanoi.bfl` and `programs/quicksort.bfl`
-are written the way they would be in C. `shared proc` uses the same machinery
-to keep one copy of a procedure that is called from many places instead of
-inlining it at each. `bf --emit prog.b prog.bfl` writes the generated
-code (with a `# L12: source` comment before each statement) and a statement map.
-In the UI, Ctrl+B shows the generated brainfuck, annotated or compacted to one
-continuous string of commands, and the debugger works on the source: F11 steps a statement (into calls), F10 steps over, F9 breakpoints by
-line, and the watch list is filled with the program's variables by name.
-The editor colours BFL keywords, types, numbers, strings, comments and register
-names. Compiler errors and warnings are listed in a pane under the editor;
-double-click one, or press F4, to go to it. When the debugger stops in an imported
-file, that file is shown read-only in the editor's place; the File box in the
-toolbar switches between the program and its imports, and F9 sets breakpoints in
-imported files too. Run > Check heap accesses and Run > Check recursion stack
-compile in the same checks as `bf --check-heap` and `--check-stack`.
-`programs/leds.bfl`, `serial_echo.bfl`, `fb.bfl` and `primes.bfl` are examples;
-`tests/golden/` holds their generated code, and `tests\test_lang.py` fails if it
-changes (run it with `--update-golden` after a deliberate codegen change).
-
-## Example programs
-
-`programs/` holds small demos for the devices (`leds`, `serial_echo`, `fb`) in
-brainfuck and in BFL. `programs/samples/` holds BFL programs that use the
-language's newer features: a linked list, a binary search tree, a calculator
-with a recursive-descent parser, N queens, merge sort, string handling, the
-integer types, a two-file maze solver, an animated Game of Life, a revolving cube, a
-starfield and a raytracer; its README says what each one shows.
-`programs/thirdparty/` holds programs by other authors: Erik Bosman's
-`mandelbrot.b`, and 32 programs by Daniel B. Cristofani from brainfuck.org (CC BY-SA
-4.0) including a self-interpreter, a universal Turing machine, Life, tic-tac-toe,
-quines, sorts and streaming digits of e. Its README lists what each one does and what
-input to give it, and the test suite runs the terminating ones through every executor.
-
-![raytracer.bfl: 16 frames of one camera orbit](docs/raytracer.gif)
-
-`programs/samples/raytracer.bfl` on the framebuffer: four reflective spheres, two
-coloured lamps with soft shadows and a checkerboard floor, in fixed-point BFL. A 128x64
-frame takes about 55 ms with the JIT (2.3 s before the loop idioms; see Speed).
-`python tools/rt_gif.py docs/raytracer.gif` renders these 16 frames headless and writes
-the GIF (it needs Pillow).
-
-## Speed
-
-Source is compiled to an optimised IR and then to x64 machine code at run time.
-`mandelbrot.b` (Erik Bosman) runs in about 0.4 s with the JIT and 3.2 s on the IR
-interpreter on this machine. A naive interpreter takes well over a minute.
-
-Optimisations: run folding, offset fusion (one pointer update per block), clear loops,
-multiply loops with any odd step, conditional once-only loops (also with if-blocks inside),
-scan loops, dead-loop removal, known cell values carried across blocks (each block is
-rebuilt from its net effect, so a copy through a known-zero scratch cell is one
-multiply-add), and loop idioms.
-
-**Loop idioms.** BFL's multi-byte arithmetic is built from byte loops that run a cell's
-value times: a carry or borrow chain adding a byte into a number one unit at a time, the
-saturating subtract behind every compare, halving with a remainder bit, byte division.
-The optimiser executes each candidate loop body symbolically (one pass as a function of
-the cells' entry values, as a set of paths with linear expressions), compares that
-function with each idiom's one-pass rule on a set of points that covers every case, and
-on a match puts an `IDIOM` instruction at the top of the body that runs the whole loop at
-once. Scratch cells the loop always leaves holding a constant are checked on entry; if
-one holds something else the body runs as written. `bf --dump` shows them. On
-`programs/samples/raytracer.bfl` this made a frame 16 times faster (2.3 s to 85 ms).
-
-**Fixed point.** BFL's `mulshr(a, b, k)` is `(a * b) >> k` with the exact
-double-width product, computed by one shift-and-add loop that keeps only the bytes
-surviving the shift (docs/LANG.md). A Q12 `long` product of two variables runs 1 100
-IR instructions instead of 1 900 and is a third smaller (a constant factor is still
-faster with `*` and `>>`); with it the raytracer's frame went from 71 to
-65 ms and its code from 5.67 M to 5.12 M commands, and `raytracer_text.bfl` from 32.4 to
-29.6 ms.
-
-**Division.** A word or long `/` or `%` is one bit-by-bit loop of 16 or 32 passes
-(shift, subtract, add back on a borrow), too large for the symbolic matching. The
-compiler emits it from a generator in the executor (`bf::division_loop`), and the
-optimiser recognises a loop whose commands are exactly that text and runs all its
-passes in one step, with its scratch cells checked on entry as for the other idioms. A
-32-bit `/` runs about 200 IR instructions instead of 7 150 and is half the code; even as
-written it runs in linear time (850 000 commands for the benchmark's operands instead of
-27 million, and at most about 3 million), since a byte's zero test there does not copy the
-byte. The raytracer's frame went from 65 to 58 ms (its light map from 158 to 89 ms) and
-its code to 4.80 M commands, and `raytracer_text.bfl` from 29.5 to 25 ms.
-
-**Shared arithmetic.** A 32-bit `*` or `mulshr` is about 11 000 commands of straight-line
-code, and most of the raytracer's size was hundreds of them inlined. When the terms of a
-sum, or a run of assignments without calls, use the same multiply, `mulshr`, `/` or `%`
-(same width and signedness) at least twice, the compiler emits the routine once inside a
-small loop that runs once per operation; a flag per operation picks the code that takes
-the result and loads the next operation's factors (docs/LANG.md, "Idioms used by the
-compiler"). There is no dispatcher and no frame, and the values the compiler knows survive
-the loop. Three `long` products in a sum are 15 000 commands instead of 34 500, for 1%
-more executed instructions. The raytracer's code went from 4.80 M to 4.06 M commands
-(`place_camera` from 1.15 M to 0.88 M) and `raytracer_text.bfl`'s from 4.31 M to 3.59 M;
-they execute 1.5% more IR instructions, yet with a third less machine code (3.1 MB of x64
-instead of 4.6 MB) their frames are faster, 55 ms instead of 58 and 23.7 instead of 25.4.
 
 ## Memory map
 
-Cells are 8-bit. The tape is `mmio_size` device cells followed by `ram_size` RAM cells.
-The pointer starts at the first RAM cell, so hardware lives just to the left of it.
-`<n` is how many `<` reach the register from the start cell. Defaults: 256 device cells, 1 MiB RAM.
-
-The table below is generated from `src/registers.h` by `bf --regs`, and the test suite
-fails if it differs, so it is always current. The same table appears in the UI's help
-(F1, or Help > Memory map).
+Cells are 8-bit. The tape is 256 device cells followed by 1 MiB of RAM. The pointer starts
+at the first RAM cell, so `<n` is how many `<` reach a register. This table is generated
+from `src/registers.h` by `bf --regs` (the test suite fails if it differs) and is also in
+the UI's help (F1).
 
 | Cell | From start | Register | Access | Meaning |
 |------|-----------|----------|--------|---------|
@@ -245,32 +56,78 @@ fails if it differs, so it is always current. The same table appears in the UI's
 | 0xE8 | <24 | FB_FILL | w | fill the whole screen with the written value |
 | 0xE7 | <25 | FB_READ | w | load FB_COLOR with the pixel under the cursor |
 
-The serial device (`src/hw.h`) talks to a real COM port chosen from the UI's Devices menu
-or with `bf --serial COM3`; `loopback` wires TX to RX for testing without hardware.
-Sends and pops are triggers separate from the data latch, so the usual `+` loops never
-transmit by accident. The framebuffer is a 128x64 byte-per-pixel display shown in its own
-window (Ctrl+F, or automatically on the first plot). `programs/serial_echo.b` and
-`programs/fb.b` demonstrate both.
+Readable registers are latches that read back what was last written, so the usual copy
+idiom `[>+<-]` works on them. Triggers (sends, pops, plots) are separate cells from their
+data latches, so `+` loops never fire one by accident. The serial device talks to a real
+COM port (Devices menu, or `bf --serial COM3`; `loopback` for testing). The framebuffer
+opens in its own window on the first plot (Ctrl+F).
 
-Readable registers are latches: they read back what was last written, which is what makes
-the normal brainfuck copy idiom `[>+<-]` work on a register. Optimised code never executes
-against device registers: every compiled program keeps a literal one-instruction-per-command
-copy (only runs of `<` and `>` are merged into one move, since moving touches no cell, so
-a loop that copies a value into a register unit by unit does not walk the pointer cell by
-cell on every turn), and whenever a block of optimised code could reach the device window the executor
-runs the literal copy from the same source position until the pointer is back in RAM at a
-point where the optimised code can resume. So a trigger written inside a loop fires once
-per iteration exactly as the source says, in the JIT, the interpreter and the debugger.
-The one shortcut: a loop the optimiser would turn into multiply-adds runs in one step in
-the literal copy too when every cell it touches is RAM or a *plain* register, one that
-`Device::plain()` says behaves like memory (it reads back exactly what was written, with
-no side effects), such as the framebuffer's colour latch. Then `FB_COLOR = c` costs a few
-bus accesses instead of one per unit of the old and new values.
+Optimised code never touches a register. Every program keeps a literal
+one-instruction-per-command copy, and whenever a block could reach the device window the
+executor runs that copy until the pointer is back in RAM. A trigger written inside a loop
+therefore fires once per iteration exactly as the source says, in the JIT, the interpreter
+and the debugger. `programs/leds.b`, `serial_echo.b` and `fb.b` are small demos.
+Adding a device is a `bf::Device` subclass and one `Machine::map()` call.
 
-`programs/leds.b` is a chaser that drives LEDS, paces itself with TICK_LATCH / TICKS1 and
-finishes through HALT. Comments in `.b` files must avoid the eight command characters.
+## BFL
 
-## How the executor works
+Counting `<` to reach a register is tedious, so BFL (`docs/LANG.md`, Help > BFL language)
+compiles to brainfuck with every variable in a fixed cell and registers addressed by name:
+
+```
+proc wait_ms(byte ms) {
+    pulse TICK_LATCH;
+    byte start = TICKS0;
+    byte elapsed = 0;
+    while (elapsed < ms) { pulse TICK_LATCH; elapsed = TICKS0 - start; }
+}
+byte led = 1;
+while (led) { LEDS = led; wait_ms(60); led = led << 1; }
+halt;
+```
+
+It has signed and unsigned 8, 16 and 32-bit integers, pointers into a 64 KB heap with
+`new` and `free`, structs, strings, arrays, the usual control flow and operators,
+`asm { }` for raw brainfuck, `import` with a standard library in `lib/`, and recursion
+(`rec proc` compiles to a trampoline with an explicit stack, `docs/TRAMPOLINE.md`).
+`bf --emit` writes the generated code with a source comment before each statement.
+`programs/samples/` has a linked list, a tree, a calculator, N queens, merge sort, a maze
+solver, Life, a revolving cube, a starfield and a raytracer; `programs/thirdparty/` has
+classic programs by Erik Bosman and Daniel B. Cristofani.
+
+![raytracer.bfl: 16 frames of one camera orbit](docs/raytracer.gif)
+
+`programs/samples/raytracer.bfl`: four reflective spheres, two lamps with soft shadows and
+a checkerboard floor, in fixed-point BFL on the framebuffer. A 128x64 frame takes about
+55 ms with the JIT.
+
+## UI
+
+Device panel, source editor, VT100 terminal, memory viewer and watch list. F5 compiles and
+runs the editor, Shift+F5 stops, Ctrl+B shows the generated brainfuck. The terminal is a
+real VT100/ANSI emulator (cursor addressing, scroll regions, colours), and Run > Terminal
+speed paces output like a serial line so fast animations are visible.
+
+**Debugger.** Ctrl+F5 starts paused; F11 steps, F10 steps over a loop or call, F9 sets a
+breakpoint, Ctrl+F10 runs to the caret. The watch list shows cells or BFL variables by
+name, whole and typed, and ticking one makes it a data breakpoint. For BFL the debugger
+works on the source, including imported files.
+
+**Profiler.** Run > Profile (Ctrl+P) counts IR instructions per source line and colours
+the editor gutter by share; `bf --profile` does the same on the console.
+
+Settings persist in `%APPDATA%\bfmachine\settings.ini`.
+
+## Speed
+
+Source is compiled to an optimised IR and then to x64 at run time. `mandelbrot.b` runs in
+about 0.4 s with the JIT and 3.2 s on the interpreter; a naive interpreter takes over a
+minute. Besides the usual run folding, offset fusion, clear, multiply and scan loops, the
+optimiser executes candidate loop bodies symbolically and recognises BFL's multi-byte
+arithmetic idioms (carry chains, saturating subtract, halving, division), running the whole
+loop in one step; this made a raytracer frame 16 times faster. `bf --dump` shows the IR.
+
+## How it works
 
 ```
 src/bf.h        public API: compile(), Machine, Device, ConsoleIo
@@ -278,39 +135,20 @@ src/ir.cpp      parser and optimiser
 src/jit.cpp     x64 code generator
 src/interp.cpp  IR interpreter: reference executor and the JIT's slow path
 src/machine.cpp tape, device bus, run loop, stop and fault handling
-src/devices.h   the standard devices above
-src/registers.h the register table: memory map, access, kind (single source of truth)
-src/profile.h   profile counts per BFL line or brainfuck offset (bf --profile, Run > Profile)
-src/lang/       the BFL compiler: parse.cpp (lexer, parser), sema.cpp (types and checks),
-                codegen.cpp (brainfuck emitter)
-lib/            the BFL standard library, embedded into the executables at build time
-tools/          embed.cpp (the build step that embeds lib/), heap_proto.py (docs/HEAP.md)
+src/devices.h   the standard devices
+src/registers.h the register table (single source of truth)
+src/lang/       the BFL compiler
+lib/            the BFL standard library, embedded at build time
 src/cli.cpp     bf.exe
 src/ui.cpp      bfui.exe
 ```
 
-**JIT register use.** `r12` holds the tape pointer, `r13` the start of RAM, `rbx` the run
-context. Every straight-line block computes its lowest reachable address once and compares
-it against `r13`. Blocks that only touch cells at or above the pointer need no check at all.
-`[` and `]` are a single `cmp byte [r12], 0` plus a branch.
-
-**Device access.** If a block could reach below RAM, the generated code hands the IR index
-to the interpreter, which executes with full bus semantics (every cell access is bounds
-checked and routed to devices) until it reaches a labelled instruction with the pointer back
-in RAM, then returns the native address to resume at. The pointer may wander through the
-device window freely; the fast code never sees it.
-
-**Stop with zero overhead.** There is no poll in the generated loops. `request_stop()` sets
-a flag and revokes page access on RAM. The next tape access faults, a vectored exception
-handler recognises the run context, and it redirects the thread to the JIT exit stub using
-the stack pointer saved in the prologue. The same handler reports a pointer that leaves the
-tape (the tape sits between two 1 GiB reserved guard regions, and ends where its last page
-does) as status "fault", with the cell it touched, as the interpreter does.
-
-**Adding a device.** Derive from `bf::Device`, override `read(rel)` / `write(rel, v)` where
-`rel` is the offset within the mapped range (and `plain(rel)` for registers that behave
-like memory), and call `Machine::map(addr, size, &dev)`. Device
-code runs on the executor thread; use the thread-safe patterns in `devices.h` for UI work.
+The JIT keeps the tape pointer in `r12` and the start of RAM in `r13`; each block checks
+its lowest reachable address once and hands off to the interpreter if it could reach the
+device window. There is no stop poll in generated code: `request_stop()` revokes page
+access on RAM, the next access faults, and a vectored exception handler unwinds to the exit
+stub. The tape sits between two 1 GiB guard regions, so a pointer that leaves it is
+reported as a fault with the cell it touched.
 
 ## Licence
 

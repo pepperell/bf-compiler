@@ -141,15 +141,15 @@ struct LV {
     const Var* arr = nullptr;               // Elem: the array variable
     const Expr* index = nullptr;            // Elem: runtime index (null: cidx)
     int64_t cidx = -1;                      // Elem: constant index
+    int64_t icell = -1;                     // Elem: or the runtime index already computed into this cell (pin)
     int boff = 0;                           // Elem: byte offset within the element
     const Expr* ptr = nullptr;              // Heap: pointer-valued expression (null: none)
     int64_t ptr_cell = -1;                  // Heap: or the cells of a pointer variable
     int64_t base = 0;                       // Heap: constant address part (includes constant offsets)
-    const Expr* hidx = nullptr;             // Heap: runtime index, scaled by esize
-    int esize = 1;
+    std::vector<std::pair<const Expr*, int>> hidx;   // Heap: runtime indices, each scaled by its element size
     const bf::RegisterInfo* reg = nullptr;  // Reg
     int size() const { return std::max(type->size, 1); }
-    bool const_addr() const { return kind == Heap && !ptr && ptr_cell < 0 && !hidx; }
+    bool const_addr() const { return kind == Heap && !ptr && ptr_cell < 0 && hidx.empty(); }
 };
 
 struct Gen {
@@ -1527,8 +1527,9 @@ struct Gen {
             if (base.kind == Expr::Name) {
                 Var* v = find_var(base.text);
                 if (v && v->arr_ptr) {
-                    lv.kind = LV::Heap; lv.ptr_cell = v->cell; lv.esize = std::max(t.type->size, 1);
-                    if (auto i = fold(*t.b)) lv.base = *i * lv.esize; else lv.hidx = t.b.get();
+                    lv.kind = LV::Heap; lv.ptr_cell = v->cell;
+                    int es = std::max(t.type->size, 1);
+                    if (auto i = fold(*t.b)) lv.base = *i * es; else lv.hidx.emplace_back(t.b.get(), es);
                     return lv;
                 }
                 if (v && v->cell_array()) {
@@ -1541,9 +1542,10 @@ struct Gen {
                 }
             }
             if (base.type && base.type->is_ptr()) {
-                lv.kind = LV::Heap; lv.esize = std::max(t.type->size, 1);
+                lv.kind = LV::Heap;
+                int es = std::max(t.type->size, 1);
                 if (auto p = fold(base)) lv.base = *p; else lv.ptr = &base;
-                if (auto i = fold(*t.b)) lv.base += *i * lv.esize; else lv.hidx = t.b.get();
+                if (auto i = fold(*t.b)) lv.base += *i * es; else lv.hidx.emplace_back(t.b.get(), es);
                 return lv;
             }
             // an array field of a struct: the element sits at a constant or (in the heap) runtime offset
@@ -1552,7 +1554,7 @@ struct Gen {
             auto i = fold(*t.b);
             if (b.kind == LV::Heap) {
                 if (i) b.base += *i * es;
-                else { if (b.hidx) fail(t.pos, "use a pointer for this second runtime index"); b.hidx = t.b.get(); b.esize = es; }
+                else b.hidx.emplace_back(t.b.get(), es);
             } else {
                 if (!i) fail(t.b->pos, "an array field of a struct held in cells needs a constant index");
                 if (b.kind == LV::Cells) b.cell += *i * es; else if (b.kind == LV::Elem) b.boff += (int)(*i * es);
@@ -1602,14 +1604,29 @@ struct Gen {
     void eval_address(const LV& lv, int64_t dst) {
         if (lv.ptr_cell >= 0) copyN(lv.ptr_cell, dst, 2);
         else if (lv.ptr) eval_into(*lv.ptr, dst, T->u16());
-        if (lv.hidx) {
+        for (auto& [idx, es] : lv.hidx) {
             int64_t t = tmp2();
-            eval_into(*lv.hidx, t, T->u16());
-            if (lv.esize == 1) addN(dst, t, 2);
-            else { int64_t m = tmp2(); mul_constN(t, lv.esize, m, 2); addN(dst, m, 2); release2(m); }
+            eval_into(*idx, t, T->u16());
+            if (es == 1) addN(dst, t, 2);
+            else { int64_t m = tmp2(); mul_constN(t, es, m, 2); addN(dst, m, 2); release2(m); }
             release2(t);
         }
         if (lv.base) addN_const(dst, 2, lv.base);
+    }
+    // Compute the runtime part of a location (an index into a cell array, a heap address) once, into
+    // temporaries, so that it stays the same place while code in between changes what it reads.  Returns
+    // the cells to clear once the location is no longer used, and how many.
+    std::pair<int64_t, int> pin(LV& lv) {
+        if (lv.kind == LV::Elem && lv.index) {
+            lv.icell = tmp(); eval8(*lv.index, lv.icell); lv.index = nullptr;
+            return {lv.icell, 1};
+        }
+        if (lv.kind == LV::Heap && !lv.const_addr()) {
+            int64_t a = tmp2(); eval_address(lv, a);
+            lv.ptr = nullptr; lv.ptr_cell = a; lv.hidx.clear(); lv.base = 0;
+            return {a, 2};
+        }
+        return {-1, 0};
     }
     // dst (n cells, known zero) = the value at lv
     void read_lv(const LV& lv, int64_t dst) {
@@ -1622,9 +1639,9 @@ struct Gen {
             return;
         case LV::Elem: {
             const Var& v = *lv.arr;
-            if (!lv.index) { for (int k = 0; k < n; k++) copy(elem_cell(lv, k), dst + k); return; }
+            if (!lv.index && lv.icell < 0) { for (int k = 0; k < n; k++) copy(elem_cell(lv, k), dst + k); return; }
             int64_t i = tmp();
-            eval8(*lv.index, i);
+            if (lv.icell >= 0) copy(lv.icell, i); else eval8(*lv.index, i);
             elem_read(v.cell, v.size(), lv.boff, n, i, dst);
             drop(i);
             return;
@@ -1653,9 +1670,9 @@ struct Gen {
         case LV::Reg: clear(lv.cell); move(val, {{lv.cell, 1}}); return;
         case LV::Elem: {
             const Var& v = *lv.arr;
-            if (!lv.index) { for (int k = 0; k < n; k++) { int64_t c = elem_cell(lv, k); clear(c); move(val + k, {{c, 1}}); } return; }
+            if (!lv.index && lv.icell < 0) { for (int k = 0; k < n; k++) { int64_t c = elem_cell(lv, k); clear(c); move(val + k, {{c, 1}}); } return; }
             int64_t i = tmp();
-            eval8(*lv.index, i);
+            if (lv.icell >= 0) copy(lv.icell, i); else eval8(*lv.index, i);
             elem_write(v.cell, v.size(), lv.boff, n, i, val);
             drop(i);
             return;
@@ -1963,6 +1980,22 @@ struct Gen {
         releaseN(w, m);
     }
 
+    // A field or element of a struct returned by a call, reached through fields and constant indices
+    // (mk().x, mk().p.d[2]): the call, with the part's byte offset in off; null when e is not one.
+    const Expr* returned_part(const Expr& e, int64_t& off) {
+        off = 0;
+        const Expr* x = &e;
+        for (;; x = x->a.get()) {
+            if (x->kind == Expr::Field && !x->arrow) off += x->a->type->st->field(x->text)->offset;
+            else if (x->kind == Expr::Index && x->a->type && x->a->type->kind == TK::Array && x->a->kind != Expr::Name) {
+                auto i = fold(*x->b);
+                if (!i) return nullptr;
+                off += *i * std::max(x->type->size, 1);
+            } else break;
+        }
+        return x != &e && x->kind == Expr::Call ? x : nullptr;
+    }
+
     // dst (size(e.type) cells, known zero) = e
     void eval_same(const Expr& e, int64_t dst) {
         int n = sz(e);
@@ -1981,20 +2014,21 @@ struct Gen {
             if (n == 1) { eval8(e, dst); return; }      // a register
             fail(e.pos, "'" + e.text + "' is not declared");
         }
-        case Expr::Field:
-            if (!e.arrow && e.a->kind == Expr::Call) {          // a field of a returned struct
-                int bn = sz(*e.a);
+        case Expr::Field: case Expr::Index: {
+            int64_t off;
+            if (const Expr* c = returned_part(e, off)) {         // a part of a returned struct
+                int bn = sz(*c);
                 int64_t t = tmpN(bn);
-                eval_same(*e.a, t);
-                const Field* f = e.a->type->st->field(e.text);
-                for (int k = 0; k < n; k++) move(t + f->offset + k, {{dst + k, 1}});
+                eval_same(*c, t);
+                for (int k = 0; k < n; k++) move(t + off + k, {{dst + k, 1}});
                 clearN(t, bn);
                 releaseN(t, bn);
                 return;
             }
             read_lv(lvalue(e), dst);
             return;
-        case Expr::Index: case Expr::Deref:
+        }
+        case Expr::Deref:
             read_lv(lvalue(e), dst);
             return;
         case Expr::AddrOf:
@@ -2445,7 +2479,8 @@ struct Gen {
                     continue;
                 }
             }
-            if (a.kind == Expr::Index || a.kind == Expr::Field || a.kind == Expr::Deref) {
+            int64_t off;
+            if ((a.kind == Expr::Index || a.kind == Expr::Field || a.kind == Expr::Deref) && !returned_part(a, off)) {
                 LV lv = lvalue(a);
                 if (lv.kind == LV::Elem && !lv.index) { go(elem_cell(lv, 0)); out += '.'; continue; }
                 if (lv.kind == LV::Cells) { go(lv.cell); out += '.'; continue; }
@@ -2620,6 +2655,7 @@ struct Gen {
         int64_t mark = next_free;
         std::vector<Var> bound;
         std::vector<std::pair<LV, int64_t>> writeback;     // ref arguments that live outside cells
+        std::vector<std::pair<int64_t, int>> pins;          // their runtime indices and addresses
         for (size_t i = 0; i < args.size(); i++) {
             const Param& prm = proc.params[i];
             const Expr& a = *args[i];
@@ -2641,7 +2677,8 @@ struct Gen {
                 LV lv = lvalue(a);
                 if (lv.kind == LV::Cells) { v.cell = lv.cell; v.owned = false; bound.push_back(v); continue; }
                 if (lv.kind == LV::Reg) fail(a.pos, "a register cannot be passed by 'ref'");
-                // copy in, and back out after the call
+                // copy in, and back out after the call to the same place: its index or address is computed once
+                pins.push_back(pin(lv));
                 int n = lv.size();
                 v.cell = alloc(n);
                 read_lv(lv, v.cell);
@@ -2672,6 +2709,7 @@ struct Gen {
             drop(t, n);
             clearN(wb.second, n);
         }
+        for (auto& pc : pins) if (pc.second) clearN(pc.first, pc.second);
         next_free = mark;        // value parameters were cleared when the body's scope closed
     }
 
@@ -2811,11 +2849,35 @@ struct Gen {
         return c;
     }
 
+    // A ref argument is copied back after the call to the place it was read from: the indices and
+    // pointers that place depends on are computed before the call, into hidden variables of the caller.
+    void pin_arg(Expr& e, LowCtx& L, const Stmt& from) {
+        auto keep = [&](ExprP& x) {
+            if (fold(*x)) return;
+            const Type* t = x->type;
+            Pos pos = x->pos;
+            std::string h = hidden(L.p, t);
+            synth_plain(L, mk_assign(from, h, std::move(x), t), from);
+            x = std::make_unique<Expr>(); x->kind = Expr::Name; x->pos = pos; x->text = h; x->type = t;
+        };
+        switch (e.kind) {
+        case Expr::Index:
+            if (e.a->type && e.a->type->is_ptr()) keep(e.a); else pin_arg(*e.a, L, from);
+            keep(e.b);
+            return;
+        case Expr::Field: if (e.arrow) keep(e.a); else pin_arg(*e.a, L, from); return;
+        case Expr::Deref: keep(e.a); return;
+        default: return;
+        }
+    }
+
     // A call to a trampolined procedure: ends the current block, resumes in a new one.
     void emit_call(LowCtx& L, TProc* callee, std::vector<ExprP> args, Pos pos, const Stmt& from, const std::string& result) {
         const Stmt& decl = *callee->decl;
         if (args.size() != decl.params.size()) fail(pos, "'" + callee->name + "' takes " + std::to_string(decl.params.size()) + " argument(s), " + std::to_string(args.size()) + " given");
         std::vector<std::pair<const Expr*, int>> copy_out;
+        for (size_t i = 0; i < args.size(); i++)
+            if (decl.params[i].ref && !decl.params[i].array) pin_arg(*args[i], L, from);
         for (size_t i = 0; i < args.size(); i++) {
             if (!decl.params[i].ref || decl.params[i].array) continue;
             ExprP keep = clone(*args[i]);
