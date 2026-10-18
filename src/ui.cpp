@@ -7,7 +7,7 @@
 //   +----------------------------------------------+  (hex dump of    |
 //   | source editor (RichEdit; breakpoints in red; |   any tape       |
 //   |  imported files in a read-only viewer)       |   region) and    |
-//   | error list (BFL)                             |   watch list     |
+//   | error list (BFL), or the profile list        |   watch list     |
 //   +----------------------------------------------+   (Ctrl+M hides) |
 //   | VT100 terminal (keys typed here feed ',')    |                  |
 //   +----------------------------------------------+------------------+
@@ -22,6 +22,7 @@
 #include "hw.h"
 #include "help.h"
 #include "lang/lang.h"
+#include "profile.h"
 #include "registers.h"
 #include "terminal.h"
 #define WIN32_LEAN_AND_MEAN
@@ -38,6 +39,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -63,7 +65,7 @@ enum : int {
     ID_VIEW_FB, ID_LANG, ID_VIEW_GEN, ID_EXPORT_BF, ID_GENEDIT, ID_GEN_ANNOTATED, ID_GEN_COMPACT, ID_GEN_COPY, ID_GEN_INFO,
     ID_NEWLINE, ID_TB_NEWLINE, ID_NEXT_DIAG,
     ID_VIEW_MEM, ID_TERM_FIT, ID_TERM_80, ID_TERM_120, ID_TERM_132, ID_CHECK_HEAP, ID_CHECK_STACK,
-    ID_VIEW_ERRORS, ID_ERRLIST, ID_FILESEL, ID_VIEWER,
+    ID_VIEW_ERRORS, ID_ERRLIST, ID_FILESEL, ID_VIEWER, ID_PROFILE, ID_PROFLIST,
     ID_SER_NONE, ID_SER_LOOP, ID_SER_COM_BASE = 400,  // ID_SER_COM_BASE + n = COMn
     ID_HELP_BASE = 700                                             // ID_HELP_BASE + (int)help::Topic
 };
@@ -163,6 +165,16 @@ struct App {
     struct WatchInfo { std::vector<int64_t> cells; bool is_signed = false; bool is_ptr = false; };
     std::map<int64_t, WatchInfo> watch_info;
     std::wstring settings_file;
+    // Run > Profile: counts per IR instruction of the profiled run, then per line
+    std::vector<uint64_t> prof_counts;
+    bool prof_shown = false;                      // the heat gutter and the profile list are showing
+    std::map<std::pair<int, int>, uint64_t> prof_lines;   // (file, line) -> instructions; file 0 for brainfuck
+    std::vector<uint64_t> prof_files;             // instructions per file
+    uint64_t prof_total = 0, prof_max = 0;        // all instructions; the hottest line's
+    struct ProfItem { int file, line; int32_t pos; };      // a list row; pos is the brainfuck offset, else -1
+    std::vector<ProfItem> prof_items;
+    HWND proflist = nullptr;                      // profile list pane (in the error list's place)
+    int  heat_w = 0;                              // gutter width while a profile is shown
 } app;
 
 int px(int v) { return MulDiv(v, (int)app.dpi, 96); }
@@ -258,6 +270,7 @@ void set_mode(Mode m) {
         if (btn >= 0) EnableWindow(app.tb_buttons[btn], on);
     };
     en(ID_RUN, TB_RUN, idle || paused);
+    en(ID_PROFILE, -1, idle);
     en(ID_DEBUG, TB_DEBUG, idle);
     en(ID_STEP, TB_STEP, paused);
     en(ID_STEP_OVER, TB_OVER, paused);
@@ -647,6 +660,24 @@ void show_file(int f) {
     ShowWindow(app.editor, f == 0 ? SW_SHOW : SW_HIDE);
     if (app.filesel) SendMessageW(app.filesel, CB_SETCURSEL, f, 0);
 }
+// A file selector entry; with a profile of a multi-file program shown, the file's share of the instructions.
+std::wstring filesel_label(size_t i) {
+    std::wstring s = L"File: " + short_name(app.lr.files[i]) + (i == 0 ? L"  (editor)" : L"");
+    if (app.prof_shown && app.prof_total && app.lr.files.size() > 1 && i < app.prof_files.size()) {
+        wchar_t b[32]; swprintf(b, 32, L"   %.1f%%", 100.0 * (double)app.prof_files[i] / (double)app.prof_total);
+        s += b;
+    }
+    return s;
+}
+void relabel_filesel() {
+    if (!app.lang || app.lr.files.empty() || SendMessageW(app.filesel, CB_GETCOUNT, 0, 0) != (LRESULT)app.lr.files.size()) return;
+    LRESULT sel = SendMessageW(app.filesel, CB_GETCURSEL, 0, 0);
+    for (size_t i = 0; i < app.lr.files.size(); i++) {
+        SendMessageW(app.filesel, CB_DELETESTRING, i, 0);
+        SendMessageW(app.filesel, CB_INSERTSTRING, i, (LPARAM)filesel_label(i).c_str());
+    }
+    SendMessageW(app.filesel, CB_SETCURSEL, sel, 0);
+}
 // Refill the file selector after a compile.
 void fill_filesel() {
     view_loaded = -1;
@@ -658,10 +689,7 @@ void fill_filesel() {
         show_file(0);
         return;
     }
-    for (size_t i = 0; i < app.lr.files.size(); i++) {
-        std::wstring s = L"File: " + short_name(app.lr.files[i]) + (i == 0 ? L"  (editor)" : L"");
-        SendMessageW(app.filesel, CB_ADDSTRING, 0, (LPARAM)s.c_str());
-    }
+    for (size_t i = 0; i < app.lr.files.size(); i++) SendMessageW(app.filesel, CB_ADDSTRING, 0, (LPARAM)filesel_label(i).c_str());
     EnableWindow(app.filesel, app.lr.files.size() > 1);
     show_file(app.view_file < (int)app.lr.files.size() ? app.view_file : 0);
 }
@@ -796,9 +824,11 @@ void show_diag(int i) {
 }
 
 void layout();
+void clear_profile();
 // BFL on or off: colouring, file selector and error list follow.
 void lang_changed() {
     if (!app.editor || !app.errlist) return;
+    clear_profile();
     colour_source(app.editor, app.lang);
     fill_filesel();
     fill_errlist();
@@ -932,20 +962,186 @@ void export_bf() {
     set_status(std::wstring(L"Exported ") + file);
 }
 
+// ---- profiler (Run > Profile) -------------------------------------------------------------------
+// The program runs on the interpreter with Machine::profile set, and the counts go
+// to lines exactly as bf --profile attributes them (profile.h).  Each line's share
+// shows in a heat gutter at the left of the editor and the imported-file viewer,
+// and the top lines are listed in the pane under the editor (in the error list's
+// place).  The next edit or run clears it.
+std::wstring result_text(const RunResult& r);
+// Heat scale by a line's count relative to the hottest line: pale yellow, orange, red.
+COLORREF heat_colour(double t) {
+    t = std::sqrt(std::clamp(t, 0.0, 1.0));           // spreads out the cooler lines
+    static const int stop[3][3] = {{255, 244, 196}, {255, 170, 60}, {215, 40, 30}};
+    int k = t < 0.5 ? 0 : 1;
+    double u = t < 0.5 ? t * 2 : t * 2 - 1;
+    auto mix = [&](int c) { return (int)(stop[k][c] + (stop[k + 1][c] - stop[k][c]) * u + 0.5); };
+    return RGB(mix(0), mix(1), mix(2));
+}
+// Paint the gutter of the editor or the viewer: each visible line with a count gets
+// its heat colour and its share of all instructions.  Runs after the control's own
+// WM_PAINT, which leaves the left margin blank.
+void paint_heat(HWND ed) {
+    int f = ed == app.editor ? 0 : view_loaded;
+    if (!app.prof_shown || f < 0 || !app.prof_total) return;
+    RECT cr; GetClientRect(ed, &cr);
+    HDC dc = GetDC(ed);
+    RECT g{0, 0, app.heat_w - px(4), cr.bottom};
+    HBRUSH gb = CreateSolidBrush(RGB(232, 232, 228));
+    FillRect(dc, &g, gb);
+    DeleteObject(gb);
+    HFONT old = (HFONT)SelectObject(dc, app.mono);
+    TEXTMETRICW tm; GetTextMetricsW(dc, &tm);
+    SelectObject(dc, app.ui_font);
+    SetBkMode(dc, TRANSPARENT);
+    int line = (int)SendMessageW(ed, EM_GETFIRSTVISIBLELINE, 0, 0);
+    LRESULT ci = SendMessageW(ed, EM_LINEINDEX, line, 0);
+    POINTL p{};
+    if (ci >= 0) SendMessageW(ed, EM_POSFROMCHAR, (WPARAM)&p, ci);
+    while (ci >= 0 && p.y < cr.bottom) {
+        LRESULT next = SendMessageW(ed, EM_LINEINDEX, line + 1, 0);
+        POINTL q{p.x, p.y + tm.tmHeight};
+        if (next >= 0) SendMessageW(ed, EM_POSFROMCHAR, (WPARAM)&q, next);
+        auto it = app.prof_lines.find({f, line + 1});
+        if (it != app.prof_lines.end() && it->second && q.y > p.y) {
+            double t = (double)it->second / (double)app.prof_max;
+            RECT r{0, p.y, g.right, q.y};
+            HBRUSH hb = CreateSolidBrush(heat_colour(t));
+            FillRect(dc, &r, hb);
+            DeleteObject(hb);
+            double share = 100.0 * (double)it->second / (double)app.prof_total;
+            wchar_t b[16];
+            if (share >= 0.1) swprintf(b, 16, L"%.1f%%", share); else wcscpy(b, L"<0.1%");
+            SetTextColor(dc, std::sqrt(t) > 0.75 ? RGB(255, 255, 255) : RGB(40, 30, 20));
+            r.right -= px(4);
+            DrawTextW(dc, b, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+        line++; ci = next; p = q;
+    }
+    SelectObject(dc, old);
+    ReleaseDC(ed, dc);
+}
+LRESULT CALLBACK heat_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (m == WM_NCDESTROY) RemoveWindowSubclass(h, heat_proc, 2);
+    LRESULT r = DefSubclassProc(h, m, w, l);
+    if (m == WM_PAINT && app.prof_shown) paint_heat(h);
+    return r;
+}
+void set_heat_margin(int w) {
+    app.suppress_change++;
+    for (HWND ed : {app.editor, app.viewer}) {
+        SendMessageW(ed, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(w, 0));
+        InvalidateRect(ed, nullptr, TRUE);
+    }
+    app.suppress_change--;
+}
+
+// After a profiled run: per-line counts, the gutter, the list and the file shares.
+void show_profile() {
+    app.prof_total = profile_total(app.prof_counts);
+    std::vector<ProfileRow> rows = profile_rows(app.prog, app.prof_counts, app.lang ? &app.lr : nullptr);
+    std::wstring text = app.lang ? std::wstring() : editor_text();
+    std::vector<int32_t> starts{0};                    // brainfuck: where each editor line starts
+    for (int32_t i = 0; i < (int32_t)text.size(); i++) if (text[(size_t)i] == L'\r') starts.push_back(i + 1);
+    app.prof_lines.clear();
+    app.prof_items.clear();
+    app.prof_files.assign(app.lang ? std::max<size_t>(1, app.lr.files.size()) : 1, 0);
+    for (const ProfileRow& r : rows) {
+        App::ProfItem it{r.file, r.line, -1};
+        if (!app.lang && r.line >= 0) { it.pos = r.line; it.file = 0; it.line = (int)(std::upper_bound(starts.begin(), starts.end(), it.pos) - starts.begin()); }
+        if (it.file >= 0) {
+            app.prof_lines[{it.file, it.line}] += r.count;
+            if ((size_t)it.file < app.prof_files.size()) app.prof_files[(size_t)it.file] += r.count;
+        }
+        app.prof_items.push_back(it);
+    }
+    app.prof_max = 1;
+    for (auto& kv : app.prof_lines) app.prof_max = std::max(app.prof_max, kv.second);
+
+    SendMessageW(app.proflist, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(app.proflist, LVM_DELETEALLITEMS, 0, 0);
+    for (size_t i = 0; i < app.prof_items.size() && i < 500; i++) {
+        const App::ProfItem& it = app.prof_items[i];
+        wchar_t n[32], share[16];
+        swprintf(n, 32, L"%llu", (unsigned long long)rows[i].count);
+        swprintf(share, 16, L"%.1f%%", app.prof_total ? 100.0 * (double)rows[i].count / (double)app.prof_total : 0.0);
+        std::wstring file, line, what;
+        if (it.pos >= 0) {                              // brainfuck: line:column, and the text from there on
+            int32_t a = it.pos, b = line_end(text, a);
+            line = std::to_wstring(it.line) + L":" + std::to_wstring(it.pos - starts[(size_t)it.line - 1] + 1);
+            what = text.substr((size_t)a, (size_t)std::min(b - a, 80));
+        } else if (it.file < 0) what = L"(outside statements)";
+        else {
+            if ((size_t)it.file < app.lr.files.size()) file = short_name(app.lr.files[(size_t)it.file]);
+            line = std::to_wstring(it.line);
+            what = widen(profile_line_text(app.lr, it.file, it.line, 120));
+        }
+        LVITEMW lv{}; lv.mask = LVIF_TEXT | LVIF_PARAM; lv.iItem = (int)i; lv.pszText = n; lv.lParam = (LPARAM)i;
+        int row = (int)SendMessageW(app.proflist, LVM_INSERTITEMW, 0, (LPARAM)&lv);
+        lv.mask = LVIF_TEXT; lv.iItem = row;
+        const wchar_t* sub[4] = {share, file.c_str(), line.c_str(), what.c_str()};
+        for (int c = 0; c < 4; c++) { lv.iSubItem = c + 1; lv.pszText = (LPWSTR)sub[c]; SendMessageW(app.proflist, LVM_SETITEMW, 0, (LPARAM)&lv); }
+    }
+    SendMessageW(app.proflist, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(app.proflist, nullptr, TRUE);
+
+    app.prof_shown = true;
+    HDC dc = GetDC(app.editor);
+    HFONT old = (HFONT)SelectObject(dc, app.ui_font);
+    SIZE sz{}; GetTextExtentPoint32W(dc, L"100.0%", 6, &sz);
+    SelectObject(dc, old);
+    ReleaseDC(app.editor, dc);
+    app.heat_w = sz.cx + px(14);
+    set_heat_margin(app.heat_w);
+    relabel_filesel();
+    layout();
+    std::wstring s = result_text(app.last);
+    wchar_t buf[200];
+    swprintf(buf, 200, L"   |   Profile: %llu IR instructions (", (unsigned long long)app.prof_total);
+    s += buf + widen(profile_by_kind(app.prog, app.prof_counts)) + L"). Double-click a row to go to its line.";
+    set_status(s);
+}
+void clear_profile() {
+    if (!app.prof_shown) return;
+    app.prof_shown = false;
+    app.prof_lines.clear();
+    app.prof_items.clear();
+    app.prof_files.clear();
+    set_heat_margin(0);
+    SendMessageW(app.proflist, LVM_DELETEALLITEMS, 0, 0);
+    relabel_filesel();
+    layout();
+}
+// Double-click on a profile row: show its file and select the line (brainfuck: the command).
+void goto_profile(int i) {
+    if (i < 0 || i >= (int)app.prof_items.size()) return;
+    const App::ProfItem& it = app.prof_items[(size_t)i];
+    if (it.file < 0) { set_status(L"That row is code outside any statement."); return; }
+    show_file(it.file);
+    HWND ed = file_edit(app.view_file);
+    std::wstring text = rich_text(ed);
+    int32_t a = it.pos >= 0 ? it.pos : first_nonblank(text, it.line);
+    edit_select(ed, a, it.pos >= 0 ? a + 1 : line_end(text, a), true);
+    SetFocus(ed);
+}
+
 // ---- running (JIT) ------------------------------------------------------------------
-void start_run() {
+// profile: run on the interpreter counting instructions; show_profile() follows.
+void start_run(bool profile = false) {
     if (app.mode != Mode::Idle) return;
     if (app.worker.joinable()) app.worker.join();
+    clear_profile();
     if (!compile_editor(true)) return;
     term::clear(app.console);
     app.dev.reset();
     app.fb.clear();
     app.machine->reset();
     app.have_last = false;
+    if (profile) app.machine->profile = &app.prof_counts;
     set_mode(Mode::Running);
-    set_status(app.use_interp ? L"Running (interpreter)..." : L"Running (JIT)...");
+    set_status(profile ? L"Profiling (interpreter)..." : app.use_interp ? L"Running (interpreter)..." : L"Running (JIT)...");
     notify_device();
-    bool jit = !app.use_interp;
+    bool jit = !app.use_interp && !profile;
     app.worker = std::thread([jit] {
         app.last = app.machine->run(app.prog, jit);
         PostMessageW(app.wnd, WM_APP_DONE, 0, 0);
@@ -962,10 +1158,13 @@ std::wstring result_text(const RunResult& r) {
 
 void finish_run() {
     if (app.worker.joinable()) app.worker.join();
+    bool profiled = app.machine->profile != nullptr;
+    app.machine->profile = nullptr;
     app.have_last = true;
     set_mode(Mode::Idle);
     append_output(app.con.take());
     set_status(result_text(app.last));
+    if (profiled) show_profile();
     notify_device();
     refresh_memory();
 }
@@ -1012,6 +1211,7 @@ void show_paused() {
 void start_debug() {
     if (app.mode != Mode::Idle) return;
     if (app.worker.joinable()) app.worker.join();
+    clear_profile();
     std::wstring text = editor_text();
     if (!compile_editor(false)) return;
     sync_bps_from_editor(text);
@@ -1297,7 +1497,7 @@ void paint_panel(HDC dc, const RECT& rc) {
     RECT l2{box.left, rc.bottom - px(18), box.right, rc.bottom - 2};
     DrawTextW(dc, L"NUMBER 0xF6..F7 (<9,<10)", -1, &l2, DT_LEFT | DT_SINGLELINE);
     RECT right{box.right + px(24), rc.top, rc.right - 8, rc.bottom};
-    const wchar_t* text = L"IDLE\r\nF5 run   Ctrl+F5 debug   F9 breakpoint   Ctrl+O open   Ctrl+S save   Ctrl+G go to address";
+    const wchar_t* text = L"IDLE\r\nF5 run   Ctrl+F5 debug   Ctrl+P profile   F9 breakpoint   Ctrl+O open   Ctrl+S save   Ctrl+G go to address";
     switch (app.mode) {
     case Mode::Running:      text = L"RUNNING\r\nKeys typed in the terminal feed KEY_DATA and ','"; break;
     case Mode::DebugPaused:  text = L"PAUSED\r\nF11 step   F10 step over   Ctrl+F10 to cursor   F5 continue   F9 breakpoint   Shift+F5 stop"; break;
@@ -1334,9 +1534,11 @@ void layout() {
     body_top += tbh + px(10);
     body_h -= tbh + px(10);
 
-    bool errs = app.show_errors && app.lang;
-    int err_h = errs ? px(100) : 0, err_gap = errs ? px(3) : 0;
+    bool prof = app.prof_shown;                        // the profile list takes the error list's place
+    bool errs = !prof && app.show_errors && app.lang;
+    int err_h = prof ? px(150) : errs ? px(100) : 0, err_gap = prof || errs ? px(3) : 0;
     ShowWindow(app.errlist, errs ? SW_SHOWNA : SW_HIDE);
+    ShowWindow(app.proflist, prof ? SW_SHOWNA : SW_HIDE);
     int min_edit = px(60);
     app.console_h = std::clamp(app.console_h, px(40), std::max(px(40), body_h - gap - min_edit - err_h - err_gap));
     int edit_h = body_h - gap - app.console_h - err_h - err_gap;
@@ -1345,6 +1547,10 @@ void layout() {
     if (errs) {
         MoveWindow(app.errlist, 0, body_top + edit_h + err_gap, left_w, err_h, TRUE);
         SendMessageW(app.errlist, LVM_SETCOLUMNWIDTH, 3, LVSCW_AUTOSIZE_USEHEADER);   // the message column fills the rest
+    }
+    if (prof) {
+        MoveWindow(app.proflist, 0, body_top + edit_h + err_gap, left_w, err_h, TRUE);
+        SendMessageW(app.proflist, LVM_SETCOLUMNWIDTH, 4, LVSCW_AUTOSIZE_USEHEADER);
     }
     int split_top = body_top + edit_h + err_gap + err_h;
     app.splitter = RECT{0, split_top, left_w, split_top + gap};
@@ -1516,6 +1722,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file, MF_STRING, ID_EXIT, L"E&xit");
         AppendMenuW(run, MF_STRING, ID_RUN, L"&Run editor contents\tF5");
+        AppendMenuW(run, MF_STRING, ID_PROFILE, L"&Profile (interpreter, instructions by line)\tCtrl+P");
         AppendMenuW(run, MF_STRING | MF_GRAYED, ID_STOP, L"&Stop\tShift+F5");
         AppendMenuW(run, MF_STRING, ID_CLEAR, L"&Clear terminal\tCtrl+L");
         AppendMenuW(run, MF_SEPARATOR, 0, nullptr);
@@ -1611,6 +1818,20 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 SendMessageW(app.errlist, LVM_INSERTCOLUMNW, i, (LPARAM)&c);
             }
         }
+        app.proflist = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+                                       0, 0, 10, 10, h, (HMENU)(INT_PTR)ID_PROFLIST, nullptr, nullptr);
+        SendMessageW(app.proflist, WM_SETFONT, (WPARAM)app.ui_font, TRUE);
+        SendMessageW(app.proflist, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT);
+        {
+            const wchar_t* cols_[5] = {L"Instructions", L"Share", L"File", L"Line", L"Statement (double-click to go there)"};
+            const int widths[5] = {110, 60, 150, 60, 900};
+            for (int i = 0; i < 5; i++) {
+                LVCOLUMNW c{}; c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT; c.fmt = i < 2 ? LVCFMT_RIGHT : LVCFMT_LEFT; c.pszText = (LPWSTR)cols_[i]; c.cx = px(widths[i]);
+                SendMessageW(app.proflist, LVM_INSERTCOLUMNW, i, (LPARAM)&c);
+            }
+        }
+        SetWindowSubclass(app.editor, heat_proc, 2, 0);
+        SetWindowSubclass(app.viewer, heat_proc, 2, 0);
         term::Config tc;
         tc.font = app.mono;
         tc.on_key = [](uint8_t k) { if (app.running) app.dev.keys.push(k); };
@@ -1714,6 +1935,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int id = LOWORD(w), code = HIWORD(w);
         if (id == ID_EDITOR && code == EN_CHANGE) {
             if (!app.suppress_change && !app.modified) { app.modified = true; update_title(); }
+            if (!app.suppress_change) clear_profile();                      // the counts belong to the old text
             if (!app.suppress_change && app.lang) SetTimer(h, TIMER_COLOUR, 400, nullptr);   // recolour after a pause in typing
             return 0;
         }
@@ -1746,6 +1968,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_SAVEAS: save_file(true); break;
         case ID_EXIT:   SendMessageW(h, WM_CLOSE, 0, 0); break;
         case ID_RUN:    if (app.mode == Mode::DebugPaused) debug_cont(); else start_run(); break;
+        case ID_PROFILE: start_run(true); break;
         case ID_DEBUG:  start_debug(); break;
         case ID_STEP:   debug_step(); break;
         case ID_STEP_OVER: debug_step_over(); break;
@@ -1809,6 +2032,11 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             LVITEMW it{}; it.mask = LVIF_PARAM; it.iItem = ia->iItem;
             if (ia->iItem >= 0 && SendMessageW(app.errlist, LVM_GETITEMW, 0, (LPARAM)&it) && it.lParam >= 0) show_diag((int)it.lParam);
         }
+        if (nm->idFrom == ID_PROFLIST && nm->code == LVN_ITEMACTIVATE) {
+            auto* ia = (NMITEMACTIVATE*)l;
+            LVITEMW it{}; it.mask = LVIF_PARAM; it.iItem = ia->iItem;
+            if (ia->iItem >= 0 && SendMessageW(app.proflist, LVM_GETITEMW, 0, (LPARAM)&it)) goto_profile((int)it.lParam);
+        }
         return 0;
     }
     case WM_APP_OUTPUT: append_output(app.con.take()); return 0;
@@ -1858,7 +2086,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
 
     ACCEL acc[] = {
         {FVIRTKEY | FCONTROL, 'F', ID_VIEW_FB}, {FVIRTKEY | FCONTROL, 'B', ID_VIEW_GEN}, {FVIRTKEY, VK_F4, ID_NEXT_DIAG}, {FVIRTKEY | FSHIFT, VK_F4, ID_NEXT_DIAG + 1000}, {FVIRTKEY, VK_F1, ID_HELP_BASE + (int)help::START},
-        {FVIRTKEY, VK_F5, ID_RUN}, {FVIRTKEY | FSHIFT, VK_F5, ID_STOP}, {FVIRTKEY | FCONTROL, VK_F5, ID_DEBUG},
+        {FVIRTKEY, VK_F5, ID_RUN}, {FVIRTKEY | FSHIFT, VK_F5, ID_STOP}, {FVIRTKEY | FCONTROL, 'P', ID_PROFILE}, {FVIRTKEY | FCONTROL, VK_F5, ID_DEBUG},
         {FVIRTKEY, VK_F11, ID_STEP}, {FVIRTKEY, VK_F10, ID_STEP_OVER}, {FVIRTKEY | FCONTROL, VK_F10, ID_RUN_TO_CURSOR},
         {FVIRTKEY, VK_F6, ID_PAUSE}, {FVIRTKEY, VK_F9, ID_TOGGLE_BP},
         {FVIRTKEY | FCONTROL, 'O', ID_OPEN}, {FVIRTKEY | FCONTROL, 'S', ID_SAVE}, {FVIRTKEY | FCONTROL, 'R', ID_RELOAD},
@@ -1894,7 +2122,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
-        if (!TranslateAcceleratorW(h, app.accel, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+        // While a program runs, Ctrl+P typed in the terminal is the program's key (0x10), not Profile.
+        bool to_term = app.running && msg.hwnd == app.console && msg.message == WM_KEYDOWN && msg.wParam == 'P' && GetKeyState(VK_CONTROL) < 0;
+        if (to_term || !TranslateAcceleratorW(h, app.accel, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
     if (app.worker.joinable()) app.worker.join();
     app.dbg.reset();

@@ -33,6 +33,9 @@ KEYS
   F5          run the editor contents (or continue when paused in the debugger)
   Shift+F5    stop
   Ctrl+F5     start debugging, paused on the first command
+  Ctrl+P      profile: run on the interpreter, then show where the
+              instructions went (see "Debugger"); typed in the terminal
+              while a program runs, Ctrl+P goes to the program
   F11         step one command            F10   step over a [ ] loop
   Ctrl+F10    run to the caret            F6    pause a running debug session
   F9          toggle a breakpoint on the command at the caret
@@ -232,7 +235,22 @@ IMPORTED FILES (BFL)
   caret line.  The editor comes back when the session ends.
 
 Debug sessions use the interpreter with one instruction per source command,
-so they are far slower than a normal run.  Use them for logic, not timing.)";
+so they are far slower than a normal run.  Use them for logic, not timing.
+
+PROFILER
+  Run > Profile (Ctrl+P) runs the editor contents on the interpreter and
+  counts the IR instructions each source line executes, the same counts as
+  bf --profile.  When the program ends (or Shift+F5 stops it) a gutter at the
+  left of the editor shows each line's share of all instructions on a heat
+  scale from pale yellow to red, and the pane under the editor lists the
+  lines that executed the most, with their counts; double-click a row to go
+  to its line.  For a BFL program a line is the innermost statement starting
+  there; the row (outside statements) is code such as the dispatcher of
+  rec procedures.
+  For brainfuck the list gives line:column of each instruction.
+  With imports, the File box shows each file's share, and an imported file
+  picked there has the gutter too.  The next edit or run clears the profile.
+  The interpreter is slower than the JIT, so the times are not comparable.)";
 
 const wchar_t* TERMINAL_TEXT = LR"(TERMINAL
 
@@ -273,7 +291,8 @@ const wchar_t* CLI_TEXT = LR"(COMMAND LINE: bf.exe
   --regs           print the memory map as a Markdown table and exit
   --time           print run time and status to stderr
   --profile        run in the interpreter, then list where the executed
-                   instructions went (by BFL statement for a .bfl file)
+                   instructions went (by BFL statement for a .bfl file);
+                   Run > Profile in this window shows the same counts
   --eof MODE       ',' at end of input: nochange (default), 0, 255
   --ram N          RAM cells (default 1048576)
   --mmio N         device window cells (default 256, 0 disables devices)

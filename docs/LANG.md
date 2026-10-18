@@ -474,7 +474,7 @@ loop"). Measured in IR instructions executed, a 32-bit `+` is about 40, `<` abou
 one copy of their code
 ("Shared arithmetic" below): three `long` products in a sum are about 15 000
 commands instead of 34 500.
-`bf --profile` shows where a program's instructions go, by statement. The compiler also tracks cells whose value it knows in straight-line
+`bf --profile` (Run > Profile in the UI) shows where a program's instructions go, by statement. The compiler also tracks cells whose value it knows in straight-line
 code: constants, string output and copies of known variables are emitted as the
 shortest delta, and expressions over known variables fold entirely.
 
