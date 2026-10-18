@@ -363,13 +363,17 @@ product starting from a value that corrects for the signs, so the bytes kept are
 already the rounded-down result. A constant factor, either operand, runs the same
 loop with its sign known at compile time; a power of two whose shift is a whole
 number of bytes is just that shift (`mulshr(a, 4096, 12)` is `a`). A Q12 product of
-two `long`s runs about 70 IR instructions and compiles to about 6 300 commands,
+two `long`s runs about 70 IR instructions and compiles to about 4 900 commands,
 against 230 and 12 800 for `(a * b) >> 12` (`tools/bench.py`), since `>>` by bits is
 unrolled bit by bit; `mulshr(a, 218, 8)` on `long`s is about 55 against 65, in 2 900
-commands against 5 300. The values of the operands and their order do not change
-the cost. Only where `>>` moves whole bytes can `*` then `>>` come out a little
-ahead: on two signed variables (`mulshr` tests both signs, while the wrapped `*`
-needs neither; on `int`s with `k = 8`, about 50 IR instructions against 42), for a
+commands against 5 300. From `k` of the width up, the bits shifted out past the whole
+bytes cost one division of each byte. The order of the operands does not change the
+cost, and nor do their values except for signs: each negative factor of a signed type
+adds its correction, up to about 30 IR instructions for two `long`s (`mulshr(a, b, 12)`:
+about 47 with both positive, 79 with both negative). Only where `>>` moves whole
+bytes can `*` then `>>` come out a little ahead: on two signed variables (`mulshr`
+tests both signs, while the wrapped `*` needs neither; on `int`s with `k = 8`, about
+50 IR instructions against 42), for a
 factor of 2, and in size for a constant factor below 8, which `*` unrolls into a
 few copies. So `mulshr` pays wherever `a * b` could overflow, and almost everywhere
 else as well.

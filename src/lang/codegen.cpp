@@ -853,7 +853,8 @@ struct Gen {
     // n bytes above the ceil(k/8) dropped: no shift after the loop.  A signed product is the product of the
     // bit patterns less 2^8n * (b when a < 0, plus a when b < 0), so P starts at minus those (mod 256^(w-n))
     // and the floor of the two's complement value is its bytes as they stand.  From k = 8n on it is the high
-    // half shifted right by k - 8n.  A constant factor (either operand) goes into B, its sign known; a power
+    // half shifted right by k - 8n: the bytes above the whole bytes shifted out, then one division of each by
+    // 2^(the bits left) and a sign fill.  A constant factor (either operand) goes into B, its sign known; a power
     // of two whose shift is by whole bytes is that shift.
     void mulshr(const Expr& ea, const Expr& eb, int k, const Type* t, int64_t dst) {
         const Expr* var = &ea;
@@ -871,15 +872,14 @@ struct Gen {
         k = std::min(k, 16 * n);                      // floor(a * b / 2^16n) is already 0 or -1
         uint64_t cu = cst ? (uint64_t)*cst & ((1ull << (8 * n)) - 1) : 0;
         bool cneg = cst && sgn && (cu >> (8 * n - 1)) & 1;
-        if (cst && (!cu || k == 0 || (!cneg && !(cu & (cu - 1))))) {
+        if (cst && (!cu || (!cneg && !(cu & (cu - 1))))) {
             int j = 0;
             while (cu && !((cu >> j) & 1)) j++;
             int s = k - j;                            // a * 2^j / 2^k: a shifted right by s, or left by -s
-            if (!cu || k == 0 || s % 8 == 0) {
+            if (!cu || s % 8 == 0) {
                 int64_t a = tmpN(n);
                 load(a, -1);
                 if (!cu) clearN(a, n);
-                else if (k == 0) mul_constN(a, (int64_t)cu, dst, n);
                 else {
                     if (s) shift_bytes(a, n, std::min(std::abs(s) / 8, n), s < 0, sgn);
                     moveN(a, dst, n);
@@ -888,43 +888,61 @@ struct Gen {
                 return;
             }
         }
+        if (k == 0 && n == 1) {                        // a byte's a * b, as * does it: b added a times
+            int64_t a = tmp(), b = cst ? -1 : tmp();
+            load(a, b);
+            open(a); add(a, -1);
+            if (cst) add(dst, (int64_t)cu); else copy(b, dst);
+            close();
+            if (!cst) release(b);
+            release(a);
+            return;
+        }
         bool upper = k >= 8 * n;
         int q = upper ? n : k / 8, r = upper ? 0 : k % 8;
         int Q = q + (r ? 1 : 0), w = n + Q;           // the bytes dropped and the bytes of P (at most 2n)
+        // from k = 8n on: the high half shifted right by s = k - 8n, the bytes above 8m taken (keep of them)
+        int s = upper ? k - 8 * n : 0, m = s / 8, rb = s % 8, keep = n - m;
+        int top = !upper ? Q : !sgn && !keep ? w : w - std::max(keep, 1);   // P's bytes from top on go to dst
         int64_t a = tmpN(n), b = tmpN(n);
         load(a, cst ? -1 : b);
         if (cst) setN(b, n, (int64_t)cu);
         multiply_block(a, b, n, w, [&](int64_t c, const bf::MultiplyLayout& L) {
             for (int i = 0; i < w; i++) {
-                if (i >= Q) move(c + L.p(i), {{dst + i - Q, 1}});
+                if (i >= top) move(c + L.p(i), {{dst + i - top, 1}});
                 else clear(c + L.p(i));
             }
         }, 8 * n + (r ? 8 - r : 0), [&](int64_t c, const bf::MultiplyLayout& L) {
             if (!sgn || !Q) return;
             auto P = [&](int i) { return c + L.p(i); };
+            // The three cells after each byte of P are the loop's scratch cells, zero here: the carries and
+            // copies below go through them rather than through temporaries past the block, a long way off.
+            auto copy_via = [&](int64_t from, int64_t to, int sign, int64_t t) {   // to += sign*from; t zero
+                move(from, {{to, sign}, {t, 1}});
+                move(t, {{from, 1}});
+            };
+            auto zero_flag = [&](int i) {              // P(i) + 1 = (P(i) == 0), through P(i) + 2
+                int64_t z = P(i) + 1, t = P(i) + 2;
+                move(P(i), {{t, 1}});
+                add(z, 1);
+                open(t); move(t, {{P(i), 1}}); add(z, -1); close();
+                return z;
+            };
             std::function<void(int)> dec = [&](int from) {      // P -= 256^from (mod 256^Q)
-                if (from + 1 < Q) {
-                    int64_t z = tmp(); iszero8(P(from), z);
-                    if_nonzero(z, [&] { dec(from + 1); });
-                    release(z);
-                }
+                if (from + 1 < Q) if_nonzero(zero_flag(from), [&] { dec(from + 1); });
                 add(P(from), -1);
             };
             std::function<void(int)> inc = [&](int from) {      // P += 256^from (mod 256^Q)
                 add(P(from), 1);
-                if (from + 1 < Q) {
-                    int64_t z = tmp(); iszero8(P(from), z);
-                    if_nonzero(z, [&] { inc(from + 1); });
-                    release(z);
-                }
+                if (from + 1 < Q) if_nonzero(zero_flag(from), [&] { inc(from + 1); });
             };
             auto sub_low = [&](const std::function<int64_t(int)>& x) {   // P -= the low Q bytes of x (preserved)
-                if (Q == 1) { copy(x(0), P(0), -1); return; }
-                int64_t y = tmpN(Q);
-                for (int i = 0; i < Q; i++) copy(x(i), y + i);
-                for (int i = 0; i < Q - 1; i++) { open(y + i); add(y + i, -1); dec(i); close(); }
-                move(y + Q - 1, {{P(Q - 1), -1}});
-                releaseN(y, Q);
+                for (int i = 0; i < Q; i++) {
+                    if (i == Q - 1) { copy_via(x(i), P(i), -1, P(i) + 1); break; }
+                    int64_t y = P(i) + 3;
+                    copy_via(x(i), y, 1, P(i) + 1);
+                    open(y); add(y, -1); dec(i); close();
+                }
             };
             auto A = [&](int i) { return c + L.a(i); };
             auto B = [&](int i) { return c + L.b(i); };
@@ -939,9 +957,9 @@ struct Gen {
                         int64_t bt = (int64_t)((v >> (8 * i)) & 255);
                         if (!bt) continue;
                         if (!cneg || i == Q - 1) { add(P(i), bt); continue; }
-                        int64_t u = tmp(); set(u, bt);
+                        int64_t u = P(i) + 3;
+                        add(u, bt);
                         open(u); add(u, -1); inc(i); close();
-                        release(u);
                     }
                 });
             } else {
@@ -954,10 +972,37 @@ struct Gen {
         });
         releaseN(b, n);
         releaseN(a, n);
-        if (upper && k > 8 * n) {                       // the high half >> (k - 8n)
-            int s = k - 8 * n;
-            if (s / 8) shift_bytes(dst, n, std::min(s / 8, n), false, sgn);
-            for (int i = 0; i < s % 8; i++) shrN(dst, n, sgn);
+        if (!s) return;
+        // dst holds the keep bytes of the high half above 8m (its top byte when keep is 0): shift those right
+        // by rb and fill the bytes above with the sign
+        int64_t sg = -1;
+        if (!keep && sgn) {                            // the top byte only gives the sign
+            int64_t u = tmp(); set(u, 127);
+            lt8_loop(u, dst);                          // dst - 127, or 0
+            release(u);
+            sg = tmp(); move(dst, {{sg, 1}});
+        } else if (sgn) sg = sign_test(dst + keep - 1);
+        if (rb) shr_bits(dst, keep, rb);
+        if (sg >= 0) {
+            if_nonzero(sg, [&] {
+                for (int i = keep; i < n; i++) add(dst + i, 255);
+                if (rb) add(dst + keep - 1, 256 - (256 >> rb));
+            });
+            release(sg);
+        }
+    }
+    // w >>= r (0 < r < 8, unsigned): one division of each byte by 2^r, the remainders moved into the byte
+    // below; one bit is a pass of shrN, which is fewer instructions
+    void shr_bits(int64_t w, int n, int r) {
+        if (r == 1) { shrN(w, n, false); return; }
+        for (int i = 0; i < n; i++) {
+            int64_t d = tmp(), qq = tmp(), rr = tmp();
+            set(d, int64_t(1) << r);
+            divmod8(w + i, d, qq, rr);
+            move(qq, {{w + i, 1}});
+            if (i) move(rr, {{w + i - 1, 1 << (8 - r)}});
+            else clear(rr);
+            release(rr); release(qq); release(d);
         }
     }
     // q += a / b, r += a % b (unsigned; b == 0 gives q = 0, r = a).  a consumed, b cleared; q and r start at zero.
