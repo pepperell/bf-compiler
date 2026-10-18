@@ -346,16 +346,24 @@ int  x1 = mulshr(x, cosine, 10) + mulshr(z, sine, 10);   // the product needs 32
 - So whenever `a * b` does not overflow, `mulshr(a, b, k)` equals `(a * b) >> k`;
   when it does, `mulshr` still gives the right answer. Two constants fold exactly.
 
-Cost: a shift-and-add loop that runs once per bit of `|b|`, so put the operand with
-the smaller magnitude second. Each step adds `|a|`, shifted, into an accumulator that
-keeps only the bytes that survive the shift (and one below them for the bits): after
+Cost: a shift-and-add loop that runs once per bit of `|b|`. Unlike `*`, which
+compares its operands and loops over the smaller, `mulshr` takes them as written, so
+put the operand with the smaller magnitude second. Each step adds `|a|`, shifted,
+into an accumulator that keeps only the bytes that survive the shift (and one below
+them for the bits): after
 each byte of `b` whose bits are all below the shift, the accumulator's low byte is
 final and is dropped; the last `k % 8` bits are one pass of byte divisions. A Q12
 product of two `long`s runs about 1 100 IR instructions and compiles to about 12 000
 commands, against 1 900 and 18 000 for `(a * b) >> 12` (`tools/bench.py`); for `int`
 it is 490 and 4 900 against 690 and 10 000, since `>>` on an `int` is unrolled bit by
-bit. A constant factor runs the same loop, so it gains less: `(a * 45) >> 12` is
-already cheap to run, though `mulshr` is still the smaller code.
+bit. Each further bit of `|b|` adds about 100 IR instructions: with `b` near 2^31
+and `a` around 5 000, `mulshr(a, b, 12)` runs about 2 900 against 1 800 for
+`(a * b) >> 12`, and 1 100 with the operands the other way round. A constant factor
+runs the same loop, which is slower than the unrolled constant multiply of `*`:
+`mulshr(a, 218, 8)` on `long`s runs about 690 IR instructions against 560 for
+`(a * 218) >> 8`, though it is the smaller code (about 8 000 commands against
+12 000). So `mulshr` pays for two variables in the right order, and wherever `a * b`
+could overflow; a constant factor whose product fits is faster with `*` and `>>`.
 
 ## Registers
 

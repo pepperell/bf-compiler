@@ -156,8 +156,9 @@ one holds something else the body runs as written. `bf --dump` shows them. On
 
 **Fixed point.** BFL's `mulshr(a, b, k)` is `(a * b) >> k` with the exact
 double-width product, computed by one shift-and-add loop that keeps only the bytes
-surviving the shift (docs/LANG.md). A Q12 `long` product runs 1 100 IR instructions
-instead of 1 900 and is a third smaller; with it the raytracer's frame went from 75 to
+surviving the shift (docs/LANG.md). A Q12 `long` product of two variables runs 1 100
+IR instructions instead of 1 900 and is a third smaller (a constant factor is still
+faster with `*` and `>>`); with it the raytracer's frame went from 75 to
 66 ms and its code from 5.67 M to 5.12 M commands, and `raytracer_text.bfl` from 36.5 to
 30 ms.
 

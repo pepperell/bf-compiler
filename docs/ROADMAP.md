@@ -298,7 +298,12 @@ has a case in `tests/test_lang.py`:
   corrupted a result (`for-break-skips-step`).
 
 The final run of 5000 BFL and 3000 brainfuck programs (seed 100000) found
-nothing.
+nothing. A later run hung on one program (seed 17897) in every executor: its
+nested recursion needed more than the default 128 cells of stack, and an
+overflow is not checked at run time, so the program wrote over other cells. The
+fuzzer now runs a program with `rec` procedures once with `--check-stack` and,
+when it overflows, gives it `stack 4096;` (which also exercises the 16-bit stack
+pointer), or skips it if even that overflows (`fuzz-stack` in `tests/test.py`).
 
 ### Phase 10: fused multiply-and-shift
 
@@ -342,8 +347,11 @@ Measured with `tools/bench.py` against the commit before:
 | `starfield.bfl` | 1.25 / 1.81 M | 1.19 / 1.80 M |
 
 The raytracers use it for every single product and for the dot products (a sum of
-`mulshr` terms rounds each term down, so 1 to 2% of the pixels change by a dither
-step and a lamp moves by a pixel in two of 16 frames; the pictures look the same).
+`mulshr` terms rounds each term down: rendered headless against the commit before,
+0.8 to 2.2% of a frame's pixels change, 1.5% over 16 frames; two thirds of those by
+one level of a colour channel (a dither step), the rest by up to 7 levels, mostly in
+the spheres' reflections, where a ray now meets a slightly different point; a lamp
+moves by a pixel in three of the 16 frames (4, 8, 12). The pictures look the same).
 `cube.bfl` rotates in `int`s, because the exact product no longer needs `long`s, with
 shifts instead of `/ 1024`: a corner sometimes lands one cell over, since the shift
 rounds down where the division truncated. `starfield.bfl` has no fixed-point products
