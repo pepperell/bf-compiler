@@ -247,11 +247,33 @@ def bf_fuzz():
     return 0 if ok else 1
 
 
+def fuzz_stack():
+    """tests/fuzz.py gives a program whose recursion overflows the default stack a
+    bigger one (an overflow is unchecked, and such a program once spun forever)."""
+    import tempfile
+    sys.path.insert(0, os.path.dirname(__file__))
+    sys.dont_write_bytecode = True
+    import fuzz as F
+    n = F.Var("p0n")
+    body = [F.If(F.Bin("!=", n, F.Lit(0)), [F.CallS("p0", [F.Cast("byte", F.Bin("-", n, F.Lit(1))), F.Var("p0a")])], [])]
+    prog = F.Program([], [F.Proc("p0", None, [("byte", False, "p0n"), ("long", False, "p0a")], body, True)],
+                     [F.CallS("p0", [F.Lit(50), F.Lit(7)])], [F.Out([F.Lit(75)])])
+    d = tempfile.mkdtemp()
+    fitted = F.fit_stack(BF, d, prog, b"")
+    fails = F.check_bfl(BF, d, prog.text(), b"", F.model_run(prog, b""), F.MODES[:2], determinism=False, layout=False)
+    ok = fitted and prog.stack == F.STACK_BIG and not fails
+    print(("PASS " if ok else "FAIL ") + "fuzz-stack")
+    for f in fails[:3]:
+        print("   " + str(f))
+    return 0 if ok else 1
+
+
 def main():
     fails = 0
     idiom_fails, idiom_n = idiom_cases()
     fails += idiom_fails
     fails += bf_fuzz()
+    fails += fuzz_stack()
     ok, why = readme_matches_regs()
     print(("PASS " if ok else "FAIL ") + "readme-register-table")
     if not ok:
@@ -282,7 +304,7 @@ def main():
             print("   expected:", expected)
             for k, v in results.items():
                 print(f"   {k}: rc={v[0]} out={v[1]!r} err={v[2]!r}")
-    total = len(CASES) + 2 + len(THIRDPARTY) + idiom_n
+    total = len(CASES) + 3 + len(THIRDPARTY) + idiom_n
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

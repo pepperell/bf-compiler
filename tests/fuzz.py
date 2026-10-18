@@ -11,7 +11,9 @@ Two generators:
        without the automatic layout of globals, and run by every executor.  Its
        brainfuck is also run with one cell poked before the start, compared with
        the unoptimised run, so that scratch cells hold unexpected values and the
-       loop idioms' guards must send loops through their bodies.
+       loop idioms' guards must send loops through their bodies.  A program
+       whose recursion overflows the default stack (unchecked at run time) is
+       found with --check-stack and given a bigger one.
   bf   random brainfuck aimed at the loop shapes the optimiser rewrites,
        checked against a plain interpreter in Python.
 
@@ -790,9 +792,11 @@ class Program(Node):
 
     def __init__(self, decls, procs, main, dump):
         self.decls, self.procs, self.main, self.dump = decls, procs, main, dump
+        self.stack = None                # `stack N;` when the default recursion stack is too small (fit_stack)
 
     def text(self):
-        return "\n".join(lines(self.decls, "") + lines(self.procs, "") + lines(self.main, "") + lines(self.dump, "")) + "\n"
+        head = [f"stack {self.stack};"] if self.stack else []
+        return "\n".join(head + lines(self.decls, "") + lines(self.procs, "") + lines(self.main, "") + lines(self.dump, "")) + "\n"
 
 
 def lines(lst, ind):
@@ -1365,6 +1369,28 @@ def check_bf_file(bf, path, stdin, eof, expected, modes):
     return fails
 
 
+def fit_stack(bf, d, prog, stdin):
+    """Overflowing the recursion stack is not checked at run time: the program then writes over other cells
+    and does anything, often spinning forever, which the model cannot predict.  For a program with rec procs,
+    find out with --check-stack whether it fits, and give it a bigger stack when it does not.  False when
+    even that overflows."""
+    if not any(p.rec for p in prog.procs):
+        return True
+    src = os.path.join(d, "stack.bfl")
+    while True:
+        with open(src, "w", newline="\n") as f:
+            f.write(prog.text())
+        _, out, _ = run(bf, [src, "--check-stack", "--quiet-devices", "--eof", "nochange"], stdin)
+        if b"recursion stack overflow" not in out:
+            return True                  # fits, or fails some other way that check_bfl reports
+        if prog.stack == STACK_BIG:
+            return False
+        prog.stack = STACK_BIG
+
+
+STACK_BIG = 4096                         # also exercises the 16-bit stack pointer of stacks above 256 cells
+
+
 def check_bfl(bf, d, text, stdin, expected, modes=MODES, pokes=None, determinism=True, layout=True):
     """Compile and run one BFL program; returns the failures.  pokes: (cell offset, value) pairs."""
     src = os.path.join(d, "p.bfl")
@@ -1484,6 +1510,8 @@ def shrink_bfl(bf, prog, stdin, fails, d, log):
             expected = model_run(p, stdin)
         except ModelError:
             return False
+        if not fit_stack(bf, d, p, stdin):
+            return False
         res = check_bfl(bf, d, p.text(), stdin, expected, modes, pokes, "determinism" in kinds, "layout" in kinds)
         if compile_msg is not None:
             return any(f.kind == "compile" and compile_msg in f.detail for f in res)
@@ -1576,6 +1604,8 @@ def bfl_case(bf, seed, tmp, modes=MODES, pokes=True):
     prog, stdin, expected = g
     d = os.path.join(tmp, f"bfl{seed}")
     os.makedirs(d, exist_ok=True)
+    if not fit_stack(bf, d, prog, stdin):
+        return Result("bfl", seed, "skip")
     fails = check_bfl(bf, d, prog.text(), stdin, expected, modes, poker(seed) if pokes else None)
     return Result("bfl", seed, "fail" if fails else "ok", fails, (prog, stdin, expected))
 
@@ -1665,10 +1695,12 @@ def replay(bf, kind, seed, tmp):
             print("no program for this seed")
             return 0
         prog, stdin, expected = g
-        print(prog.text())
-        print(f"stdin {stdin!r}\nexpected {expected!r}")
         d = os.path.join(tmp, "replay")
         os.makedirs(d, exist_ok=True)
+        if not fit_stack(bf, d, prog, stdin):
+            print(f"overflows even a stack of {STACK_BIG} cells")
+        print(prog.text())
+        print(f"stdin {stdin!r}\nexpected {expected!r}")
         fails = check_bfl(bf, d, prog.text(), stdin, expected, MODES, poker(seed))
         print(f"compiled to {os.path.join(d, 'p.b')}")
     else:
