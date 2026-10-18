@@ -34,6 +34,7 @@
 #include <fstream>
 #include <sstream>
 #include <climits>
+#include <deque>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -158,7 +159,9 @@ struct Gen {
     int heap_size = 0;
 
     struct Scope { std::unordered_map<std::string, Var> vars; std::vector<std::string> order; int64_t mark; bool top; bool frame = false; };
-    std::vector<Scope> scopes;
+    // A deque, so that pushing a scope never moves the others: code holds Var*
+    // into them across the evaluation of expressions that inline procedures.
+    std::deque<Scope> scopes;
     std::unordered_map<std::string, ProcInfo> procs;
     std::vector<std::string> call_stack;
     std::string cur_proc;
@@ -2005,7 +2008,7 @@ struct Gen {
         if (pc.needs) { pc.alive = tmp(); set(pc.alive, 1); }
         ctxs.push_back(pc);
         // lexical scoping: the body sees the globals and its own parameters, not the caller's locals
-        std::vector<Scope> hidden_scopes(std::make_move_iterator(scopes.begin() + 1), std::make_move_iterator(scopes.end()));
+        std::deque<Scope> hidden_scopes(std::make_move_iterator(scopes.begin() + 1), std::make_move_iterator(scopes.end()));
         scopes.resize(1);
         push_scope();
         for (size_t i = 0; i < bound.size(); i++) { Var v = bound[i]; v.name = proc.params[i].name; declare(v, proc.params[i].pos); }
