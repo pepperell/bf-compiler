@@ -1,6 +1,7 @@
 // sema.h - the BFL semantic pass: names, types, checks, warnings.
 #pragma once
 #include "ast.h"
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -33,11 +34,19 @@ struct SemaResult {
     std::vector<std::pair<int64_t, std::string>> heap_init;   // string literals: address, bytes with the NUL
 };
 
+// Where the string literals go in the static heap, when the caller places them (below
+// the heap arrays, which then start at arrays_from).
+struct StringPlaces {
+    std::map<std::string, int64_t> at;
+    int64_t arrays_from = 7;
+};
+
 // Checks prelude + program (prelude procedures first, unchecked for warnings)
 // and annotates both.  `types` owns all types referred to by the annotations.
 // Warnings are not reported for files in quiet_files (the standard library).
 // file_names (by Pos::file) lets messages about clashes between files name both.
 SemaResult analyse(Program& prelude, Program& prog, Types& types, const Features& f, bool warnings,
-                   const std::set<int>& quiet_files = {}, const std::vector<std::string>& file_names = {});
+                   const std::set<int>& quiet_files = {}, const std::vector<std::string>& file_names = {},
+                   const StringPlaces* places = nullptr);
 
 } // namespace bfl

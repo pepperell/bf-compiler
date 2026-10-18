@@ -14,7 +14,9 @@ Measures with out\\bf.exe of the tree it runs in (or the bf.exe given):
           a routine: the whole program's count less that of the program without the
           line (the profiler charges a straight-line block to the statement it starts
           in, so a per-line count would include some of the next line); also the
-          brainfuck commands the line adds to the program
+          brainfuck commands generated for the line (its ranges in the .map): the
+          program less the program without it would count the other variables
+          moving too, since the compiler lays them out by the trips made to them
 
 --json FILE writes the results; --compare FILE prints them next to an earlier --json
 file with the change. Takes under a minute.
@@ -124,7 +126,7 @@ word wa = word(x) * 251 + 7;
 word wb = word(y) + 3;
 byte ba = x;
 byte bb = y - 60;
-long lc; int ic; word wc; byte bc;
+long lc = long(y); int ic = int(y); word wc = word(y); byte bc = y;        // unknown, so the tail does not fold without the line
 '''
 # the same work whatever the values (unsigned shifts by whole bytes move bytes)
 TAIL = 'out byte(lc) + byte(dword(lc) >> 8) + byte(dword(lc) >> 16) + byte(dword(lc) >> 24) + byte(ic) + byte(word(ic) >> 8) + byte(wc) + bc;\n'
@@ -159,19 +161,34 @@ def profile_total(bf, path):
         raise RuntimeError(f'--profile failed: {r.stderr.decode("latin-1").strip()}')
     return int(m.group(1))
 
+def line_size(bf, src, line, tmp):
+    """brainfuck commands generated for the statements on line `line` of src (main file)"""
+    out = os.path.join(tmp, 'line.b')
+    r = subprocess.run([bf, '--emit', out, src], capture_output=True, text=True, timeout=300)
+    if r.returncode:
+        return None
+    text = open(out, encoding='latin-1').read()
+    spans = sorted((int(p[4]), int(p[5])) for p in (l.split() for l in open(out + '.map', encoding='latin-1'))
+                   if p and p[0] == 'S' and int(p[1]) == line and int(p[8]) == 0)
+    n, reach = 0, 0
+    for a, b in spans:                      # the union of the ranges (a statement's ranges can nest)
+        a = max(a, reach)
+        if b > a:
+            n += sum(text[a:b].count(c) for c in '<>+-[].,')
+            reach = b
+    return n
+
 def ops(bf, tmp):
     res = {}
     base = os.path.join(tmp, 'op_base.bfl')
     open(base, 'w', newline='\n').write(SETUP + TAIL)
-    base_size = emit_size(bf, base, tmp)
     base_ir = profile_total(bf, base)
     for name, stmt in OPS:
         path = os.path.join(tmp, 'op.bfl')
         open(path, 'w', newline='\n').write(SETUP + stmt + '\n' + TAIL)
         n = profile_total(bf, path) - base_ir
-        size = emit_size(bf, path, tmp)
         res[name] = n
-        res[name + ' size'] = size - base_size if size is not None and base_size is not None else None
+        res[name + ' size'] = line_size(bf, path, SETUP.count('\n') + 1, tmp)
         print(f'  {name:22} {n:>9,} IR instructions   {fmt(res[name + " size"]):>9} commands', flush=True)
     return res
 

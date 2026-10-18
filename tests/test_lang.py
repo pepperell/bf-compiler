@@ -632,6 +632,10 @@ case("word-compound", "word w = 1000; w *= 3; print w; w /= 7; print \" \", w; w
 case("self-assign", "byte x = in; x = x; out x; x = x + x; out x; word w = 300; w = w + w; print w; w = w * 2 - w; print \" \", w;", b"\x05\x0a600 600", b"\x05")
 case("deep-expr", "byte a = in; byte b = in; byte r = (a + b) * (a - b) / (a % b + 1) - !(a == b) + (a > b) * 7; print r;", b"26", b"\x07\x03")
 case("else-if-chain", "byte x = in; if (x < 3) { out 'a'; } else if (x < 6) { out 'b'; } else if (x < 9) { out 'c'; } else { out 'd'; }", b"c", b"\x07")
+# a status register read (test_reg) steps the pointer as far above its temporaries as they are above the
+# register, and the cell it lands on must be zero: not in the heap or the globals above the temporaries
+case("register-status-heap", 'heap 256; byte arr[64]; string s = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; arr[0] = 1; byte k = 0; if (KEY_STATUS) { k = 1; } print s, " ", k;',
+     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 0")
 case("while-register-loop", "byte n = 0; while (KEY_STATUS) { pulse KEY_STATUS; n++; } print n;", b"4", b"abcd")
 
 # ---- procedures with return values (inlined) ----
@@ -822,30 +826,32 @@ def profile_devices():
 
 
 SHARE_SETTING_SRC = """long a = long(in) * 1000; long b = long(in) - 7;
-long x = a * b + 5; long y = a / b; long z = mulshr(a, b, 3) - 1; long w = x * y;
+long x = a * b + 5; long y = a / b; long z = mulshr(a, b, 3) - 1; long w = x * y; long v = w * b + x * z;
 long k = 100000; long m = 7; long p = k / m; long q = p / m; long r = k * m; long u = r * p;
-print x, " ", y, " ", z, " ", w, " ", p, " ", q, " ", u;
+print x, " ", y, " ", z, " ", w, " ", v, " ", p, " ", q, " ", u;
 """
 
 
 def share_setting():
     """BFL_SHARE: 1 compiles as 2 (one operation has nothing to share with), 0 and below never share,
-    and all print the same.  The second line is a run sharing a multiply (x and w).  Operations on values
-    the compiler knows are not shared: the third line's fold whether or not sharing is on."""
+    and all print the same.  The second line is a run sharing a multiply (x, w and v).  Operations on values
+    the compiler knows are not shared: the third line's fold whether or not sharing is on.  The sizes are
+    compared with BFL_NO_LAYOUT=1, since the layout of the globals follows the trips the code makes to
+    them (phase 16), and so changes with sharing as well."""
     src = os.path.join(TMP, "share_setting.bfl")
     open(src, "w", newline="\n").write(SHARE_SETTING_SRC)
     folded = os.path.join(TMP, "share_known.bfl")
     open(folded, "w", newline="\n").write(SHARE_SETTING_SRC.splitlines()[2] + "\nprint p, \" \", q, \" \", u;\n")
     sizes, outs, known = {}, {}, {}
     for share in ("2", "1", "0", "-1"):
-        env = dict(os.environ, BFL_SHARE=share)
+        env = dict(os.environ, BFL_SHARE=share, BFL_NO_LAYOUT="1")
         for f, into in ((src, sizes), (folded, known)):
             r = subprocess.run([BF, "--emit", os.path.join(TMP, "share_setting.b"), f], capture_output=True, text=True, timeout=60, env=env)
             m = re.search(r"(\d+) commands", r.stdout + r.stderr)
             into[share] = int(m.group(1)) if r.returncode == 0 and m else 0
         outs[share] = subprocess.run([BF, "--quiet-devices", src], input=b"ab", capture_output=True, timeout=60, env=env).stdout
     ok = (0 < sizes["2"] == sizes["1"] < sizes["0"] == sizes["-1"] and 0 < known["2"] == known["0"]
-          and set(outs.values()) == {b"8827005 1065 1103374 810825733 14285 2040 1409565408"})
+          and set(outs.values()) == {b"8827005 1065 1103374 810825733 -727314787 14285 2040 1409565408"})
     print(("PASS " if ok else "FAIL ") + "share-setting")
     if not ok:
         print(f"   sizes {sizes}, with known values {known}, outputs {outs}")
@@ -875,6 +881,115 @@ def share_known():
         outs.append(subprocess.run([BF, "--quiet-devices", src], input=b"AB", capture_output=True, timeout=60).stdout)
     ok = 0 < sizes[0] == sizes[1] and outs[0] == outs[1] == b"-61302773 83724218 -34134645 4"
     print(("PASS " if ok else "FAIL ") + "share-known")
+    if not ok:
+        print(f"   sizes {sizes}, outputs {outs}")
+    return ok
+
+
+# Shapes where sharing a routine used to cost more than not sharing (the phase 18 review): a run reading
+# variables known before it and written inside it, word and mulshr runs, a gap between the operations,
+# divisions, and a variable declared or assigned with a constant inside the run and then multiplied.
+SHARE_PAYS_SRCS = [
+    """dword a = in; dword b = in; dword k = 4000000000; dword j = 3;
+dword x = a * b + k; dword q = x / (b + 1) + k; k = q % (a + 2) + j; dword y = x / (a + 3) + k; j = y % (b + 5) + k + j;
+print x, " ", q, " ", k, " ", y, " ", j;""",
+    """long a = in; long b = in; long k = 11; byte n = 3; byte m = 4;
+long x = a * b + k; n = n + m; m = n * 2; long y = x * b + k + n + m; k = k + n; m = m + 1; long z = y * a + k + m + n;
+print x, " ", y, " ", z, " ", k, " ", n, " ", m;""",
+    """word a = in; word b = in; word k = 300; byte c = 3; int s = -5;
+word x = a * b + k; k = x * a + c; c = c + 1; word y = k * b + k + c; s = y * s; int z = s * s + c + s; word w = z * a + k + c;
+print x, " ", k, " ", y, " ", s, " ", z, " ", w, " ", c;""",
+    """long a = in; long b = in; long k = 1000; long j = 7;
+long x = mulshr(a, b, 3) + k; k = mulshr(x, b, 3) + k - j; long y = mulshr(k, a, 3) + k + j; j = mulshr(y, b, 3) + j; long z = mulshr(j, a, 3) + k + j;
+print x, " ", k, " ", y, " ", j, " ", z;""",
+    """long a = in; long b = in;
+long x = a * b + 1; long k = 5; long y = k * a + x; long z = y * b + x;
+print x, " ", y, " ", z;""",
+    """long a = in; long b = in; long k = in;
+long x = a * b + 1; k = 5; long y = k * a + x; long z = y * b + x;
+print x, " ", y, " ", z, " ", k;""",
+]
+
+
+def share_pays():
+    """A run of statements shares its routine only when that is smaller: the compiler generates it both
+    ways and keeps the smaller, so no program is larger than with BFL_SHARE=0, and both print the same."""
+    ok, notes = True, []
+    for k, text in enumerate(SHARE_PAYS_SRCS):
+        src = os.path.join(TMP, f"share_pays_{k}.bfl")
+        open(src, "w", newline="\n").write(text + "\n")
+        sizes, outs = [], []
+        for share in ("2", "0"):
+            env = dict(os.environ, BFL_SHARE=share)
+            r = subprocess.run([BF, "--emit", os.path.join(TMP, "share_pays.b"), src], capture_output=True, text=True, timeout=60, env=env)
+            m = re.search(r"(\d+) commands", r.stdout + r.stderr)
+            sizes.append(int(m.group(1)) if r.returncode == 0 and m else 0)
+            outs.append(subprocess.run([BF, "--quiet-devices", src], input=b"AB", capture_output=True, timeout=60, env=env).stdout)
+        if not (0 < sizes[0] <= sizes[1] and outs[0] == outs[1] and outs[0]):
+            ok = False
+            notes.append(f"program {k}: sizes shared {sizes[0]}, unshared {sizes[1]}, outputs {outs}")
+    print(("PASS " if ok else "FAIL ") + "share-pays")
+    for n in notes:
+        print("   " + n)
+    return ok
+
+
+LAYOUT_PLAN_SRC = """long t[8]; long u[8]; long v[8]; long w[8];
+long s = 0; byte i;
+proc long f(long a, long b) { long c = a * b; long d = c / (a + 1); return c + d; }
+for (i = 0; i < 8; i++) { t[i] = long(i) * 1000 + 7; u[i] = f(t[i], 3); v[i] = f(u[i], t[i]); w[i] = v[i] - u[i]; s = s + w[i] + t[i]; }
+print s, " ", w[7];
+"""
+
+
+def layout_plan():
+    """Globals the code reaches from deep down go above the temporaries (phase 16): here an array the loop
+    uses most sits above the cells of f's inlined locals, the program is smaller than with BFL_NO_LAYOUT=1,
+    and every executor and both layouts print the same."""
+    src = os.path.join(TMP, "layout_plan.bfl")
+    open(src, "w", newline="\n").write(LAYOUT_PLAN_SRC)
+    sizes, cells = {}, {}
+    with_layout = {k: v for k, v in os.environ.items() if k != "BFL_NO_LAYOUT"}
+    for name, env in (("plan", with_layout), ("plain", dict(with_layout, BFL_NO_LAYOUT="1"))):
+        out_b = os.path.join(TMP, "layout_plan.b")
+        r = subprocess.run([BF, "--emit", out_b, src], capture_output=True, text=True, timeout=60, env=env)
+        m = re.search(r"(\d+) commands", r.stdout + r.stderr)
+        sizes[name] = int(m.group(1)) if r.returncode == 0 and m else 0
+        if name == "plan" and os.path.exists(out_b + ".map"):
+            for line in open(out_b + ".map"):
+                p = line.split()
+                if p and p[0] == "V":
+                    cells[(p[1], p[6] if len(p) > 6 else "")] = int(p[3], 16)
+    outs = set()
+    for flags, env in (([], {}), (["--interp"], {}), (["--no-opt"], {}), ([], {"BFL_NO_LAYOUT": "1"})):
+        outs.add(subprocess.run([BF, "--quiet-devices"] + flags + [src], capture_output=True, timeout=60, env=dict(with_layout, **env)).stdout)
+    locals_f = [c for (n, sc), c in cells.items() if sc == "f"]
+    arrays = [cells.get((n, ""), -1) for n in ("t", "u", "v", "w")]
+    ok = (0 < sizes["plan"] < sizes["plain"] and outs == {b"421205208 147294144"} and locals_f
+          and max(arrays) > max(locals_f))
+    print(("PASS " if ok else "FAIL ") + "layout-plan")
+    if not ok:
+        print(f"   sizes {sizes}, outputs {outs}, cells {cells}")
+    return ok
+
+
+def strings_first():
+    """String literals take the start of the static heap, before the heap arrays, whatever the order they
+    appear in: the start-up code that writes them does not walk past a large array and back.  (Part of the
+    layout, so not with BFL_NO_LAYOUT.)"""
+    env = {k: v for k, v in os.environ.items() if k != "BFL_NO_LAYOUT"}
+    texts = ['heap byte big[3000]; string s = "hi"; big[5] = 3; print s, big[5], "!";',
+             'string s = "hi"; heap byte big[3000]; big[5] = 3; print s, big[5], "!";']
+    sizes, outs = [], set()
+    for k, text in enumerate(texts):
+        src = os.path.join(TMP, f"strings_first_{k}.bfl")
+        open(src, "w", newline="\n").write(text + "\n")
+        r = subprocess.run([BF, "--emit", os.path.join(TMP, "strings_first.b"), src], capture_output=True, text=True, timeout=60, env=env)
+        m = re.search(r"(\d+) commands", r.stdout + r.stderr)
+        sizes.append(int(m.group(1)) if r.returncode == 0 and m else 0)
+        outs.add(subprocess.run([BF, "--quiet-devices", src], capture_output=True, timeout=60, env=env).stdout)
+    ok = 0 < sizes[0] == sizes[1] < 3000 * 5 and outs == {b"hi3!"}
+    print(("PASS " if ok else "FAIL ") + "strings-first")
     if not ok:
         print(f"   sizes {sizes}, outputs {outs}")
     return ok
@@ -925,6 +1040,12 @@ def main():
     if not share_setting():
         fails += 1
     if not share_known():
+        fails += 1
+    if not share_pays():
+        fails += 1
+    if not layout_plan():
+        fails += 1
+    if not strings_first():
         fails += 1
     if not profile_devices():
         fails += 1

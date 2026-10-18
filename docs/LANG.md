@@ -488,8 +488,10 @@ of the same 16- or 32-bit `*`, `mulshr`, `/` or `%` in one sum or run of
 statements share one copy of their code ("Shared arithmetic" below): three
 `long` products in a sum are about 11 000 commands instead of 20 700.
 `bf --profile` (Run > Profile in the UI) shows where a program's instructions go, by statement. The compiler also tracks cells whose value it knows in straight-line
-code: constants, string output and copies of known variables are emitted as the
-shortest delta, and expressions over known variables fold entirely.
+code, also across the clear and move loops, which touch only their own cells:
+constants, string output and copies of known variables are emitted as the
+shortest delta (or as `[-]` and the new value when that is shorter), and
+expressions over known variables fold entirely.
 
 ## Idioms used by the compiler
 
@@ -499,14 +501,30 @@ These are the building blocks; knowing them helps read the output and write
 - **Temporaries** come from a stack just above the variables and are always
   returned to zero, so a fresh temporary is known to be 0.
 - **Layout of globals.** The pointer reaches a cell one step at a time, so a
-  variable costs roughly its references times its distance from the
-  temporaries. Each run of top-level declarations with no other statement
-  between them is laid out together when the first is reached: by references
-  per cell (a procedure's body counts once per inlined call), the densest
-  nearest the temporaries. The order of declarations within such a run does not
-  matter; a declaration after other statements still starts a new run above
-  the variables that exist then.
-- **Clear** `[-]`, **move** `a[-b+a]`, **copy** `a[-b+t+a]t[-a+t]`.
+  variable costs roughly the trips the code makes to it times their length.
+  The compiler first generates the whole program without writing it, counting
+  the trips to each global and where they start. Each run of top-level
+  declarations with no other statement between them is then laid out together
+  when the first is reached, by trips per cell, the busiest nearest the
+  temporaries; and the globals that cost less from above (typically arrays
+  used by deeply nested code, whose temporaries are far up) go instead in a
+  region just above the temporaries' high-water mark, between them and the
+  heap. The trampolined main program's frame (the globals of a program that
+  calls a `rec` or `shared` proc) is laid out the same way. The plan is kept
+  when a second measuring pass with it in place estimates fewer commands than
+  the first. The order of declarations within such a run does not matter; a
+  declaration after other statements still starts a new run above the
+  variables that exist then. `BFL_NO_LAYOUT=1` in the environment of `bf` keeps
+  the declaration order and everything below the temporaries, for measuring;
+  `BFL_PLAN_DEBUG=1` prints the measurements, the plan and the shared-run
+  choices on stderr.
+  String literals take the start of the static heap, before the heap arrays,
+  so the start-up code that writes them stays near the bottom of the heap.
+- **Clear** `[-]`, **move** `a[-b+a]`, **copy** `a[-b+t+a]t[-a+t]`. The
+  copy's `t` is a spare cell next to `a` when there is one: the header and the
+  `C` and `V` cells of the arrays that live for the whole program are zero
+  between walks, so a copy from a far variable makes the trip there and back
+  once instead of twice.
 - **If** `c[ body c[-] ]` on a temporary copy of the condition;
   **if/else** adds a flag cell set to 1 and cleared by the taken branch.
 - **While** `c[ body ; recompute c ]`; a body containing `break` or
@@ -514,7 +532,8 @@ These are the building blocks; knowing them helps read the output and write
   point, and `break` also sets a flag that clears the loop cell.
 - **Register test without a write**: `reg[ flag+ P ]` leaves the pointer on
   `reg` (0) or on `P` (0); moving `M - reg` cells right then lands on `M`,
-  prepared with 1, or on `P + M - reg`, which is free and 0; `[- >·D ]` with
+  prepared with 1, or on `P + M - reg`, which is free and 0 (the globals above
+  the temporaries and the heap start above the highest such cell); `[- >·D ]` with
   `D = P - reg` brings the first case to the same cell. Costs about 70 commands.
 - **Division** of words and longs (`n` bytes) is one loop on a block of
   `12n + 2` temporaries (`bf::division_loop` and `bf::DivisionLayout` in
@@ -574,8 +593,11 @@ These are the building blocks; knowing them helps read the output and write
   what its constant would. Values known before the loop that no statement in it
   writes are known again after it. A constant factor
   is not shared (it is multiplied on its own, as above), nor is an operation that reads a
-  variable whose value the compiler knows: a run ends before its statement,
-  which can then fold it or use a constant factor, and its result is known. One
+  variable whose value the compiler knows (from before the run, or declared or
+  assigned with a constant earlier in it): a run ends before its statement,
+  which can then fold it or use a constant factor, and its result is known. A run
+  is shared only when that is smaller: the measuring passes generate it both ways
+  and keep the smaller, and the last pass follows their choices. One
   loop runs at most 16 operations, because the code between the loop's flags
   and the variables grows with their number: a sum with more is cut into
   several loops, and a run ends before the statement that would pass 16.

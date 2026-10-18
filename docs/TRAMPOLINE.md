@@ -40,8 +40,10 @@ these changes, which also apply to `rec proc`:
   cells. A return clears its frame (the caller's resume code moves the result and
   `ref` parameters out), so the cells above a running procedure's frame are zero
   and its temporaries start right there, instead of above every frame of the
-  program. The main program's frame (the globals) is ordered by use, as in
-  inlined code.
+  program. The main program's frame (the globals) is ordered by the trips the
+  code makes to them, as in inlined code, and the globals that cost less from
+  above leave it for the region above the temporaries (docs/LANG.md, "Layout of
+  globals"); the frames above it move down by what left.
 - **Flat dispatcher.** The countdown runs as one sequence of tests instead of
   nested ones, so every block's temporaries start at the same height, and the
   dispatcher's own cells sit below the frames.

@@ -82,6 +82,7 @@ struct Sema {
     void warning(Pos p, const std::string& m) { if (warn && !in_prelude && !quiet_files.count(p.file)) R.warnings.push_back(Diag{p, m}); }
     void need_heap() { if (!in_prelude) R.uses_heap = true; }
     std::map<std::string, int64_t> strings;     // literal -> heap address
+    const std::map<std::string, int64_t>* string_at = nullptr;   // addresses given by the caller (analyse)
     int64_t heap_alloc(int64_t bytes, Pos p) {   // static heap space for arrays and literals
         int64_t a = R.heap_static_end;
         if (a + bytes > 65535) { error(p, "the static heap data does not fit in 64 KB"); return 7; }
@@ -289,7 +290,8 @@ struct Sema {
             int64_t a;
             if (it != strings.end()) a = it->second;
             else {
-                a = heap_alloc((int64_t)e.text.size() + 1, e.pos);
+                auto given = string_at ? string_at->find(e.text) : std::map<std::string, int64_t>::const_iterator{};
+                a = string_at && given != string_at->end() ? given->second : heap_alloc((int64_t)e.text.size() + 1, e.pos);
                 strings[e.text] = a;
                 R.heap_init.emplace_back(a, e.text + std::string(1, '\0'));
             }
@@ -1025,10 +1027,11 @@ struct Sema {
 } // namespace
 
 SemaResult analyse(Program& prelude, Program& prog, Types& types, const Features& f, bool warnings, const std::set<int>& quiet_files,
-                   const std::vector<std::string>& file_names) {
+                   const std::vector<std::string>& file_names, const StringPlaces* places) {
     Sema s(types, f, warnings);
     s.quiet_files = quiet_files;
     s.file_names = file_names;
+    if (places) { s.string_at = &places->at; s.R.heap_static_end = (int)places->arrays_from; }
     try { s.run(prelude, prog); } catch (const Abort&) {}
     return std::move(s.R);
 }

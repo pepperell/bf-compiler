@@ -1,10 +1,10 @@
 # Roadmap: BFL towards modern programming
 
-Status: implemented (phases 0 to 14); phases 15 to 19 are planned (section 12).
+Status: implemented (phases 0 to 19).
 Hardware and devices are out of scope here. The sections below are the plan as
 written. Where the result differs, docs/HEAP.md (phase 0), docs/TRAMPOLINE.md
-(phase 7), the note under phase 8 and the **Built** notes in section 11 say what
-was built, and docs/LANG.md describes the language as it is.
+(phase 7), the note under phase 8 and the **Built** notes in sections 11 and 12 say
+what was built, and docs/LANG.md describes the language as it is.
 
 BFL today has bytes and 16-bit words, byte arrays, inlined procedures with return
 values, and recursion through `rec proc` (docs/LANG.md, docs/TRAMPOLINE.md). What
@@ -33,7 +33,7 @@ plus the type system, library and tooling they need.
 | 13 | The profiler in the UI | nothing |
 | 14 | Housekeeping (the raytracer animation) | nothing |
 | 15 | Multiplication as one IR step | 9 |
-| 16 | Planned: shorter trips to operands (placement of temporaries and globals) | 9 |
+| 16 | Shorter trips to operands: globals laid out by the trips to them, some above the temporaries | 9 |
 | 17 | Cheaper `mulshr`: no shift after the loop, signs as a start value, constant factors | 10, 15 |
 | 18 | Loose ends of phases 11 to 13: device-window profile, dark theme, known values in shared runs | 11, 13 |
 | 19 | Fuzzer coverage of structs, `ref` arrays and `shared proc` | 9 |
@@ -637,7 +637,7 @@ commit it with a mention in README.md, or drop it.
 **Done**: `tools/rt_gif.py OUT.gif` renders the 16 frames headless (2 s in all, a
 frame about 55 ms); README.md shows the re-recorded `docs/raytracer.gif`.
 
-## 12. Next: phases 15 to 19 (planned)
+## 12. Phases 15 to 19 (built)
 
 Where phases 9 to 14 leave things (`tools/bench.py`): a raytracer frame takes 55 ms
 and its light map 86 ms, the program is 4.06 M commands, a 32-bit `/` executes about
@@ -756,6 +756,176 @@ by use count, not by co-use); keep hot locals of a procedure close to its tempor
 
 Done when: the samples are measurably smaller (the raytracers by at least 10%) with
 frame times no worse, and the tests and fuzzer are clean, also with `BFL_NO_LAYOUT`.
+
+**Built** in `src/lang/codegen.cpp` (and a few lines of `src/lang/sema.cpp`), from a
+measurement first. Of the raytracer's 3.57 M commands 87.6% were pointer moves, and 35% of
+those came in runs of 512 cells or more (20% in runs of 1 024 to 2 047): the trips from the
+temporaries down to the scene's arrays (`scx[s]`, `socd0[s]`, ...), which the layout of
+phase 8 put lowest, 900 to 1 300 cells away, because an array is many cells for its
+references. A runtime-indexed `long` element costs about 11 such distances (the index there,
+four bytes back, the walk's own trip), and `brow[s] = socd0[s] + long(y) * socdv[s];` was
+51 000 commands, 98% of them moves.
+
+**Trips, measured.** The compiler now first generates the whole program dry (the dry pass
+of the heap placement, for every program), and `go()` counts, for every global, the trips
+whose other end is outside the globals and the cell they start from (`Gen::Cand`,
+`note_trip`), and the trips into the heap. From those `plan_globals` makes a `Gen::Plan`:
+
+- **Globals above the temporaries.** A global whose trips start high up (its uses are in
+  deeply nested code, whose temporaries sit far above the globals) can be cheaper in a region
+  placed just above the temporaries' high-water mark, between them and the heap. The estimate
+  of a trip to a global below is its distance down (from the trips' mean start to the top of
+  its group, the globals of the group nearer the top, the part of itself below the cell a use
+  reaches) less the sizes of the globals of higher groups that moved up; to one above it is the
+  distance up to the high-water mark plus what was placed before it there; every heap trip
+  gets longer by the region's size. Starting from everything below, single moves either way
+  are made while they lower the estimate. A second dry pass with the plan finds where the
+  temporaries now end (the frame below shrank), and the last pass places the region there and
+  the heap above it. In the raytracer the region holds 19 globals, 576 cells, mostly the
+  per-sphere arrays; in `raytracer_text.bfl` 17 (522 cells); in `quicksort.bfl` the array
+  of its trampolined main frame, in `trampoline_fib.bfl` its hand-made stack (291 cells) and
+  the two cells used with it.
+- **The rest by trips per cell**, the busiest nearest the temporaries, in the same groups
+  (top-level declarations with no code between them, or the trampolined main frame) as the
+  static count of phase 8, which still lays out the measuring pass.
+- The plan is used when the second dry pass's estimated commands (the commands it wrote and
+  the moves it left out, with the heap and the region taken where they will be) are fewer than
+  the first's; otherwise the program is laid out as before.
+
+The trampolined main frame (the raytracer calls a `shared proc`) is planned like the
+top-level declarations: the globals that go up leave the frame, and the frames above it move
+down by what left, so the frames stay a call stack. Symbols, the .map and the watch list
+show the cells wherever they are.
+
+**Copies through a spare cell.** `copy(a)` came back through a temporary at the top:
+`a[-b+t+a]t[-a+t]`, two trips there and back per byte. The header and the `C` and `V` cells
+of every array that lives for the whole program (top-level, the main frame, the save stack)
+are zero between walks, so the copy now uses the one nearest `a` when it is much nearer than
+the temporary (`spare_near`): one round trip a byte. The temporary is still taken, so the
+cells a program uses do not depend on where things are.
+
+**Known values kept through clears and moves**, which loop on their own cells only (the
+experiment of phase 18, now kept): what is known of every other cell holds after them. `set`
+on a cell with a known value adds the difference unless `[-]` and the new value is shorter,
+which was why `hanoi.bfl` and `quicksort.bfl` grew in the experiment; both are now smaller.
+A declaration whose cells were reserved earlier (a layout group, or before an early exit)
+knows they are still zero, which they are, so `long k = 5;` after other code is known again.
+
+**String literals first in the static heap.** `raytracer_text.bfl`'s `string ramp` came after
+the 12 288-byte light map, so the start-up code that writes it walked 62 000 cells up and its
+first statement 62 000 back (4% of the program), and every `ramp[i]` walked there and back at
+run time. When the front end finds a literal after a heap array, it runs again with the
+literals placed first (`StringPlaces` for `analyse`), unless that moves an array more than a
+sixteenth further up: `starfield.bfl`'s 600 bytes of strings in front of its two 682-byte
+frame buffers made its frames 24% slower (a heap walk takes as long as its address is high),
+so there they stay where they are.
+
+**The phase 18 review's points** (the coordinator's notes):
+
+- *A shared run is larger than unshared in some shapes* (7 of the reviewer's 30 cases, 0.2 to
+  2.8%). The dry passes now generate each run both ways and keep the smaller (`run_pays`:
+  everything the generation touches is saved and put back); the last pass takes the choices of
+  the dry pass before it in the same order, so its code is the same but for the placement. None
+  of the reviewer's 37 programs is now larger than with `BFL_SHARE=0`.
+- *A variable declared with a constant in a run* (`long x = a*b+1; long k = 5; long y = k*a + x;`)
+  was shared as a general product, 255 389 commands against 254 161 unshared: `reads_known` now
+  counts the variables declared or assigned with a constant earlier in the run (250 214 now,
+  against 252 564 for the program with `5 * a` written in before).
+- The phase 18 note's sentence about operations inside the loop is corrected (below).
+
+**Found along the way: a register test wrote into the heap.** `if (KEY_STATUS)` (any readable
+register that is not a latch, `test_reg`) steps the pointer as far above its temporaries as
+they are above the register and expects the cell it lands on to be zero; in a program with a
+heap it could land on a heap byte. `heap 256; byte arr[64]; string s = "abc..."; ... if
+(KEY_STATUS) { ... } print s;` printed an empty string in cffb80c (8 of 53 array sizes from 1
+to 160). The measuring pass now records the highest landing cell, and the region above the
+temporaries and the heap start above it (`register-status-heap` in `tests/test_lang.py`).
+
+Measured with `tools/bench.py --only sizes` against cffb80c:
+
+| | commands before | after | |
+|---|---:|---:|---:|
+| `raytracer.bfl` | 3 566 063 | 2 770 508 | -22.3% |
+| `raytracer_text.bfl` | 3 075 162 | 2 465 851 | -19.8% |
+| `quicksort.bfl` | 106 632 | 86 341 | -19.0% |
+| `trampoline_fib.bfl` | 23 413 | 7 138 | -69.5% |
+| `serial_echo.bfl` | 2 879 | 2 506 | -13.0% |
+| `numbers.bfl` | 534 786 | 499 019 | -6.7% |
+| `primes.bfl` | 4 971 | 4 662 | -6.2% |
+| `cube.bfl` | 248 021 | 235 128 | -5.2% |
+| `calc.bfl` | 942 782 | 906 162 | -3.9% |
+| `mergesort.bfl` | 187 267 | 181 168 | -3.3% |
+| `fb.bfl` | 2 800 | 2 710 | -3.2% |
+| `text.bfl` | 486 008 | 478 615 | -1.5% |
+| `bst.bfl` | 575 325 | 569 142 | -1.1% |
+| `queens.bfl` | 49 802 | 49 325 | -1.0% |
+| `starfield.bfl` | 1 224 128 | 1 212 625 | -0.9% |
+| `maze.bfl` | 237 473 | 235 456 | -0.8% |
+| `life.bfl` | 76 292 | 75 759 | -0.7% |
+| `linked_list.bfl` | 1 612 754 | 1 601 728 | -0.7% |
+| `hanoi.bfl` | 60 229 | 59 838 | -0.6% |
+| `queue.bfl`, `leds.bfl` | 169, 1 352 | the same | |
+
+In the order they were built, on the raytracer and `raytracer_text.bfl`: the region above
+and the trips counted -13.7% and -9.4%, the order below by trips -14.4% and -10.1%, the
+strings first -14.4% and -14.1%, the spare cells -16.7% and -17.0%, the reserved
+declarations known zero -17.0% and -17.3%, the run choices -17.9% and -18.5%, the known
+values through clears and moves -22.3% and -19.8%. The raytracer's moves went from 3.12 M
+to 2.33 M, and those in runs of 1 024 cells or more from 631 K to 108 K.
+
+Frame times, `tools/bench.py --only frames` on cffb80c built in a temporary worktree and on
+this build, alternately, three rounds each, the fastest (the machine was otherwise idle but
+for the odd other agent):
+
+| ms | before | after |
+|---|---:|---:|
+| `raytracer.bfl` frame / light map | 30.58 / 37 | 30.08 / 37 |
+| `raytracer_text.bfl` | 11.75 / 33 | 7.55 / 33 |
+| `cube.bfl` | 1.31 | 1.27 |
+| `starfield.bfl` | 1.03 | 1.02 |
+
+`raytracer_text.bfl` is faster because `ramp[level]`, read for every character, now walks to
+byte 7 of the heap instead of byte 12 295. The frame programs execute fewer IR instructions
+(`bf --profile`): the raytracer's (light map and 3 frames) 505.9 M against 499.1 M,
+`raytracer_text.bfl`'s 310.3 M against 248.2 M, the cube's (40 frames) 238.1 M against
+237.6 M, the starfield's 168.7 M against 168.4 M. The raytracer's 16 frames rendered
+headless (`tools/rt_gif.py`) are identical to cffb80c's, and so is the output of the other
+three frame programs.
+
+`tools/bench.py --only ops` now reports a line's own commands from the .map: the program
+less the program without the line had come to include the other globals moving, since the
+layout follows the trips (`byte / byte` showed +585%, its line +60%, its variables now further
+down since the plan finds them rarely used). The setup's result variables start from an input
+byte, so the tail no longer folds when the line is missing. By that measure the lines are 1 to
+22% smaller (`mulshr(long, 218, 8)` 3 173 to 2 481, `(long * long) >> 12` 13 906 to 12 183),
+but for `byte / byte` (271 to 443) and `mulshr(int, int, 7)` (+1.5%). The IR rows went up by
+2 to 9 instructions (`long * long` 52 to 58): every op program executes about 126 fewer IR
+instructions than before, the program without the line 132 fewer (the setup's known values).
+
+Tests: `share-pays` (the reviewer's losing shapes and the two known-constant cases: no larger
+than with `BFL_SHARE=0`, same output), `layout-plan` (an array used from inlined code lies above
+that code's locals; smaller than `BFL_NO_LAYOUT=1`; the same output in every executor and both
+layouts), `strings-first` (a literal after a 3 000-byte heap array costs what one before it
+does) and `register-status-heap` in `tests/test_lang.py`; `share-setting` compares its sizes with
+`BFL_NO_LAYOUT=1` (the layout moves with sharing too) and its run has three products now, since
+with two the run was not the smaller and is no longer shared. The golden files were
+regenerated (all smaller but `leds.b`, unchanged). Both suites pass (`test.py` 83/83, `test_lang.py` 247 tests with the
+grids, all but the golden files also with `BFL_NO_LAYOUT=1`, whose code they do not describe, as
+before); and `tests/fuzz.py --bfl 1500 --bf 300` found nothing, run as it is (seed 1 600 000; 929 programs sharing arithmetic, 406 with shared procs) and with `BFL_NO_LAYOUT=1` (seed 1 700 000), nor did 800 programs each of `--focus shared` and `--focus struct`.
+
+The options the phase listed, and what became of them:
+
+- *A statement's temporaries next to the variables it uses*: the region above the
+  temporaries does this for the globals that deep code uses, without temporaries of
+  their own per region (a statement's temporaries are a stack its inlined calls grow, so
+  they cannot be moved per statement).
+- *Globals that are used together, together*: the plan orders by measured trips and the
+  height they start from, which is where the code using them sits, rather than by
+  co-occurrence in statements. Not tried as such.
+- *Hot locals of a procedure near its temporaries*: inlined procedures' locals are already
+  allocated on the temporaries' stack, and a trampolined procedure's frame sits right below
+  its blocks' temporaries; nothing to change.
+- *Known values through every move*: done, with the `set` case fixed.
 
 ### Phase 17: cheaper constant factors in `mulshr`
 
@@ -1076,7 +1246,10 @@ the next move (of the last result into H) made the compiler forget it again befo
 anything read them. Now H is known only where it is zero, and since that move keeps what
 is known, the restored values reach the statements after the loop. Unchanged: an
 operation that reads a known variable still ends the run before its statement
-(`reads_known`), so no operation inside the loop sees a known value.
+(`reads_known`). (Its review found that this missed variables declared with a constant
+earlier in the run, which had no cells yet: `long x = a*b+1; long k = 5; long y = k*a + x;`
+shared `k*a` with `k` a known 5 inside the loop, and so did one assigned a constant there.
+Phase 16 counts both as known, so no operation inside the loop sees a known value.)
 
 Measured on the samples against the commit before (only these four change):
 

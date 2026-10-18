@@ -3,9 +3,10 @@
 // Model: the pointer position is known at every point of the output.  Every
 // variable owns fixed cells; a value of type T occupies sizeof(T) consecutive
 // cells, least significant byte first.  Temporaries come from a LIFO pool just
-// above the variables and are always returned to zero, so a freshly allocated
-// cell is known to hold 0.  Loops keep the invariant "pointer on the same cell
-// at '[' and ']'" by construction: close() moves back to the loop cell.
+// above the variables (some globals go above the pool's high-water mark: Plan)
+// and are always returned to zero, so a freshly allocated cell is known to hold 0.
+// Loops keep the invariant "pointer on the same cell at '[' and ']'" by
+// construction: close() moves back to the loop cell.
 //
 // The semantic pass (sema.cpp) has already checked the program and given every
 // expression its type; this file only generates code.
@@ -232,8 +233,21 @@ struct Gen {
     // ---- emission primitives ------------------------------------------------------------
     bool dry = false;               // measuring pass: the heap position is a placeholder, so no long moves are written
     bool trackable(int64_t c) const { return c >= ram && c < heap_lo; }
-    void rep(char c, int64_t n) { if (n > 0 && !dry) out.append((size_t)n, c); }
-    void go(int64_t c) { if (c > cur) rep('>', c - cur); else rep('<', cur - c); cur = c; }
+    int64_t dry_commands() const { return dry_moves + (int64_t)std::count_if(out.begin(), out.end(), [](char c) { return strchr("<>+-[].,", c) && c; }); }
+    int64_t dry_moves = 0;          // the moves a dry pass leaves out, the heap and the globals above the temporaries taken as just above them
+    void rep(char c, int64_t n) { if (n > 0) { if (dry) dry_moves += n; else out.append((size_t)n, c); } }
+    void go(int64_t c) {
+        if (stats) note_trip(c);
+        if (dry) {
+            int64_t above = plan ? plan->size : 0;
+            auto at = [&](int64_t x) { return x >= heap_lo ? x - heap_lo + high + above + 16 : x >= upper_lo ? x - upper_lo + high : x; };
+            dry_moves += std::llabs(at(c) - at(cur));
+            cur = c;
+            return;
+        }
+        if (c > cur) rep('>', c - cur); else rep('<', cur - c);
+        cur = c;
+    }
     void open(int64_t c) { go(c); out += '['; loops.push_back(c); known.clear(); }
     void close() {
         int64_t c = loops.back(); loops.pop_back();
@@ -244,7 +258,13 @@ struct Gen {
     bool known_is(int64_t c, int v) const { auto it = known.find(c); return it != known.end() && it->second == v; }
     std::optional<int> known_val(int64_t c) const { auto it = known.find(c); if (it == known.end()) return std::nullopt; return it->second; }
     void forget(int64_t c) { known.erase(c); }
-    void clear(int64_t c) { if (known_is(c, 0)) return; open(c); out += '-'; close(); }
+    // clear and move loop on their own cells only, so what is known of the others holds after them
+    void clear(int64_t c) {
+        if (known_is(c, 0)) return;
+        auto before = known;
+        open(c); out += '-'; close();
+        for (auto& kv : before) if (kv.first != c) known.insert(kv);
+    }
     void add(int64_t c, int64_t v) {
         v &= 255;
         if (!v) return;
@@ -254,12 +274,81 @@ struct Gen {
     }
     void set(int64_t c, int64_t v) {
         v &= 255;
-        if (auto k = known_val(c)) { add(c, v - *k); return; }
+        auto steps = [](int64_t d) { d &= 255; return std::min(d, 256 - d); };
+        if (auto k = known_val(c); k && (*k == 0 || steps(v - *k) <= 3 + steps(v))) { add(c, v - *k); return; }   // else [-] and v is shorter
         clear(c);
         add(c, v);
     }
     void setN(int64_t c, int n, int64_t v) { for (int k = 0; k < n; k++) set(c + k, (v >> (8 * k)) & 255); }
     void clearN(int64_t c, int n) { for (int k = 0; k < n; k++) clear(c + k); }
+
+    // ---- globals above the temporaries -----------------------------------------------------
+    // Temporaries are a stack above the variables, so a variable far below them costs a
+    // long trip at every use.  Some globals (those whose trips cost less from above) go in
+    // a region just above the temporaries' high-water mark instead, between them and the
+    // heap, and the rest are ordered by the trips made to them.  A measuring pass (stats)
+    // counts the trips to each candidate and where they start; compile() makes the plan
+    // (plan_globals), and the passes after it follow it.
+    struct Cand {                       // a global the plan places
+        const Stmt* decl = nullptr;     // a top-level declaration, or
+        int frame_idx = -1;             // a variable of the trampolined main frame
+        const void* group = nullptr;    // the variables it may be reordered with (null: none)
+        int64_t cell = 0, size = 0, access = 0;   // where the measuring pass put it; access: the cell a use reaches, from cell
+        double trips = 0, from = 0;     // trips to or from it (the other end outside the candidates), the sum of those ends
+        std::string name;               // for BFL_PLAN_DEBUG
+    };
+    struct Plan {
+        std::unordered_map<const Stmt*, int64_t> decl_up, decl_rank;   // offset in the region above / order below
+        std::unordered_map<int, int64_t> frame_up, frame_rank;
+        int64_t size = 0;               // of the region above
+    };
+    const Plan* plan = nullptr;         // the plan of this pass; its region at upper_lo
+    int64_t upper_lo = INT64_MAX;
+    int64_t land_hi = -1;               // the highest landing cell of test_reg
+    int64_t cells_end() const { return plan && plan->size ? std::max(high, upper_lo + plan->size) : high; }
+    bool stats = false;
+    std::vector<Cand> cands;
+    std::vector<int> cand_at;           // cell - ram -> index in cands + 1
+    double heap_trips = 0;              // trips into or out of the heap, which the region would lengthen
+    std::unordered_set<const Stmt*> top_decls;
+    std::unordered_map<const Stmt*, const void*> group_of;
+    void note_trip(int64_t c) {
+        if ((c >= heap_lo) != (cur >= heap_lo)) heap_trips += 1;
+        if (c >= heap_lo || cur >= heap_lo || c < ram || cur < ram) return;
+        auto at = [&](int64_t x) { return x - ram < (int64_t)cand_at.size() ? cand_at[(size_t)(x - ram)] : 0; };
+        int k = at(c), kc = at(cur);
+        if (k && !kc) { cands[(size_t)k - 1].trips += 1; cands[(size_t)k - 1].from += (double)cur; }
+        if (kc && !k) { cands[(size_t)kc - 1].trips += 1; cands[(size_t)kc - 1].from += (double)c; }
+    }
+    void add_cand(Cand cd) {
+        cands.push_back(cd);
+        int64_t hi = cd.cell + cd.size - ram;
+        if (hi > (int64_t)cand_at.size()) cand_at.resize((size_t)hi, 0);
+        for (int64_t i = cd.cell - ram; i < hi; i++) cand_at[(size_t)i] = (int)cands.size();
+    }
+    int64_t upper_cells(int64_t off, int64_t n) {
+        int64_t c = upper_lo + off;
+        for (int64_t i = 0; i < n; i++) known[c + i] = 0;
+        return c;
+    }
+    static int64_t access_of(const Type* t, int count, int64_t n) { return count >= 0 ? stride(std::max(t->size, 1)) + 1 : n / 2; }
+    // cells for a declaration of n cells: above the temporaries when planned, else the next free
+    int64_t decl_cells(const Stmt& d, int64_t n) {
+        int64_t c = decl_place(d, n);
+        if (d.count >= 0 && top_decls.count(&d)) add_spares(c, d.count, std::max(d.vtype->size, 1));
+        return c;
+    }
+    int64_t decl_place(const Stmt& d, int64_t n) {
+        if (plan) if (auto it = plan->decl_up.find(&d); it != plan->decl_up.end()) return upper_cells(it->second, n);
+        int64_t c = alloc((int)n);
+        if (stats && top_decls.count(&d)) {
+            Cand cd; cd.decl = &d; cd.cell = c; cd.size = n; cd.access = access_of(d.vtype, d.count, n); cd.name = d.name;
+            auto g = group_of.find(&d);
+            cd.group = g != group_of.end() ? g->second : nullptr;
+            add_cand(cd);
+        }
+        return c;
+    }
 
     // ---- cells ----------------------------------------------------------------------------
     int64_t alloc(int n) {
@@ -267,6 +356,7 @@ struct Gen {
         next_free += n;
         if (next_free > high) high = next_free;
         if (next_free > heap_lo) internal("variables collide with the heap");
+        if (next_free > upper_lo) internal("temporaries collide with the globals above them");
         for (int i = 0; i < n; i++) known[c + i] = 0;
         return c;
     }
@@ -298,18 +388,43 @@ struct Gen {
             set(from, 0);
             return;
         }
+        auto before = known;
         open(from);
         add(from, -1);
         for (Dst d : dsts) add(d.c, d.sign);
         close();
+        for (auto& kv : before)
+            if (kv.first != from && std::none_of(dsts.begin(), dsts.end(), [&](const Dst& d) { return d.c == kv.first; })) known.insert(kv);
     }
     // dst += sign*src, src preserved.
     void copy(int64_t from, int64_t dst, int sign = 1) {
         if (trackable(from)) if (auto k = known_val(from)) { add(dst, sign * *k); return; }
         int64_t t = tmp();
-        move(from, {{dst, sign}, {t, 1}});
-        move(t, {{from, 1}});
+        // The copy comes back through a cell next to from when there is one: a spare cell
+        // of a global array (zero between accesses).  The temporary is still taken, so
+        // the cells used do not depend on where things are.
+        int64_t s = spare_near(from, dst, t);
+        move(from, {{dst, sign}, {s, 1}});
+        move(s, {{from, 1}});
+        if (s != t) known[t] = 0;
         release(t);
+    }
+    // Spare cells: the header and each element's C and V cells of the arrays that live
+    // for the whole program, zero whenever no walk of that array is under way, and so
+    // between any two steps of code outside the walks (array_read, array_write, walk).
+    std::set<int64_t> spare;
+    void add_spares(int64_t base, int count, int s) {
+        int64_t K = stride(s);
+        for (int64_t k = 0; k <= count; k++) for (int64_t j = 0; j <= (k ? s : K - 1); j++) spare.insert(base + K * k + j);
+    }
+    int64_t spare_near(int64_t from, int64_t dst, int64_t t) {
+        if (spare.empty() || from < ram || !trackable(from) || spare.count(from) || spare.count(dst)) return t;
+        int64_t best = t;
+        auto it = spare.lower_bound(from);
+        auto consider = [&](int64_t c) { if (c != dst && std::llabs(c - from) < std::llabs(best - from)) best = c; };
+        if (it != spare.end()) consider(*it);
+        if (it != spare.begin()) consider(*std::prev(it));
+        return std::llabs(best - from) * 4 < std::llabs(t - from) ? best : t;
     }
     // body runs if z != 0; z is 0 afterwards.
     void if_nonzero(int64_t z, const std::function<void()>& body) {
@@ -338,6 +453,10 @@ struct Gen {
         out += "[-"; rep('>', D); out += ']';
         cur = P + k;
         if (P + k < next_free) internal("test_reg landing cell is in use");
+        // the landing cell must be zero: compile() places the globals above the
+        // temporaries and the heap above the highest one
+        land_hi = std::max(land_hi, P + k);
+        if ((plan && P + k >= upper_lo && P + k < upper_lo + plan->size) || P + k >= heap_lo) internal("test_reg lands on a variable");
         known.clear();
         clear(M);                   // still 1 on the taken path
         release(P); release(M);
@@ -1130,7 +1249,7 @@ struct Gen {
         std::unordered_map<int64_t, int> kept;
         int64_t base = next_free;
         for (auto& kv : known) {
-            if (kv.first >= base || (kv.first >= acc && kv.first < acc + n)) continue;
+            if ((kv.first >= base && kv.first < upper_lo) || (kv.first >= acc && kv.first < acc + n)) continue;
             bool w = false;
             if (h.written) for (auto& r : *h.written) if (kv.first >= r.first && kv.first < r.second) w = true;
             if (!w) kept.insert(kv);
@@ -1255,17 +1374,20 @@ struct Gen {
         if (e && n >= 2 && sz(*e) >= 2) wide_ops(*e, found);
         return found;
     }
-    // Does e read a variable the compiler knows the value of (a cell in vals)?  declared: the names declared
+    // Does e read a variable the compiler knows the value of (a cell in vals, or one declared by an earlier
+    // statement of the run with a constant and not written since: in consts)?  declared: the names declared
     // by earlier statements of the run, which have no cells yet.
-    bool reads_known(const Expr& e, const std::unordered_map<int64_t, int>& vals, const std::unordered_set<std::string>& declared) {
+    bool reads_known(const Expr& e, const std::unordered_map<int64_t, int>& vals, const std::unordered_set<std::string>& declared,
+                     const std::unordered_set<std::string>& consts) {
         if (e.kind == Expr::Name) {
+            if (consts.count(e.text)) return true;
             const Var* v = declared.count(e.text) ? nullptr : find_var(e.text);
             if (!v || v->is_const) return false;
             for (int64_t c = v->cell, end = c + (v->count >= 0 ? array_total(*v) : v->size()); c < end; c++)
                 if (vals.count(c)) return true;
             return false;
         }
-        return (e.a && reads_known(*e.a, vals, declared)) || (e.b && reads_known(*e.b, vals, declared));
+        return (e.a && reads_known(*e.a, vals, declared, consts)) || (e.b && reads_known(*e.b, vals, declared, consts));
     }
     // The variable whose cells an assignment to target writes, if the compiler can tell.
     const Var* target_var(const Expr& target) {
@@ -1290,14 +1412,14 @@ struct Gen {
         std::unordered_map<int64_t, int> saved;
         std::swap(saved, known);                       // the run's later statements see other values
         std::unordered_map<int64_t, int> vals = saved; // known before the run and not written by it so far
-        std::unordered_set<std::string> declared;
+        std::unordered_set<std::string> declared, consts;
         run_names = &declared;
         for (size_t j = i; j < v.size(); j++) {
             const Stmt& s = *v[j];
             if (!shareable_stmt(s)) break;
             Found f;
             for (const Expr* x : stmt_ops(s)) f.ops.emplace_back(x, *shared_kind(*x, sz(*x)));
-            if (std::any_of(f.ops.begin(), f.ops.end(), [&](auto& o) { return reads_known(*o.first, vals, declared); })) break;
+            if (std::any_of(f.ops.begin(), f.ops.end(), [&](auto& o) { return reads_known(*o.first, vals, declared, consts); })) break;
             if (!f.ops.empty()) {                      // are they all terms of the statement's sum?
                 Terms terms; int64_t c = 0;
                 collect_terms(*s.e, 1, terms, c, sz(*s.e));
@@ -1306,9 +1428,23 @@ struct Gen {
             }
             all.push_back(f);
             if (all.size() > (size_t)SHARE_GAP && std::all_of(all.end() - SHARE_GAP - 1, all.end(), [](auto& x) { return x.ops.empty(); })) break;
-            if (s.kind == Stmt::Decl) declared.insert(s.name);
-            else if (const Var* tv = target_var(*s.target)) {
+            if (s.kind == Stmt::Decl) {
+                declared.insert(s.name);
+                if (fold(*s.e)) consts.insert(s.name); else consts.erase(s.name);
+                continue;
+            }
+            const Expr* root = s.target.get();
+            while (root->kind == Expr::Index || (root->kind == Expr::Field && !root->arrow)) root = root->a.get();
+            // a plain variable set to a constant is known from here on
+            std::optional<int64_t> k = s.kind == Stmt::Assign && s.op == "=" && s.target->kind == Expr::Name ? fold(*s.e) : std::nullopt;
+            if (root->kind == Expr::Name && declared.count(root->text)) {
+                if (k) consts.insert(root->text); else consts.erase(root->text);
+                continue;
+            }
+            if (const Var* tv = target_var(*s.target)) {
                 for (int64_t c = tv->cell, end = c + (tv->count >= 0 ? array_total(*tv) : tv->size()); c < end; c++) vals.erase(c);
+                if (k && tv->count < 0 && !tv->is_const && tv->type && tv->type->is_scalar())
+                    for (int b = 0; b < tv->size(); b++) vals[tv->cell + b] = (int)((*k >> (8 * b)) & 255);
             } else vals.clear();                       // through a pointer: it could be anything
         }
         std::swap(saved, known);
@@ -1345,7 +1481,7 @@ struct Gen {
             if (scopes.size() == 1 && call_stack.empty()) place_group(d);
             if (prealloc.count(&d)) continue;
             Var tv; tv.type = d.vtype; tv.count = d.count;
-            prealloc[&d] = alloc(tv.size());
+            prealloc[&d] = decl_cells(d, tv.size());
         }
         std::vector<SharedOp> flat;
         std::vector<size_t> stmt_of, slot_of;          // statement (index in ops) and cells slot of each operation
@@ -1384,7 +1520,7 @@ struct Gen {
         auto known_at = [&](size_t j) {
             for (auto& kv : before) {
                 int64_t c = kv.first;
-                if (c >= acc || (c >= H && c < H_end)) continue;
+                if ((c >= acc && c < upper_lo) || (c >= H && c < H_end)) continue;
                 bool w = false;
                 for (size_t e = 0; e < j && !w; e++) for (auto& r : writes[e]) if (c >= r.first && c < r.second) w = true;
                 if (!w) known.insert(kv);
@@ -2339,12 +2475,54 @@ struct Gen {
     static bool has_exit(const std::vector<StmtP>& v) { for (auto& x : v) if (may_exit(*x)) return true; return false; }
 
     // ---- statements -------------------------------------------------------------------------------------------
+    // Does a shared run pay?  A dry pass generates it both ways and keeps the smaller (in commands, counting
+    // the moves it leaves out); the last pass takes the choices of the dry pass before it in the same order,
+    // so that both generate the same code but for the placement.
+    std::vector<char> run_choices;
+    size_t run_choice_at = 0;
+    bool choosing = false;              // making the choices (else following run_choices)
+    bool run_pays(const std::vector<StmtP>& v, size_t i, size_t len, const SharedKind& kd, const std::vector<std::vector<const Expr*>>& ops) {
+        if (!choosing) {
+            if (run_choice_at >= run_choices.size()) internal("shared run choices out of step");
+            return run_choices[run_choice_at++] != 0;
+        }
+        struct Saved {
+            size_t out, stmts, symbols, names; int64_t cur, next_free, high, dry_moves, land_hi; double heap_trips;
+            std::unordered_map<int64_t, int> known; std::unordered_map<const Stmt*, int64_t> prealloc;
+            std::unordered_map<const Expr*, int64_t> precomputed; bool cont;
+            std::unordered_map<const Stmt*, std::shared_ptr<std::vector<const Stmt*>>> layout_group;
+            std::vector<Cand> cands; std::vector<int> cand_at;
+        } sv{out.size(), res.stmts.size(), res.symbols.size(), scopes.back().order.size(), cur, next_free, high, dry_moves, land_hi,
+             heap_trips, known, prealloc, precomputed, next_is_cont, layout_group, cands, cand_at};
+        auto cost = [&] {
+            int64_t c = dry_moves - sv.dry_moves;
+            for (size_t k = sv.out; k < out.size(); k++) if (strchr("<>+-[].,", out[k])) c++;
+            return c;
+        };
+        auto restore = [&] {
+            out.resize(sv.out); res.stmts.resize(sv.stmts); res.symbols.resize(sv.symbols);
+            Scope& sc = scopes.back();
+            while (sc.order.size() > sv.names) { sc.vars.erase(sc.order.back()); sc.order.pop_back(); }
+            cur = sv.cur; next_free = sv.next_free; high = sv.high; dry_moves = sv.dry_moves; land_hi = sv.land_hi;
+            heap_trips = sv.heap_trips; known = sv.known; prealloc = sv.prealloc; precomputed = sv.precomputed;
+            next_is_cont = sv.cont; layout_group = sv.layout_group; cands = sv.cands; cand_at = sv.cand_at;
+        };
+        gen_run(v, i, len, kd, ops);
+        int64_t shared = cost();
+        restore();
+        for (size_t j = i; j < i + len; j++) gen_stmt(*v[j]);
+        int64_t plain = cost();
+        restore();
+        if (getenv("BFL_PLAN_DEBUG")) fprintf(stderr, "run at line %d: shared %lld, plain %lld\n", v[i]->pos.line, (long long)shared, (long long)plain);
+        run_choices.push_back(shared <= plain);
+        return shared <= plain;
+    }
     std::unordered_map<const Stmt*, int64_t> prealloc;     // cells reserved for declarations after an early exit
     void gen_stmts(const std::vector<StmtP>& v, size_t from = 0) {
         for (size_t i = from; i < v.size(); i++) {
             SharedKind kd;
             std::vector<std::vector<const Expr*>> ops;
-            if (size_t len = find_run(v, i, kd, ops)) { gen_run(v, i, len, kd, ops); i += len - 1; continue; }
+            if (size_t len = find_run(v, i, kd, ops); len && run_pays(v, i, len, kd, ops)) { gen_run(v, i, len, kd, ops); i += len - 1; continue; }
             gen_stmt(*v[i]);
             if (i + 1 < v.size() && !ctxs.empty() && ctxs.back().needs && may_exit(*v[i])) {
                 // the rest runs only while the context is alive; its variables belong to
@@ -2353,7 +2531,7 @@ struct Gen {
                     const Stmt& d = *v[j];
                     if (d.kind != Stmt::Decl || d.in_heap || prealloc.count(&d)) continue;
                     Var tv; tv.type = d.vtype; tv.count = d.count;
-                    prealloc[&d] = alloc((int)(d.count >= 0 ? array_total(tv) : tv.size()));
+                    prealloc[&d] = decl_cells(d, d.count >= 0 ? array_total(tv) : tv.size());
                 }
                 int64_t t = tmp();
                 copy(ctxs.back().alive, t);
@@ -2505,12 +2683,15 @@ struct Gen {
         if (scopes.size() == 1 && call_stack.empty()) place_group(s);
         auto pre = prealloc.find(&s);
         if (s.count >= 0) {
-            v.cell = pre != prealloc.end() ? pre->second : alloc((int)array_total(v));
+            v.cell = pre != prealloc.end() ? pre->second : decl_cells(s, array_total(v));
             if (pre != prealloc.end()) prealloc.erase(pre);
         } else {
             int n = v.size();
-            v.cell = pre != prealloc.end() ? pre->second : alloc(n);
-            if (pre != prealloc.end()) prealloc.erase(pre);
+            v.cell = pre != prealloc.end() ? pre->second : decl_cells(s, n);
+            if (pre != prealloc.end()) {               // reserved earlier and untouched since: still zero
+                prealloc.erase(pre);
+                for (int b = 0; b < n; b++) if (trackable(v.cell + b)) known[v.cell + b] = 0;
+            }
             if (s.e) {
                 auto k = v.type->is_scalar() ? fold(*s.e) : std::nullopt;
                 if (k) for (int b = 0; b < n; b++) add(v.cell + b, (*k >> (8 * b)) & 255);
@@ -3615,7 +3796,8 @@ struct Gen {
     // procedures that can never be active at once (neither can lead to the other)
     // share cells; the main program's frame is live throughout.  Within a frame the
     // variables are ordered by references per cell, the densest highest, next to the
-    // temporaries (as layout_globals does for inlined code).
+    // temporaries (as layout_globals does for inlined code); main's frame follows the
+    // plan when there is one, and its variables planned above the temporaries leave it.
     void place_frames(const Program& prog) {
         size_t n = tprocs.size();
         std::vector<std::unordered_map<std::string, double>> refs(n);
@@ -3638,6 +3820,14 @@ struct Gen {
             if (tp->ret) slots[i].push_back({nullptr, &tp->retval, std::max(tp->ret->size, 1), 1e9});
             if (!tp->is_main() && !tp->reentrant) slots[i].push_back({nullptr, &tp->ret_cell, state_n, 1e9});
             std::stable_sort(slots[i].begin(), slots[i].end(), [](const Slot& a, const Slot& b) { return a.density < b.density; });
+            if (!i && plan && !plan->frame_rank.empty()) {     // main's frame in the plan's order
+                auto rank = [&](const Slot& sl) -> int64_t {
+                    if (!sl.v) return INT64_MAX;
+                    auto it = plan->frame_rank.find((int)(sl.v - tp->frame.data()));
+                    return it == plan->frame_rank.end() ? INT64_MAX : it->second;
+                };
+                std::stable_sort(slots[i].begin(), slots[i].end(), [&](const Slot& a, const Slot& b) { return rank(a) < rank(b); });
+            }
             for (const Slot& sl : slots[i]) size[i] += sl.size;
         }
         // Like a call stack: callers before callees (cycles in any order), each frame
@@ -3664,12 +3854,34 @@ struct Gen {
             placed[pick] = true;
             extent = std::max(extent, o + size[pick]);
         }
+        // main's variables chosen to go above the temporaries leave its frame
+        auto up = [&](size_t i, const Slot& sl) -> const int64_t* {
+            if (i || !plan || !sl.v) return nullptr;
+            auto it = plan->frame_up.find((int)(sl.v - tprocs[0]->frame.data()));
+            return it == plan->frame_up.end() ? nullptr : &it->second;
+        };
+        int64_t moved = 0;
+        for (const Slot& sl : slots[0]) if (up(0, sl)) moved += sl.size;
+        size[0] -= moved;
+        for (size_t i = 1; i < n; i++) off[i] -= moved;
+        extent -= moved;
         int64_t base = alloc((int)extent);
         for (size_t i = 0; i < n; i++) {
             tprocs[i]->frame_hi = base + off[i] + size[i];
             int64_t c = base + off[i];
-            for (const Slot& sl : slots[i]) { *sl.where = c; c += sl.size; }
+            for (const Slot& sl : slots[i]) {
+                if (const int64_t* o = up(i, sl)) { *sl.where = upper_cells(*o, sl.size); continue; }
+                *sl.where = c;
+                if (stats && !i && sl.v && opt.layout) {
+                    Cand cd; cd.frame_idx = (int)(sl.v - tprocs[0]->frame.data()); cd.cell = c; cd.size = sl.size;
+                    cd.access = access_of(sl.v->type, sl.v->count, sl.size);
+                    cd.group = tprocs[0].get(); cd.name = sl.v->name;
+                    add_cand(cd);
+                }
+                c += sl.size;
+            }
             TProc* tp = tprocs[i].get();
+            if (tp->is_main()) for (Var& v : tp->frame) if (v.cell_array() && !v.arr_ptr) add_spares(v.cell, v.count, v.size());
             for (Var& v : tp->frame)
                 if (v.name.rfind("__h", 0) != 0) add_symbol(tp->is_main() ? v.name : tp->name + "." + v.name, v.cell, v.type, v.count, "");
         }
@@ -3693,7 +3905,7 @@ struct Gen {
         if (blocks.size() > 65000) fail(Pos{}, "too many trampoline blocks (" + std::to_string(blocks.size()) + ")");
 
         sp_n = stack_size > 256 ? 2 : 1;
-        if (sp_n == 1) stack_base = alloc((int)array_cells(stack_size));   // the save stack, lowest so variables stay close together
+        if (sp_n == 1) { stack_base = alloc((int)array_cells(stack_size)); add_spares(stack_base, stack_size, 1); }   // the save stack, lowest so variables stay close together
         else stack_e0 = alloc((int)((int64_t)HK * (HOP + stack_size))) + (int64_t)HK * HOP;
         state_cell = alloc(state_n); alive_cell = alloc(1); sp_cell = alloc(sp_n);
         int64_t run_cell = state_n == 2 ? alloc(1) : -1;
@@ -3760,10 +3972,12 @@ struct Gen {
     // ---- layout of the global variables ---------------------------------------------------------------
     // Brainfuck reaches a cell by stepping the pointer, and temporaries live just
     // above the last variable, so the cost of a variable is roughly how often code
-    // refers to it times its distance from the top.  The globals are laid out before
-    // any code is generated: each is counted once per reference, a procedure's body
-    // once per inlined call, and they are placed by references per cell, the densest
-    // nearest the top (which minimises the total distance: Smith's rule).
+    // refers to it times its distance from the top.  For the measuring pass the globals
+    // are laid out before any code is generated: each is counted once per reference, a
+    // procedure's body once per inlined call, and they are placed by references per
+    // cell, the densest nearest the top (which minimises the total distance: Smith's
+    // rule).  The passes after it follow the plan made from the trips it measured
+    // (plan_globals), in the same groups.
     void count_refs(const Expr& e, double w, std::unordered_map<std::string, double>& refs,
                     std::unordered_map<std::string, double>& calls, const std::unordered_set<std::string>& shadow) {
         if ((e.kind == Expr::Name) && !shadow.count(e.text)) refs[e.text] += w;
@@ -3846,7 +4060,7 @@ struct Gen {
                     };
                     return density(a) < density(b);
                 });
-                for (const Stmt* d : group) layout_group[d] = g;
+                for (const Stmt* d : group) { layout_group[d] = g; group_of[d] = g.get(); }
             }
             group.clear();
         };
@@ -3866,12 +4080,16 @@ struct Gen {
     void place_group(const Stmt& s) {
         auto it = layout_group.find(&s);
         if (it == layout_group.end()) return;
-        auto g = it->second;
-        for (const Stmt* d : *g) {
+        std::vector<const Stmt*> g = *it->second;
+        if (plan && !plan->decl_rank.empty()) {      // in the plan's order
+            auto rank = [&](const Stmt* d) { auto r = plan->decl_rank.find(d); return r == plan->decl_rank.end() ? INT64_MAX : r->second; };
+            std::stable_sort(g.begin(), g.end(), [&](const Stmt* a, const Stmt* b) { return rank(a) < rank(b); });
+        }
+        for (const Stmt* d : g) {
             layout_group.erase(d);
             if (prealloc.count(d)) continue;
             Var tv; tv.type = d->vtype; tv.count = d->count;
-            prealloc[d] = alloc((int)(d->count >= 0 ? array_total(tv) : tv.size()));
+            prealloc[d] = decl_cells(*d, d->count >= 0 ? array_total(tv) : tv.size());
         }
     }
 
@@ -3880,8 +4098,9 @@ struct Gen {
         register_procs(prog, false);
         out += "# compiled by bfl\n";
         heap_init();
-        if (sr && sr->main_tramp) { gen_trampoline(prog); res.cells_used = high - ram; return; }
+        if (sr && sr->main_tramp) { gen_trampoline(prog); res.cells_used = cells_end() - ram; return; }
         if (opt.layout) layout_globals(prog);
+        for (auto& s : prog.items) if (s->kind == Stmt::Decl && !s->in_heap) top_decls.insert(s.get());
         push_scope(true);
         ExitCtx mc; mc.kind = ExitCtx::Proc; mc.needs = contains_return(prog.items);
         if (mc.needs) { mc.alive = tmp(); set(mc.alive, 1); }
@@ -3889,9 +4108,107 @@ struct Gen {
         gen_stmts(prog.items);
         ctxs.pop_back();
         pop_scope();
-        res.cells_used = high - ram;
+        res.cells_used = cells_end() - ram;
     }
 };
+
+// The plan for the globals (Gen::Plan), from the measuring pass: each candidate's trips
+// and the mean cell their other ends are at (its uses' height), and hw, the temporaries'
+// high-water mark.  A trip to a global left below costs the distance down to it: from
+// the height to the top of its group, the sizes of the globals of the group placed
+// nearer the top, and the part of itself below the cell a use reaches, less the sizes of
+// globals of higher groups that moved up.  A trip to one above costs the distance up to
+// hw plus the sizes placed before it there.  Each side is in Smith's order (trips per
+// cell, the busiest nearest the temporaries), and every trip into the heap gets longer
+// by the size of the region above.  Starting from everything below, single moves either
+// way are made while they lower the estimate; the plan is used when it beats the
+// measuring pass's own layout.
+Gen::Plan plan_globals(const std::vector<Gen::Cand>& cs, int64_t hw, double heap_trips) {
+    size_t n = cs.size();
+    Gen::Plan plan;
+    if (!n) return plan;
+    auto height = [&](size_t i) { return cs[i].trips > 0 ? cs[i].from / cs[i].trips : (double)hw; };
+    auto per_cell = [&](size_t i) { return cs[i].trips / (double)std::max<int64_t>(cs[i].size, 1); };
+    // groups, highest first; the members of each by Smith's order
+    std::map<const void*, std::vector<size_t>> by_group;
+    std::vector<std::vector<size_t>> groups;
+    for (size_t i = 0; i < n; i++) {
+        if (cs[i].group) by_group[cs[i].group].push_back(i);
+        else groups.push_back({i});
+    }
+    for (auto& kv : by_group) groups.push_back(kv.second);
+    std::vector<int64_t> top(groups.size(), 0);
+    for (size_t g = 0; g < groups.size(); g++) {
+        for (size_t i : groups[g]) top[g] = std::max(top[g], cs[i].cell + cs[i].size);
+        std::stable_sort(groups[g].begin(), groups[g].end(), [&](size_t a, size_t b) {
+            if (per_cell(a) != per_cell(b)) return per_cell(a) > per_cell(b);
+            return cs[a].cell > cs[b].cell;
+        });
+    }
+    std::vector<size_t> gorder(groups.size());
+    for (size_t g = 0; g < groups.size(); g++) gorder[g] = g;
+    std::sort(gorder.begin(), gorder.end(), [&](size_t a, size_t b) { return top[a] > top[b]; });
+    std::vector<size_t> rise(n);                         // the order above
+    for (size_t i = 0; i < n; i++) rise[i] = i;
+    std::stable_sort(rise.begin(), rise.end(), [&](size_t a, size_t b) { return per_cell(a) > per_cell(b); });
+    auto cost = [&](const std::vector<bool>& is_up) {
+        double total = 0, removed = 0, placed = 0;
+        for (size_t g : gorder) {
+            double nearer = 0, gone = 0;
+            for (size_t i : groups[g]) {
+                const Gen::Cand& c = cs[i];
+                if (is_up[i]) { gone += (double)c.size; continue; }
+                double h = height(i), at = (double)(c.cell + c.access);
+                if (h > at) total += c.trips * std::max(h - (double)top[g] + nearer + (double)(c.size - c.access) - removed, 0.0);
+                else total += c.trips * (at - h);
+                nearer += (double)c.size;
+            }
+            removed += gone;
+        }
+        for (size_t i : rise) {
+            if (!is_up[i]) continue;
+            const Gen::Cand& c = cs[i];
+            total += c.trips * ((double)hw - height(i) + placed + (double)c.access);
+            placed += (double)c.size;
+        }
+        return total + heap_trips * placed;
+    };
+    double start = 0;                                    // the measuring pass's layout
+    for (size_t i = 0; i < n; i++) start += cs[i].trips * std::abs(height(i) - (double)(cs[i].cell + cs[i].access));
+    std::vector<bool> is_up(n, false);
+    double best = cost(is_up);
+    for (int round = 0; round < 50; round++) {
+        bool better = false;
+        for (size_t i : rise) {
+            is_up[i] = !is_up[i];
+            double c = cost(is_up);
+            if (c < best - 1e-9) { best = c; better = true; }
+            else is_up[i] = !is_up[i];
+        }
+        if (!better) break;
+    }
+    if (getenv("BFL_PLAN_DEBUG")) {
+        fprintf(stderr, "hw %lld heap trips %.0f, estimate %.0f -> %.0f\n", (long long)hw, heap_trips, start, best);
+        for (size_t g : gorder) for (size_t i : groups[g])
+            fprintf(stderr, "  %s %-12s cell %lld size %lld trips %.0f height %.1f\n", is_up[i] ? "UP" : "  ",
+                    cs[i].name.c_str(), (long long)cs[i].cell, (long long)cs[i].size, cs[i].trips, height(i));
+    }
+    if (best >= start) return plan;
+    for (size_t i : rise) {
+        if (!is_up[i]) continue;
+        const Gen::Cand& c = cs[i];
+        if (c.decl) plan.decl_up[c.decl] = plan.size; else plan.frame_up[c.frame_idx] = plan.size;
+        plan.size += c.size;
+    }
+    for (auto& grp : groups) {                           // allocation order: the farthest first
+        int64_t r = 0;
+        for (size_t k = grp.size(); k-- > 0;) {
+            const Gen::Cand& c = cs[grp[k]];
+            if (c.decl) plan.decl_rank[c.decl] = r++; else plan.frame_rank[c.frame_idx] = r++;
+        }
+    }
+    return plan;
+}
 
 } // namespace
 
@@ -3967,50 +4284,95 @@ struct Importer {
 Result compile(const std::string& source, uint32_t ram_start, const Options& opt) {
     namespace fs = std::filesystem;
     Result res;
-    std::vector<std::string> texts{source};
-    res.files.push_back(opt.file_name.empty() ? "<source>" : opt.file_name);
-    auto err = [&](const Pos& p, const std::string& m) { res.errors.push_back(Error{p.line, p.col, m, p.file}); };
-    std::vector<ParseError> perr;
-    Program prog = parse(source, 0, perr);
-    Importer imp{res.files, texts, {}, {}, {}, perr};
-    {
-        std::error_code ec;
-        fs::path mp(opt.file_name);
-        imp.dirs.push_back(!opt.file_name.empty() && fs::is_regular_file(mp, ec) ? mp.parent_path().string() : std::string());
-        if (imp.dirs[0].empty() && !opt.file_name.empty() && opt.file_name[0] != '<') imp.dirs[0] = ".";
-    }
-    imp.expand(prog, 0);
-    res.sources = texts;
-    for (const ParseError& e : perr) err(e.pos, e.msg);
-    if (!res.errors.empty()) return res;
-    Types types;
-    Program prelude;
-    try {
-        const char* pt = stdlib_text("prelude.bfl");
-        if (!pt) throw ParseError{Pos{}, "prelude.bfl is missing from the standard library"};
-        prelude = parse(pt, -1);
-    } catch (const ParseError& e) {
-        err(Pos{}, "internal compiler error in the prelude: " + e.msg);
-        return res;
-    }
-    SemaResult sr = analyse(prelude, prog, types, current_features(), opt.warnings, imp.libs, res.files);
-    auto by_pos = [](const Diag& a, const Diag& b) {
-        if (a.pos.file != b.pos.file) return a.pos.file < b.pos.file;
-        return a.pos.line != b.pos.line ? a.pos.line < b.pos.line : a.pos.col < b.pos.col;
+    std::vector<std::string> texts;
+    Program prog, prelude;
+    std::unique_ptr<Types> types;
+    SemaResult sr;
+    // The front end: parse with the imports, the prelude, the semantic pass.  false on errors (in res).
+    auto front = [&](const StringPlaces* places) {
+        res = Result{};
+        texts = {source};
+        res.files.push_back(opt.file_name.empty() ? "<source>" : opt.file_name);
+        auto err = [&](const Pos& p, const std::string& m) { res.errors.push_back(Error{p.line, p.col, m, p.file}); };
+        std::vector<ParseError> perr;
+        prog = parse(source, 0, perr);
+        Importer imp{res.files, texts, {}, {}, {}, perr};
+        {
+            std::error_code ec;
+            fs::path mp(opt.file_name);
+            imp.dirs.push_back(!opt.file_name.empty() && fs::is_regular_file(mp, ec) ? mp.parent_path().string() : std::string());
+            if (imp.dirs[0].empty() && !opt.file_name.empty() && opt.file_name[0] != '<') imp.dirs[0] = ".";
+        }
+        imp.expand(prog, 0);
+        res.sources = texts;
+        for (const ParseError& e : perr) err(e.pos, e.msg);
+        if (!res.errors.empty()) return false;
+        types = std::make_unique<Types>();
+        try {
+            const char* pt = stdlib_text("prelude.bfl");
+            if (!pt) throw ParseError{Pos{}, "prelude.bfl is missing from the standard library"};
+            prelude = parse(pt, -1);
+        } catch (const ParseError& e) {
+            err(Pos{}, "internal compiler error in the prelude: " + e.msg);
+            return false;
+        }
+        sr = analyse(prelude, prog, *types, current_features(), opt.warnings, imp.libs, res.files, places);
+        auto by_pos = [](const Diag& a, const Diag& b) {
+            if (a.pos.file != b.pos.file) return a.pos.file < b.pos.file;
+            return a.pos.line != b.pos.line ? a.pos.line < b.pos.line : a.pos.col < b.pos.col;
+        };
+        std::stable_sort(sr.errors.begin(), sr.errors.end(), by_pos);
+        std::stable_sort(sr.warnings.begin(), sr.warnings.end(), by_pos);
+        for (const Diag& d : sr.errors) err(d.pos, d.msg);
+        for (const Diag& d : sr.warnings) res.warnings.push_back(Error{d.pos.line, d.pos.col, d.msg, d.pos.file});
+        return res.errors.empty();
     };
-    std::stable_sort(sr.errors.begin(), sr.errors.end(), by_pos);
-    std::stable_sort(sr.warnings.begin(), sr.warnings.end(), by_pos);
-    for (const Diag& d : sr.errors) err(d.pos, d.msg);
-    for (const Diag& d : sr.warnings) res.warnings.push_back(Error{d.pos.line, d.pos.col, d.msg, d.pos.file});
-    if (!res.errors.empty()) return res;
+    if (!front(nullptr)) return res;
+    // String literals take static heap space in the order they are met, so one after a
+    // large heap array sits far up the heap, and the start-up code that writes it
+    // (heap_init) walks there and back, as does every walk to it.  Then the front end
+    // runs again with the literals placed first, in the same order, and the heap arrays
+    // after them, as long as that moves no array more than a sixteenth further up (a
+    // walk takes as long as its address is high).
+    if (opt.layout && sr.uses_heap && !sr.heap_init.empty()) {
+        StringPlaces places;
+        int64_t a = 7, at = 7, after = 0;
+        bool moved = false, pays = true;
+        std::vector<std::pair<int64_t, std::string>> lits = sr.heap_init;
+        std::sort(lits.begin(), lits.end());
+        for (auto& l : lits) after += (int64_t)l.second.size();
+        for (auto& l : lits) {
+            if (l.first != a) moved = true;
+            if (l.first > at && after * 16 > l.first) pays = false;    // the arrays in [at, l.first) move up by after
+            at = l.first + (int64_t)l.second.size();
+            after -= (int64_t)l.second.size();
+            places.at[l.second.substr(0, l.second.size() - 1)] = a;
+            a += (int64_t)l.second.size();
+        }
+        moved = moved && pays;
+        places.arrays_from = a;
+        if (moved) {
+            int64_t end_before = sr.heap_static_end;
+            if (!front(&places) || sr.heap_static_end != end_before)
+                if (!front(nullptr)) return res;
+        }
+    }
 
-    // One pass without a heap, or two: the first finds how many cells the
-    // variables need, the second places the heap just above them.
-    auto generate = [&](int64_t heap_lo, bool dry) -> std::unique_ptr<Gen> {
+    // A measuring pass (dry: no long moves are written) finds how many cells the
+    // variables and temporaries need and counts the trips to each global, from which
+    // plan_globals orders them and picks those that go above the temporaries; then a
+    // second dry pass with the plan finds where the temporaries end, and the last pass
+    // places those globals just above them and the heap above both.
+    std::vector<char> choices;          // the shared-run choices for the last pass (Gen::run_pays)
+    // measuring: the first pass, which counts the trips (unless BFL_NO_LAYOUT); the dry passes make the
+    // shared-run choices (Gen::run_pays) and the last one follows those of the pass before it
+    auto generate = [&](int64_t heap_lo, bool dry, const Gen::Plan* up, int64_t up_lo, bool measuring) -> std::unique_ptr<Gen> {
         auto g = std::make_unique<Gen>(texts, ram_start);
-        g->T = &types; g->opt = opt; g->sr = &sr; g->dry = dry;
+        g->T = types.get(); g->opt = opt; g->sr = &sr; g->dry = dry;
         g->file_names = res.files;
         g->prelude = std::move(prelude);
+        g->plan = up; g->upper_lo = up ? up_lo : INT64_MAX; g->stats = measuring && opt.layout;
+        g->choosing = dry; g->run_choices = choices;
         if (heap_lo != INT64_MAX) {
             g->heap_lo = heap_lo;
             g->heap_elem0 = heap_lo + (int64_t)HOP * HK;
@@ -4024,19 +4386,43 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
         prelude = std::move(g->prelude);
         return g;
     };
-    std::unique_ptr<Gen> g;
-    if (sr.uses_heap) {
-        auto g1 = generate((int64_t)ram_start + ((int64_t)1 << 30), true);
-        if (!g1->res.errors.empty()) g = std::move(g1);
-        else {
-            int64_t lo = g1->high + 16;
-            g = generate(lo, false);
-            if (g->res.errors.empty() && g->high != g1->high) g->res.errors.push_back(Error{0, 0, "internal compiler error: heap placement changed the layout", 0});
-            g->res.cells_used = g->high - (int64_t)ram_start + 16 + (int64_t)HK * (HOP + sr.heap_size);
-            g->res.heap_cell = g->heap_elem0;
-            g->res.heap_size = sr.heap_size;
+    const int64_t far_heap = (int64_t)ram_start + ((int64_t)1 << 30), far_upper = (int64_t)ram_start + ((int64_t)1 << 29);
+    // the last pass: the region (if any) at up_lo, high the temporaries' end it must reproduce
+    // the last pass: the region above (if any) and the heap above the measuring pass m's
+    // temporaries and test_reg's landing cells, which must be zero
+    auto place = [&](const Gen::Plan* up, const Gen& m) -> std::unique_ptr<Gen> {
+        int64_t up_lo = std::max(m.high, m.land_hi + 1), top = up ? up_lo + up->size : m.high;
+        if (!sr.uses_heap) {
+            auto g = generate(INT64_MAX, false, up, up_lo, false);
+            if (g->res.errors.empty() && g->high != m.high) g->res.errors.push_back(Error{0, 0, "internal compiler error: placing the globals changed the layout", 0});
+            return g;
         }
-    } else g = generate(INT64_MAX, false);
+        top = std::max(top, m.land_hi + 1);
+        auto g = generate(top + 16, false, up, up_lo, false);
+        if (g->res.errors.empty() && g->high != m.high) g->res.errors.push_back(Error{0, 0, "internal compiler error: heap placement changed the layout", 0});
+        g->res.cells_used = top - (int64_t)ram_start + 16 + (int64_t)HK * (HOP + sr.heap_size);
+        g->res.heap_cell = g->heap_elem0;
+        g->res.heap_size = sr.heap_size;
+        return g;
+    };
+    std::unique_ptr<Gen> g;
+    auto g1 = generate(sr.uses_heap ? far_heap : INT64_MAX, true, nullptr, 0, true);
+    if (!g1->res.errors.empty()) g = std::move(g1);
+    else {
+        choices = g1->run_choices;
+        Gen::Plan up = plan_globals(g1->cands, std::max(g1->high, g1->land_hi + 1), g1->heap_trips);
+        if (up.decl_rank.empty() && up.frame_rank.empty()) g = place(nullptr, *g1);
+        else {
+            choices.clear();                            // the choices again, with the plan in place
+            auto g2 = generate(sr.uses_heap ? far_heap : INT64_MAX, true, &up, far_upper, false);
+            if (!g2->res.errors.empty()) g = std::move(g2);
+            else if (g2->dry_commands() >= g1->dry_commands()) {    // the plan does not pay after all
+                choices = g1->run_choices;
+                g = place(nullptr, *g1);
+            }
+            else { choices = g2->run_choices; g = place(&up, *g2); }
+        }
+    }
     Result outr = std::move(g->res);
     outr.files = res.files;
     outr.sources = res.sources;
