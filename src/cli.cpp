@@ -2,6 +2,7 @@
 #include "bf.h"
 #include "devices.h"
 #include "hw.h"
+#include "profile.h"
 #include "registers.h"
 #include "lang/lang.h"
 #define WIN32_LEAN_AND_MEAN
@@ -11,8 +12,6 @@
 #include <io.h>
 #include <cstdio>
 #include <cstring>
-#include <algorithm>
-#include <map>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -99,61 +98,20 @@ void usage() {
 // --profile: instructions executed per BFL statement (innermost statement only), or
 // per brainfuck byte offset of the instruction for plain brainfuck.
 void report_profile(const Program& prog, const std::vector<uint64_t>& counts, const bfl::Result* lr) {
-    uint64_t total = 0;
-    for (uint64_t n : counts) total += n;
+    uint64_t total = profile_total(counts);
     fprintf(stderr, "\nprofile: %llu IR instructions executed\n", (unsigned long long)total);
     if (!total) return;
-    {
-        static const char* names[] = {"ADD", "SET", "MUL", "MOVE", "OUT", "IN", "JZ", "JNZ", "ENDIF", "SCAN", "IDIOM", "LOOPX", "END"};
-        uint64_t per[16] = {};
-        for (size_t pc = 0; pc < counts.size(); pc++) per[prog.code[pc].op] += counts[pc];
-        fprintf(stderr, "by kind:");
-        for (int k = 0; k <= END; k++) if (per[k]) fprintf(stderr, " %s %.1f%%", names[k], 100.0 * (double)per[k] / (double)total);
-        fprintf(stderr, "\n");
-    }
-    std::map<std::pair<int, int>, uint64_t> by;          // (file, line) or (-1, source offset)
-    std::vector<int> parent;
-    if (lr) {
-        std::vector<int> st;
-        for (size_t i = 0; i < lr->stmts.size(); i++) {
-            while (!st.empty() && lr->stmts[(size_t)st.back()].end <= lr->stmts[i].start) st.pop_back();
-            parent.push_back(st.empty() ? -1 : st.back());
-            st.push_back((int)i);
-        }
-    }
-    for (size_t pc = 0; pc < counts.size(); pc++) {
-        if (!counts[pc]) continue;
-        int32_t off = prog.code[pc].src;
-        if (!lr) { by[{-1, off}] += counts[pc]; continue; }
-        auto it = std::upper_bound(lr->stmts.begin(), lr->stmts.end(), off,
-                                   [](int32_t o, const bfl::StmtRange& r) { return o < r.start; });
-        int k = (int)(it - lr->stmts.begin()) - 1;
-        while (k >= 0 && lr->stmts[(size_t)k].end <= off) k = parent[(size_t)k];
-        if (k < 0) { by[{-1, -1}] += counts[pc]; continue; }
-        by[{lr->stmts[(size_t)k].file, lr->stmts[(size_t)k].line}] += counts[pc];
-    }
-    std::vector<std::pair<uint64_t, std::pair<int, int>>> rows;
-    for (auto& kv : by) rows.push_back({kv.second, kv.first});
-    std::sort(rows.rbegin(), rows.rend());
+    fprintf(stderr, "by kind: %s\n", profile_by_kind(prog, counts).c_str());
+    std::vector<ProfileRow> rows = profile_rows(prog, counts, lr);
     for (size_t i = 0; i < rows.size() && i < 30; i++) {
-        auto [n, key] = rows[i];
+        const ProfileRow& row = rows[i];
         std::string where, text;
-        if (key.first < 0) where = key.second < 0 ? "(outside statements)" : "byte " + std::to_string(key.second);
+        if (row.file < 0) where = row.line < 0 ? "(outside statements)" : "byte " + std::to_string(row.line);
         else {
-            where = (key.first > 0 ? lr->files[(size_t)key.first] + ":" : std::string()) + std::to_string(key.second);
-            const std::string& s = lr->sources[(size_t)key.first];
-            size_t a = 0;
-            for (int l = 1; l < key.second && a != std::string::npos; l++) { a = s.find('\n', a); if (a != std::string::npos) a++; }
-            if (a != std::string::npos) {
-                size_t b = s.find('\n', a);
-                text = s.substr(a, b == std::string::npos ? std::string::npos : b - a);
-                size_t f = text.find_first_not_of(" \t");
-                text = f == std::string::npos ? "" : text.substr(f);
-                if (!text.empty() && text.back() == '\r') text.pop_back();
-                if (text.size() > 70) text = text.substr(0, 67) + "...";
-            }
+            where = (row.file > 0 ? lr->files[(size_t)row.file] + ":" : std::string()) + std::to_string(row.line);
+            text = profile_line_text(*lr, row.file, row.line);
         }
-        fprintf(stderr, "%14llu %5.1f%%  %-12s %s\n", (unsigned long long)n, 100.0 * (double)n / (double)total, where.c_str(), text.c_str());
+        fprintf(stderr, "%14llu %5.1f%%  %-12s %s\n", (unsigned long long)row.count, 100.0 * (double)row.count / (double)total, where.c_str(), text.c_str());
     }
 }
 

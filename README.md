@@ -69,6 +69,19 @@ Debug sessions run on the interpreter with one IR instruction per source command
 they are much slower than a normal run; use them for logic, not for timing.
 The API behind this is `bf::Debugger` in `src/bf.h`.
 
+### Profiler
+
+Run > Profile (Ctrl+P) runs the editor contents on the interpreter and counts the IR
+instructions executed for each source line: for BFL, the innermost statement that starts
+on the line, the same attribution as `bf --profile` (`src/profile.h` is shared by both).
+When the program ends, or Shift+F5 stops one that runs forever, a gutter at the left of
+the editor colours each line by its share of all instructions (pale yellow to red) and
+prints the percentage, and the pane under the editor lists the lines that executed the
+most with their counts; double-click a row to go to the line. For a multi-file program the
+File box shows each file's share and an imported file picked there has the gutter too.
+For plain brainfuck the list gives each instruction's line and column. The next edit or
+run clears the profile.
+
 ## BFL: a language that compiles to brainfuck
 
 Writing device drivers by counting `<` is tedious, so there is a small unsigned
@@ -227,6 +240,7 @@ src/interp.cpp  IR interpreter: reference executor and the JIT's slow path
 src/machine.cpp tape, device bus, run loop, stop and fault handling
 src/devices.h   the standard devices above
 src/registers.h the register table: memory map, access, kind (single source of truth)
+src/profile.h   profile counts per BFL line or brainfuck offset (bf --profile, Run > Profile)
 src/lang/       the BFL compiler: parse.cpp (lexer, parser), sema.cpp (types and checks),
                 codegen.cpp (brainfuck emitter)
 lib/            the BFL standard library, embedded into the executables at build time

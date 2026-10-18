@@ -422,7 +422,7 @@ multi-byte `+` and `-`, halving (shifts, bitwise operators) and byte division
 each run as one step (`src/ir.cpp`, "loop idioms"). Measured in IR instructions
 executed, a 32-bit `+` is about 40, `<` about 120, `*` about 2 400 and `/` about
 7 000, against 10 000, 2 300, 129 000 and 108 000 without those idioms.
-`bf --profile` shows where a program's instructions go, by statement. The compiler also tracks cells whose value it knows in straight-line
+`bf --profile` (Run > Profile in the UI) shows where a program's instructions go, by statement. The compiler also tracks cells whose value it knows in straight-line
 code: constants, string output and copies of known variables are emitted as the
 shortest delta, and expressions over known variables fold entirely.
 
