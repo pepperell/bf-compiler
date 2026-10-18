@@ -600,6 +600,7 @@ std::vector<int> stmts_on_line(int file, int line) {
 std::vector<int32_t> pcs_for_line(int file, int line) {
     std::vector<int32_t> v;
     for (int i : stmts_on_line(file, line)) {
+        if (app.lr.stmts[i].cont) continue;        // where the statement starts, not where it goes on
         int32_t pc = first_pc_in(app.lr.stmts[i].start, app.lr.stmts[i].end);
         if (pc >= 0) v.push_back(pc);
     }

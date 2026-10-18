@@ -9,9 +9,9 @@ Measures with out\\bf.exe of the tree it runs in (or the bf.exe given):
           runs a fixed number of frames without its delays and reads the TICKS clock
           around them; the minimum of 3 runs, since other work may share the CPU.
           Also the raytracers' light-map precompute
-  ops     IR instructions executed (bf --profile) by one statement doing a single
-          operation on values read with 'in', so nothing folds; also the brainfuck
-          commands the statement adds to the program
+  ops     IR instructions executed (bf --profile) by one line doing a single
+          operation on values read with 'in', so nothing folds, or a few that share
+          a routine; also the brainfuck commands the line adds to the program
 
 --json FILE writes the results; --compare FILE prints them next to an earlier --json
 file with the change. Takes under a minute.
@@ -137,7 +137,10 @@ OPS = [('long * long', 'lc = fa * fb;'),           # 5200 * 4181, Q12-sized as i
        ('mulshr(long, long, 12)', 'lc = mulshr(fa, fb, 12);'),   # the same, fused (exact product)
        ('(int * int) >> 7', 'ic = (ia * ib) >> 7;'),     # -10600 * 47 >> 7 (* wraps, mulshr does not)
        ('mulshr(int, int, 7)', 'ic = mulshr(ia, ib, 7);'),
-       ('byte / byte', 'bc = ba / bb;')]           # 200 / 17
+       ('byte / byte', 'bc = ba / bb;'),           # 200 / 17
+       # several operations of one kind share one copy of the routine (BFL_SHARE=0 turns that off)
+       ('3 long * in a sum', 'lc = fa * fb + la * ld - lb * fa;'),
+       ('3 mulshr in 2 statements', 'lc = mulshr(fa, fb, 12); lc = mulshr(lc, la, 12) - mulshr(lb, ld, 12);')]
 
 def profile_line(bf, path, line):
     """IR instructions bf --profile charges to the statement on line"""

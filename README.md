@@ -173,6 +173,19 @@ written it runs in linear time (850 000 commands for the benchmark's operands in
 byte. The raytracer's frame went from 65 to 58 ms (its light map from 158 to 89 ms) and
 its code to 4.80 M commands, and `raytracer_text.bfl` from 29.5 to 25 ms.
 
+**Shared arithmetic.** A 32-bit `*` or `mulshr` is about 11 000 commands of straight-line
+code, and most of the raytracer's size was hundreds of them inlined. When the terms of a
+sum, or a run of assignments without calls, use the same multiply, `mulshr`, `/` or `%`
+(same width and signedness) at least twice, the compiler emits the routine once inside a
+small loop that runs once per operation; a flag per operation picks the code that takes
+the result and loads the next operation's factors (docs/LANG.md, "Idioms used by the
+compiler"). There is no dispatcher and no frame, and the values the compiler knows survive
+the loop. Three `long` products in a sum are 15 000 commands instead of 34 500, for 1%
+more executed instructions. The raytracer's code went from 4.80 M to 4.06 M commands
+(`place_camera` from 1.15 M to 0.88 M) and `raytracer_text.bfl`'s from 4.31 M to 3.59 M;
+they execute 1.5% more IR instructions, yet with a third less machine code (3.1 MB of x64
+instead of 4.6 MB) their frames are faster, 54 ms instead of 58 and 23.5 instead of 25.
+
 ## Memory map
 
 Cells are 8-bit. The tape is `mmio_size` device cells followed by `ram_size` RAM cells.

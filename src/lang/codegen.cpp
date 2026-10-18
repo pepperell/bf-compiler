@@ -841,14 +841,17 @@ struct Gen {
     // values are multiplied as magnitudes; for a negative product the accumulator starts at 2^k - 1, so the
     // shift rounds the magnitude up and its negation is the floor.  The cells used every bit sit at the top.
     void mulshr(const Expr& ea, const Expr& eb, int k, const Type* t, int64_t dst) {
+        mulshr(k, t, dst, [&](int64_t a, int64_t b) { eval_into(ea, a, t); eval_into(eb, b, t); });
+    }
+    // the same with the factors put in a and b (n cells each, known zero) by load
+    void mulshr(int k, const Type* t, int64_t dst, const std::function<void(int64_t, int64_t)>& load) {
         int n = std::max(t->size, 1);
         bool sgn = t->is_signed;
         k = std::min(k, 16 * n);                      // floor(a * b / 2^16n) is already 0 or -1
         int q = k / 8, r = k % 8, W = n + q + (r ? 1 : 0);
         int64_t neg = sgn ? tmp() : -1, drops = q ? tmp() : -1;
         int64_t cb = tmp(), f = tmp(), b = tmpN(n), acc = tmpN(W), a = tmpN(n + 1);
-        eval_into(ea, a, t);
-        eval_into(eb, b, t);
+        load(a, b);
         if (sgn) {
             int64_t s = tmp(), c = tmp(), s2 = tmp();
             sign_flag(a + n - 1, s);
@@ -979,6 +982,316 @@ struct Gen {
         release(sb); release(sa);
     }
 
+    // ---- arithmetic shared within a block (docs/LANG.md, "Idioms used by the compiler") ------------------
+    // Several multiplies (or mulshr, divisions, remainders) of one kind and width run through one copy of the
+    // routine: a loop runs once per operation, and the code around the routine, chosen by a flag per
+    // operation, evaluates the next operation's factors into the routine's operand cells.  The first
+    // operation's factors are evaluated before the loop and whatever follows the last runs after it, both
+    // with the known cell values of straight-line code; the values known before the loop that it cannot
+    // change are known again after it.  Two places use it: the terms of one sum (shared_terms, from
+    // binary_wide) and a run of statements (find_run and gen_run, from gen_stmts).  Either shares a routine
+    // that would otherwise be emitted at least opt.share times (2 by default; 0 turns sharing off).
+    struct SharedKind {
+        char op = 0;                // '*', 'm' (mulshr), '/', '%'
+        int n = 0, k = 0;           // width; mulshr's shift count
+        bool sgn = false;
+        bool operator==(const SharedKind& o) const { return op == o.op && n == o.n && k == o.k && sgn == o.sgn; }
+    };
+    struct SharedOp { const Expr* e; int sign; };       // acc += sign * e
+    using Terms = std::vector<std::pair<const Expr*, int>>;
+    // Can evaluating e be moved to another place in its statement: no calls, input or registers?
+    // run_names: variables declared by earlier statements of a run being looked at (find_run).
+    std::unordered_set<std::string>* run_names = nullptr;
+    bool movable(const Expr& e) {
+        switch (e.kind) {
+        case Expr::Num: case Expr::Str: case Expr::Sizeof: case Expr::Null: return true;
+        case Expr::Name: return find_var(e.text) || (run_names && run_names->count(e.text));
+        case Expr::Index: case Expr::Binary: case Expr::MulShr: return movable(*e.a) && movable(*e.b);
+        case Expr::Field: case Expr::Deref: case Expr::AddrOf: case Expr::Unary: case Expr::Cast: return movable(*e.a);
+        default: return false;
+        }
+    }
+    // The routine e runs on as a term of an n-byte sum, if it is one that can be shared.
+    std::optional<SharedKind> shared_kind(const Expr& e, int n) {
+        if (!opt.share || n < 2 || sz(e) != n || !e.type || !e.type->is_int()) return std::nullopt;
+        if (!precomputed.empty() && precomputed.count(&e)) return std::nullopt;    // computed already (gen_run)
+        const Type* t = conv_type(e.type);
+        if (e.kind == Expr::MulShr) return SharedKind{'m', n, std::min((int)e.value, 16 * n), t->is_signed};
+        if (e.kind != Expr::Binary || !(e.text == "*" || e.text == "/" || e.text == "%")) return std::nullopt;
+        if (e.a->type->is_ptr() || e.b->type->is_ptr()) return std::nullopt;
+        if (e.text == "*" && (fold(*e.b, true) || fold(*e.a, true))) return std::nullopt;     // a constant factor: shifts and adds
+        return SharedKind{e.text[0], n, 0, t->is_signed};
+    }
+    // acc (kd.n cells) += sign * e for every operation, through one copy of the routine.  The hooks generate
+    // code around operation i: before(i) and loaded(i) before and after its factors are evaluated, after(i)
+    // once its result is in acc.  fresh: acc is zero before every operation (after(i) empties it).
+    // written: the cells, other than acc and temporaries, that the hooks write; they may add to it as they run.
+    // at: the statement the loop's own code is mapped to (a continuation), or null.
+    struct SharedHooks {
+        std::function<void(int)> before, loaded, after;
+        std::vector<std::pair<int64_t, int64_t>>* written = nullptr;
+        const Stmt* at = nullptr;
+        bool fresh = false;
+    };
+    void run_shared(const SharedKind& kd, const std::vector<SharedOp>& ops, int64_t acc, const SharedHooks& h = {}) {
+        int n = kd.n, m = (int)ops.size();
+        bool pos = false, neg = false;
+        for (const SharedOp& o : ops) (o.sign > 0 ? pos : neg) = true;
+        auto snapshot = known;
+        int64_t base = next_free;
+        int64_t cnt = tmp(), F = tmpN(m - 1), NEG = pos && neg ? tmp() : -1;
+        int64_t P = kd.op == 'm' && !(h.fresh && !neg) ? tmpN(n) : -1, X = tmpN(n), Y = tmpN(n);   // P: mulshr's result
+        auto load = [&](int i) {                       // the factors of operation i into X and Y
+            if (h.before) h.before(i);
+            const Expr& e = *ops[(size_t)i].e;
+            const Type* t = conv_type(e.type);
+            eval_into(*e.a, X, t);
+            eval_into(*e.b, Y, t);
+            if (NEG >= 0 && ops[(size_t)i].sign < 0) add(NEG, 1);
+            if (h.loaded) h.loaded(i);
+        };
+        load(0);
+        if (h.at) begin_stmt(*h.at, true);             // the loop and the routine: the first statement's
+        set(cnt, m);
+        set(F, 1);
+        open(cnt);
+        {
+            const Type* t = conv_type(ops[0].e->type);
+            // the result r of the routine: acc += r, acc -= r, or by the sign flag
+            auto accumulate = [&](int64_t r) {
+                if (!pos) { subN(acc, r, n); return; }
+                if (NEG >= 0) if_nonzero(NEG, [&] { negN(r, n); });
+                if (h.fresh) moveN(r, acc, n); else addN(acc, r, n);
+            };
+            if (kd.op == '*') {
+                if (!pos) negN(X, n);
+                else if (NEG >= 0) if_nonzero(NEG, [&] { negN(X, n); });
+                mulN(X, Y, acc, n, kd.sgn);
+            } else if (kd.op == 'm') {
+                auto from_xy = [&](int64_t a, int64_t b) { moveN(X, a, n); moveN(Y, b, n); };
+                if (P < 0) mulshr(kd.k, t, acc, from_xy);
+                else { mulshr(kd.k, t, P, from_xy); accumulate(P); }
+            } else {
+                int64_t q = tmpN(n), r = tmpN(n);
+                if (kd.sgn) sdivmodN(X, Y, q, r, n); else divmodN(X, Y, q, r, n);
+                accumulate(kd.op == '/' ? q : r);
+                releaseN(r, n); releaseN(q, n);
+            }
+            for (int64_t c = F + m - 1; c < next_free; c++) if (trackable(c)) known[c] = 0;     // the routine's cells are zero again
+            add(cnt, -1);
+            // The code after operation i runs if F[i] is set and sets F[i + 1].  It is generated lowest first,
+            // the order of the statements it holds, each piece starting and ending on cnt; then the pieces
+            // are put highest first, so that the flag set for the next operation waits for the next pass.
+            std::vector<std::pair<size_t, size_t>> text, ranges;
+            for (int i = 0; i < m - 1; i++) {
+                size_t t0 = out.size(), r0 = res.stmts.size();
+                if_nonzero(F + i, [&] { if (h.after) h.after(i); load(i + 1); if (i + 1 < m - 1) add(F + i + 1, 1); });
+                go(cnt);
+                text.emplace_back(t0, out.size());
+                ranges.emplace_back(r0, res.stmts.size());
+            }
+            std::string moved;
+            std::vector<StmtRange> moved_ranges;
+            for (size_t i = text.size(); i-- > 0;) {
+                int32_t delta = (int32_t)(text[0].first + moved.size()) - (int32_t)text[i].first;
+                moved.append(out, text[i].first, text[i].second - text[i].first);
+                for (size_t r = ranges[i].first; r < ranges[i].second; r++) {
+                    StmtRange rr = res.stmts[r];
+                    rr.start += delta; rr.end += delta;
+                    moved_ranges.push_back(rr);
+                }
+            }
+            out.replace(text[0].first, moved.size(), moved);
+            std::copy(moved_ranges.begin(), moved_ranges.end(), res.stmts.begin() + (std::ptrdiff_t)ranges[0].first);
+        }
+        close();
+        if (h.at) end_stmt();
+        for (auto& kv : snapshot) {                    // what the loop left alone is known again
+            if (kv.first >= base || (kv.first >= acc && kv.first < acc + n)) continue;
+            bool w = false;
+            if (h.written) for (auto& r : *h.written) if (kv.first >= r.first && kv.first < r.second) w = true;
+            if (!w) known[kv.first] = kv.second;
+        }
+        for (int64_t c = cnt + 1; c < next_free; c++) if (trackable(c)) known[c] = 0;
+        if (h.after) h.after(m - 1);
+        releaseN(Y, n); releaseN(X, n);
+        if (P >= 0) releaseN(P, n);
+        if (NEG >= 0) release(NEG);
+        releaseN(F, m - 1);
+        release(cnt);
+    }
+
+    // A run of statements sharing a routine.  Its operations, wherever they are in the statements, are
+    // computed first, each into cells of its own, which the statement's code then reads instead of
+    // computing it: precomputed maps each operation to its cells.  A statement's operations go through
+    // the loop in turn, and after the last of them the statement itself is generated, in the code run
+    // before the next operation's factors (or after the loop).
+    std::unordered_map<const Expr*, int64_t> precomputed;
+    // Can s run inside a shared loop: an assignment or declaration whose expressions can be moved?
+    bool shareable_stmt(const Stmt& s) {
+        switch (s.kind) {                              // (a register is not movable)
+        case Stmt::Assign: return movable(*s.target) && movable(*s.e);
+        case Stmt::IncDec: return movable(*s.target);
+        case Stmt::Decl: return !s.in_heap && s.count < 0 && s.e && s.vtype && s.vtype->is_scalar() && movable(*s.e);
+        default: return false;
+        }
+    }
+    // The shareable operations that evaluating e reaches through eval_same: in sums, operands, casts and
+    // negations wider than a byte (a byte's operations go through eval8, which computes its own low byte).
+    void wide_ops(const Expr& e, std::vector<const Expr*>& found) {
+        if (sz(e) < 2 || !e.type || !e.type->is_int() || fold(e)) return;
+        if (shared_kind(e, sz(e))) { found.push_back(&e); return; }
+        switch (e.kind) {
+        case Expr::Unary: if (e.text == "-" || e.text == "~") wide_ops(*e.a, found); return;
+        case Expr::Cast: wide_ops(*e.a, found); return;
+        case Expr::MulShr: wide_ops(*e.a, found); wide_ops(*e.b, found); return;
+        case Expr::Binary:
+            if (is_cmp(e.text) || e.text == "&&" || e.text == "||" || e.a->type->is_ptr() || e.b->type->is_ptr()) return;
+            wide_ops(*e.a, found); wide_ops(*e.b, found);
+            return;
+        default: return;
+        }
+    }
+    // the operations of statement s that could be shared
+    std::vector<const Expr*> stmt_ops(const Stmt& s) {
+        std::vector<const Expr*> found;
+        const Expr* e = s.kind == Stmt::Decl ? s.e.get() : nullptr;
+        // gen_assign rewrites other compound assignments as x = x op e with copies of the expressions
+        if (s.kind == Stmt::Assign && (s.op == "=" || ((s.op == "+=" || s.op == "-=") && s.target->kind == Expr::Name))) e = s.e.get();
+        int n = s.kind == Stmt::Decl ? std::max(s.vtype->size, 1) : e ? sz(*s.target) : 0;
+        if (e && n >= 2 && sz(*e) >= 2) wide_ops(*e, found);
+        return found;
+    }
+    // The longest run of statements from v[i] whose operations of one kind, at least opt.share of them,
+    // can share a routine.  Statements without such an operation may sit between two that have one, up
+    // to SHARE_GAP in a row.  Returns the number of statements in the run (0: none), its kind and operations.
+    static constexpr int SHARE_GAP = 2;
+    size_t find_run(const std::vector<StmtP>& v, size_t i, SharedKind& kind, std::vector<std::vector<const Expr*>>& ops) {
+        if (!opt.share || !shareable_stmt(*v[i])) return 0;
+        struct Found { std::vector<std::pair<const Expr*, SharedKind>> ops; bool in_sum = true; };
+        std::vector<Found> all;
+        std::unordered_map<int64_t, int> saved;
+        std::swap(saved, known);                       // the run's later statements see other values
+        std::unordered_set<std::string> declared;
+        run_names = &declared;
+        for (size_t j = i; j < v.size(); j++) {
+            const Stmt& s = *v[j];
+            if (!shareable_stmt(s)) break;
+            Found f;
+            for (const Expr* x : stmt_ops(s)) f.ops.emplace_back(x, *shared_kind(*x, sz(*x)));
+            if (!f.ops.empty()) {                      // are they all terms of the statement's sum?
+                Terms terms; int64_t c = 0;
+                collect_terms(*s.e, 1, terms, c, sz(*s.e));
+                for (auto& o : f.ops)
+                    if (std::none_of(terms.begin(), terms.end(), [&](auto& t) { return t.first == o.first; })) f.in_sum = false;
+            }
+            all.push_back(f);
+            if (all.size() > (size_t)SHARE_GAP && std::all_of(all.end() - SHARE_GAP - 1, all.end(), [](auto& x) { return x.ops.empty(); })) break;
+            if (s.kind == Stmt::Decl) declared.insert(s.name);
+        }
+        std::swap(saved, known);
+        run_names = nullptr;
+        if (all.empty() || all[0].ops.empty()) return 0;
+        size_t best = 0; int best_count = 0;
+        for (auto& first : all[0].ops) {
+            const SharedKind& kd = first.second;
+            int count = 0, stmts = 0, gap = 0;
+            size_t end = 0;
+            std::vector<std::vector<const Expr*>> picked;
+            for (size_t j = 0; j < all.size(); j++) {
+                std::vector<const Expr*> mine;
+                for (auto& o : all[j].ops) if (o.second == kd) mine.push_back(o.first);
+                if (mine.empty()) { if (++gap > SHARE_GAP) break; picked.push_back(mine); continue; }
+                gap = 0; count += (int)mine.size(); stmts++; end = j + 1;
+                picked.push_back(mine);
+            }
+            // the terms of a single statement's sum share without a run (shared_terms)
+            if (count < opt.share || count <= best_count || (stmts == 1 && all[0].in_sum)) continue;
+            best = end; best_count = count; kind = kd;
+            picked.resize(end);
+            ops = picked;
+        }
+        return best;
+    }
+    // Generates v[i, i + len) as a run sharing a routine of kind kd (find_run).
+    void gen_run(const std::vector<StmtP>& v, size_t i, size_t len, const SharedKind& kd, const std::vector<std::vector<const Expr*>>& ops) {
+        int n = kd.n;
+        for (size_t j = i; j < i + len; j++) {         // declared variables outlive the loop: their cells come first
+            const Stmt& d = *v[j];
+            if (d.kind != Stmt::Decl) continue;
+            if (scopes.size() == 1 && call_stack.empty()) place_group(d);
+            if (prealloc.count(&d)) continue;
+            Var tv; tv.type = d.vtype; tv.count = d.count;
+            prealloc[&d] = alloc(tv.size());
+        }
+        std::vector<SharedOp> flat;
+        std::vector<size_t> stmt_of, slot_of;          // statement (index in ops) and cells slot of each operation
+        size_t slots = 0;
+        for (size_t j = 0; j < ops.size(); j++) {
+            for (size_t k = 0; k < ops[j].size(); k++) { flat.push_back({ops[j][k], 1}); stmt_of.push_back(j); slot_of.push_back(k); }
+            slots = std::max(slots, ops[j].size());
+        }
+        int64_t H = tmpN((int)(slots * n)), acc = tmpN(n);
+        std::vector<std::pair<int64_t, int64_t>> written;
+        auto gen_one = [&](size_t j) {                 // statement i + j, its operations ready in H
+            const Stmt& s = *v[i + j];
+            next_is_cont = !ops[j].empty();
+            gen_stmt(s);
+            for (const Expr* x : ops[j]) {             // not read after all: their cells are cleared
+                auto it = precomputed.find(x);
+                if (it != precomputed.end()) { clearN(it->second, n); precomputed.erase(it); }
+            }
+            if (s.kind == Stmt::Decl) { const Var* dv = find_var(s.name); written.emplace_back(dv->cell, dv->cell + dv->size()); }
+            else {
+                LV lv = lvalue(*s.target);
+                if (lv.kind == LV::Cells) written.emplace_back(lv.cell, lv.cell + lv.size());
+                else if (lv.kind == LV::Elem) written.emplace_back(lv.arr->cell, lv.arr->cell + array_total(*lv.arr));
+            }
+        };
+        SharedHooks h;
+        h.written = &written;
+        h.at = v[i].get();
+        h.fresh = true;
+        h.before = [&](int o) { begin_stmt(*v[i + stmt_of[(size_t)o]], slot_of[(size_t)o] > 0); };
+        h.loaded = [&](int) { end_stmt(); };
+        h.after = [&](int o) {
+            size_t j = stmt_of[(size_t)o];
+            int64_t cells = H + (int64_t)slot_of[(size_t)o] * n;
+            begin_stmt(*v[i + j], true);
+            moveN(acc, cells, n);
+            end_stmt();
+            precomputed[flat[(size_t)o].e] = cells;
+            if (slot_of[(size_t)o] + 1 < ops[j].size()) return;
+            gen_one(j);                                // the statement's last operation: the statement
+            for (size_t g = j + 1; g < ops.size() && ops[g].empty(); g++) gen_one(g);    // and those after it without one
+        };
+        run_shared(kd, flat, acc, h);
+        releaseN(acc, n);
+        releaseN(H, (int)(slots * n));
+    }
+
+    // The terms of an n-byte sum that use one routine at least opt.share times, by routine; they are taken
+    // out of terms.
+    std::vector<std::pair<SharedKind, std::vector<SharedOp>>> shared_terms(Terms& terms, int n) {
+        std::vector<std::pair<SharedKind, std::vector<SharedOp>>> groups;
+        if (!opt.share) return groups;
+        for (auto& tm : terms) if (!movable(*tm.first)) return groups;     // terms are evaluated in another order
+        for (auto& tm : terms) if (auto kd = shared_kind(*tm.first, n)) {
+            auto it = std::find_if(groups.begin(), groups.end(), [&](auto& g) { return g.first == *kd; });
+            if (it == groups.end()) groups.push_back({*kd, {}}), it = groups.end() - 1;
+            it->second.push_back({tm.first, tm.second});
+        }
+        groups.erase(std::remove_if(groups.begin(), groups.end(), [&](auto& g) { return (int)g.second.size() < opt.share; }), groups.end());
+        Terms rest;
+        for (auto& tm : terms) {
+            bool taken = false;
+            for (auto& g : groups) for (SharedOp& o : g.second) if (o.e == tm.first) taken = true;
+            if (!taken) rest.push_back(tm);
+        }
+        terms = rest;
+        return groups;
+    }
+
     // ---- symbols ------------------------------------------------------------------------------
     Var* find_var(const std::string& n) {
         for (size_t i = scopes.size(); i-- > 0;) {
@@ -1042,6 +1355,7 @@ struct Gen {
     // cells hold a known constant count too.
     std::optional<int64_t> fold(const Expr& e, bool use_known = false) {
         const Type* t = e.type;
+        if (!precomputed.empty() && precomputed.count(&e)) return std::nullopt;
         if (!t || !t->is_scalar()) return std::nullopt;
         if (e.is_const) return wrap(e.cval, conv_type(t));
         switch (e.kind) {
@@ -1603,6 +1917,10 @@ struct Gen {
     // dst (size(e.type) cells, known zero) = e
     void eval_same(const Expr& e, int64_t dst) {
         int n = sz(e);
+        if (!precomputed.empty()) {                    // computed by a shared routine (gen_run)
+            auto it = precomputed.find(&e);
+            if (it != precomputed.end()) { moveN(it->second, dst, n); precomputed.erase(it); return; }
+        }
         if (auto v = fold(e, true)) { for (int k = 0; k < n; k++) add(dst + k, (*v >> (8 * k)) & 255); return; }
         switch (e.kind) {
         case Expr::Name: {
@@ -1706,6 +2024,7 @@ struct Gen {
         if (o == "+" || o == "-") {
             std::vector<std::pair<const Expr*, int>> terms; int64_t constant = 0;
             collect_terms(e, 1, terms, constant, n);
+            auto groups = shared_terms(terms, n);
             for (auto& tm : terms) {
                 if (known0N(dst, n) && tm.second > 0) { eval_into(*tm.first, dst, t); continue; }
                 int64_t x = tmpN(n); eval_into(*tm.first, x, t);
@@ -1713,6 +2032,7 @@ struct Gen {
                 releaseN(x, n);
             }
             addN_const(dst, n, constant);
+            for (auto& g : groups) run_shared(g.first, g.second, dst);
             return;
         }
         if (o == "*") {
@@ -1815,6 +2135,9 @@ struct Gen {
     std::unordered_map<const Stmt*, int64_t> prealloc;     // cells reserved for declarations after an early exit
     void gen_stmts(const std::vector<StmtP>& v, size_t from = 0) {
         for (size_t i = from; i < v.size(); i++) {
+            SharedKind kd;
+            std::vector<std::vector<const Expr*>> ops;
+            if (size_t len = find_run(v, i, kd, ops)) { gen_run(v, i, len, kd, ops); i += len - 1; continue; }
             gen_stmt(*v[i]);
             if (i + 1 < v.size() && !ctxs.empty() && ctxs.back().needs && may_exit(*v[i])) {
                 // the rest runs only while the context is alive; its variables belong to

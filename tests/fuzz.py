@@ -5,10 +5,14 @@ Two generators:
 
   bfl  random BFL programs over every integer type: arithmetic, shifts, mulshr,
        compares, casts, constants, arrays in cells and in the heap, pointers,
-       loops with break and continue, inlined and recursive procedures.  Each
-       program is also run by a model of BFL written here in Python, the
-       oracle.  It is compiled twice (the brainfuck must be identical) and once
-       without the automatic layout of globals, and run by every executor.  Its
+       loops with break and continue, inlined and recursive procedures, and
+       runs of statements with several wide multiplies or divisions of one kind
+       (which the compiler shares).  Each program is also run by a model of BFL
+       written here in Python, the oracle.  It is compiled twice (the brainfuck
+       must be identical), once without the automatic layout of globals and
+       once without shared arithmetic (BFL_SHARE=0), and run by every executor
+       (the last two by the JIT; the summary counts the programs whose code the
+       sharing changed).  Its
        brainfuck is also run with one cell poked before the start, compared with
        the unoptimised run, so that scratch cells hold unexpected values and the
        loop idioms' guards must send loops through their bodies.  A program
@@ -949,12 +953,67 @@ class Gen:
             return Cast(t, e)
         return e
 
+    def wide_op(self, cx, t, op, k):
+        """a multiply, mulshr, division or remainder at type t, not of a constant"""
+        a, b = Cast(t, self.expr(cx, 2)), Cast(t, self.expr(cx, 2))
+        return MulShr(a, b, k) if op == "m" else Bin(op, a, b)
+
+    def wide_expr(self, cx, t, op, k):
+        """an expression at type t holding a few operations of one kind: a sum of them, or nested"""
+        r = self.r
+        e = self.wide_op(cx, t, op, k)
+        for _ in range(r.choice([0, 1, 1, 2])):
+            x = self.wide_op(cx, t, op, k)
+            if r.random() < 0.25:
+                x = r.choice([Un("-", x), Bin(">>", x, Lit(r.choice([1, 3, 8]))), Bin("*", x, Lit(3)), Cast(t, x)])
+            e = Bin(r.choice("+-"), e, x) if r.random() < 0.8 else Bin(r.choice(["^", "&", "*", "/"]), e, x)
+        if r.random() < 0.3:
+            e = Bin(r.choice("+-"), e, Cast(t, self.expr(cx, 2)))
+        if r.random() < 0.15:
+            e = Un("-", e)
+        return e
+
+    def shared_run(self, cx):
+        """A few assignments and declarations whose expressions use operations of one kind and width
+        (the compiler runs them through one copy of the routine), sometimes with a plain statement
+        between them; later ones read what earlier ones wrote."""
+        r = self.r
+        t = r.choice(["word", "int", "dword", "long", "long"])
+        op = r.choice(["*", "*", "*", "m", "m", "/", "%"])
+        k = r.choice([0, 3, 8, 12, 16, 20, 31])
+        res = []
+        for _ in range(r.randint(1, 4)):
+            if r.random() < 0.15 and cx.targets:
+                v = r.choice(cx.targets)
+                res.append(Assign(VarL(v), "=", self.fit(self.expr(cx, 1), self.vt[v])))
+            mine = [v for v in cx.targets if self.vt[v] == t]
+            arrs = [a for a in cx.warrs if a[1] == t]
+            e = self.wide_expr(cx, t, op, k)
+            q = r.random()
+            if q < 0.35 or not mine:
+                name = self.fresh("l")
+                self.vt[name] = t
+                res.append(Decl(t, name, self.fit(e, t)))
+                cx.targets.append(name)
+                cx.reads.append(name)
+            elif q < 0.75:
+                res.append(Assign(VarL(r.choice(mine)), "=", self.fit(e, t)))
+            elif q < 0.9:
+                res.append(Assign(VarL(r.choice(mine)), r.choice(["+=", "-="]), e))
+            elif arrs:
+                res.append(Assign(self.index_of(cx, r.choice(arrs), 1, lvalue=True), "=", self.fit(e, t)))
+        return res
+
     # statements
     def stmts(self, cx, n, depth):
         r = self.r
         res = []
         cx = cx.but(targets=list(cx.targets), reads=list(cx.reads), warrs=list(cx.warrs), arrs=list(cx.arrs))
         for _ in range(n):
+            k = r.random()
+            if k < 0.07:
+                res += self.shared_run(cx)
+                continue
             k = r.random()
             if k < 0.22 and cx.targets:
                 v = r.choice(cx.targets)
@@ -1391,8 +1450,13 @@ def fit_stack(bf, d, prog, stdin):
 STACK_BIG = 4096                         # also exercises the 16-bit stack pointer of stacks above 256 cells
 
 
-def check_bfl(bf, d, text, stdin, expected, modes=MODES, pokes=None, determinism=True, layout=True):
-    """Compile and run one BFL program; returns the failures.  pokes: (cell offset, value) pairs."""
+def commands(path):
+    return "".join(ch for ch in read(path).decode("latin-1") if ch in "+-<>.,[]")
+
+
+def check_bfl(bf, d, text, stdin, expected, modes=MODES, pokes=None, determinism=True, layout=True, info=None):
+    """Compile and run one BFL program; returns the failures.  pokes: (cell offset, value) pairs.
+    info["shared"] is set when the program shares arithmetic: compiled with BFL_SHARE=0 it differs."""
     src = os.path.join(d, "p.bfl")
     with open(src, "w", newline="\n") as f:
         f.write(text)
@@ -1415,9 +1479,18 @@ def check_bfl(bf, d, text, stdin, expected, modes=MODES, pokes=None, determinism
             fails.append(Failure("layout", "compile", err.strip()[:200]))
         else:
             fails += [Failure("layout", f.mode, f.detail) for f in check_bf_file(bf, c, stdin, "nochange", expected, modes[:1])]
+    if layout:                           # and without arithmetic shared within a block
+        c = os.path.join(d, "p_noshare.b")
+        rc, _, err = run(bf, ["--emit", c, src], env={"BFL_SHARE": "0"})
+        if rc != 0:
+            fails.append(Failure("noshare", "compile", err.strip()[:200]))
+        elif commands(c) != commands(a):
+            if info is not None:
+                info["shared"] = True
+            fails += [Failure("noshare", f.mode, f.detail) for f in check_bf_file(bf, c, stdin, "nochange", expected, modes[:1])]
     if pokes is None:
         return fails
-    base = "".join(ch for ch in read(a).decode("latin-1") if ch in "+-<>.,[]")
+    base = commands(a)
     for cell, val in pokes(cells):
         cell += 256
         v = os.path.join(d, "poke.b")
@@ -1595,6 +1668,7 @@ def shrink_bf(bf, src, stdin, eof, fails, d):
 class Result:
     def __init__(self, kind, seed, status, fails=(), data=None):
         self.kind, self.seed, self.status, self.fails, self.data = kind, seed, status, list(fails), data
+        self.shared = False              # a BFL program whose code shares arithmetic (check_bfl)
 
 
 def bfl_case(bf, seed, tmp, modes=MODES, pokes=True):
@@ -1606,8 +1680,11 @@ def bfl_case(bf, seed, tmp, modes=MODES, pokes=True):
     os.makedirs(d, exist_ok=True)
     if not fit_stack(bf, d, prog, stdin):
         return Result("bfl", seed, "skip")
-    fails = check_bfl(bf, d, prog.text(), stdin, expected, modes, poker(seed) if pokes else None)
-    return Result("bfl", seed, "fail" if fails else "ok", fails, (prog, stdin, expected))
+    info = {}
+    fails = check_bfl(bf, d, prog.text(), stdin, expected, modes, poker(seed) if pokes else None, info=info)
+    res = Result("bfl", seed, "fail" if fails else "ok", fails, (prog, stdin, expected))
+    res.shared = info.get("shared", False)
+    return res
 
 
 def bf_case(bf, seed, tmp, modes=MODES):
@@ -1746,7 +1823,8 @@ def main():
         rs = [r for r in results if r.kind == kind]
         if rs:
             print(f"{kind}: {sum(r.status != 'skip' for r in rs)} programs checked, "
-                  f"{sum(r.status == 'skip' for r in rs)} skipped, {sum(r.status == 'fail' for r in rs)} failing")
+                  f"{sum(r.status == 'skip' for r in rs)} skipped, {sum(r.status == 'fail' for r in rs)} failing"
+                  + (f", {sum(r.shared for r in rs)} sharing arithmetic" if kind == "bfl" else ""))
     print(f"{time.time() - t0:.0f} s")
     sys.exit(1 if failed else 0)
 

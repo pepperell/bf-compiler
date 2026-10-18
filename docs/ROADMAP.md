@@ -28,7 +28,7 @@ plus the type system, library and tooling they need.
 | 8 | Tooling: settings, terminal width, syntax colouring, multi-file debugging | 6 |
 | 9 | A differential fuzzer for the compiler, the optimiser and the JIT | nothing |
 | 10 | Fused multiply-and-shift for fixed-point arithmetic | 9 |
-| 11 | Planned: arithmetic shared within a block, without the trampoline | 9 |
+| 11 | Arithmetic shared within a block, without the trampoline | 9 |
 | 12 | Faster division | 9 |
 | 13 | Planned: the profiler in the UI | nothing |
 | 14 | Planned: housekeeping (the raytracer animation) | nothing |
@@ -233,7 +233,7 @@ touches breakpoint backgrounds nor fills the undo history. Watch rows show
 multi-byte, signed and pointer values whole. Run > Check heap accesses and Run >
 Check recursion stack match the `bf` flags.
 
-## 11. Phases 9 to 14 (9, 10 and 12 built, the rest planned)
+## 11. Phases 9 to 14 (9 to 12 built, the rest planned)
 
 After phase 8 the optimiser learnt loop idioms (multi-byte carries, compares,
 halving and byte division each run in one step), known cell values carried
@@ -387,6 +387,81 @@ outside the loop.
 
 Done when: measured on the samples; kept only where it makes code smaller
 without making frames noticeably slower.
+
+**Built** in `src/lang/codegen.cpp` ("arithmetic shared within a block"; docs/LANG.md,
+"Shared arithmetic"). An operation's routine is its operator (`*`, `mulshr`, `/`, `%`),
+width, signedness and `mulshr`'s count; a constant factor is not shared, since it becomes
+shifts and adds. `run_shared` emits the routine once inside a loop on a counter cell that
+runs once per operation, with a flag per operation choosing the code after the routine:
+it takes the result and evaluates the next operation's factors into the operand cells.
+That code is generated in statement order and placed last-first in the loop, so that the
+flag it sets for the next operation is not seen until the next pass. Two places use it:
+
+- The terms of one sum (`shared_terms`, from `binary_wide`): the products go straight into
+  the sum's cells, through a sign flag when some are subtracted. This works wherever a sum
+  is evaluated: a condition, a call's argument, a shift's operand.
+- A run of assignments and declarations without calls (`find_run`, `gen_run`, from
+  `gen_stmts`): every such operation the statements evaluate at full width (a term of a
+  sum, inside a shift or a cast, another operation's operand) is computed into cells of
+  its own when the loop reaches it, and once a statement's operations are done the
+  statement itself is generated, reading those cells instead of computing them
+  (`precomputed`). Declared variables get their cells before the loop. Up to two
+  statements without such an operation may sit between two that have one.
+
+The first operation's factors are evaluated before the loop and the last statement after
+it, with the known cell values of straight-line code, and the values known before the loop
+that no statement in it writes are known again after it. The statement map gives each
+statement of a run a range where it starts (step marks and breakpoints); the loop itself,
+routine included, is a continuation of the run's first statement, so `bf --profile`
+charges the routine to that line, and breakpoints no longer stop at continuations
+(`pcs_for_line` in `src/ui.cpp`).
+
+The heuristic: share whenever a routine would otherwise be emitted at least twice in one
+sum or one run (`Options::share`; `BFL_SHARE=N` in the environment of `bf` sets the
+minimum, 0 turns it off). Variants measured on the samples (only these four change):
+
+| | raytracer commands | ms a frame | raytracer_text | cube | starfield |
+|---|---:|---:|---:|---:|---:|
+| off | 4.80 M | 57.3 | 4.31 M / 25.0 | 341 K / 1.35 | 1.80 M / 1.09 |
+| sums only | 4.34 M | 55.5 | 3.85 M / 24.1 | 325 K / 1.35 | 1.80 M / 1.08 |
+| sums and runs, no statement between | 4.07 M | 54.3 | 3.59 M / 23.5 | 313 K / 1.33 | 1.79 M / 1.09 |
+| sums and runs, up to 2 between (kept) | 4.06 M | 54.7 | 3.59 M / 23.3 | 313 K / 1.32 | 1.79 M / 1.07 |
+| up to 4 between | 4.06 M | 54.4 | 3.59 M / 23.6 | 313 K / 1.32 | 1.79 M / 1.06 |
+| at least 3 operations | 4.14 M | 54.5 | 3.65 M / 23.5 | 317 K / 1.35 | 1.80 M / 1.09 |
+| no divisions | 4.15 M | 56.1 | 3.67 M / 23.8 | 317 K / 1.34 | 1.80 M / 1.09 |
+| multiplies only | 4.48 M | 55.7 | 4.00 M / 24.5 | 341 K / 1.35 | 1.80 M / 1.08 |
+| `long` only | 4.16 M | 55.3 | 3.68 M / 23.8 | 341 K / 1.36 | 1.80 M / 1.09 |
+
+Every kind of operation and both widths pay, and no variant made a frame slower; the
+frame times differ by about 1 ms from run to run.
+
+Tests: `share-*` cases in `tests/test_lang.py` (sums of each kind with mixed signs, runs of
+each kind, operations apart in one statement, known values kept and dropped, a run in a
+loop with `continue` and `break`, in a `rec proc`), and `share-map`: a run is smaller than
+with `BFL_SHARE=0`, prints the same, has a step mark for each statement and `bf --profile`
+counts each line. The fuzzer generates runs of statements with several operations of one
+kind (`shared_run`) and runs every program compiled with `BFL_SHARE=0` as well; `--bfl 2000
+--bf 300` (seed 20000) found nothing, and 1 151 of the 2 000 programs shared arithmetic.
+
+Measured with `tools/bench.py` against the commit before (after phase 12):
+
+| | before | after |
+|---|---:|---:|
+| `raytracer.bfl`: ms a frame / light map / commands | 57.8 / 88 / 4.80 M | 54.1 / 85 / 4.06 M |
+| the same, `place_camera` (commands) | 1.15 M | 0.88 M |
+| `raytracer_text.bfl` | 25.0 / 84 / 4.31 M | 23.5 / 81 / 3.59 M |
+| `cube.bfl`: ms a frame / commands | 1.36 / 341 K | 1.32 / 313 K |
+| `starfield.bfl` | 1.09 / 1.80 M | 1.06 / 1.79 M |
+| `lc = fa * fb + la * ld - lb * fa;`, IR instructions / commands | 4 768 / 34 540 | 4 812 / 14 936 |
+| `lc = mulshr(fa, fb, 12); lc = mulshr(lc, la, 12) - mulshr(lb, ld, 12);` | 3 863 / 37 154 | 4 007 / 19 289 |
+
+(The two operation rows are new in the benchmark; "before" is this build with
+`BFL_SHARE=0`.) The raytracer's light map and two frames execute 789 M IR instructions
+instead of 777 M (1.5% more: the loop's flags, the moves into the operand cells, and
+factors evaluated inside the loop without known values), but its machine code is a third
+smaller (3.1 MB of x64 instead of 4.6 MB, 206 K IR instructions instead of 302 K), and the
+frames got faster rather than slower. Against the commit before phase 10 the raytracer's
+code went from 5.67 M to 4.06 M commands and its frame from 75 to 54 ms.
 
 ### Phase 12: faster division
 

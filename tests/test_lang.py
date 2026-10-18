@@ -8,6 +8,7 @@ the arithmetic grids is computed in Python with the language's semantics
     python tests\test_lang.py [path\to\bf.exe]
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -461,6 +462,34 @@ case("mulshr-order", "int r = mulshr(int(in) - 100, int(in), 2); print r;", b"-1
 case("mulshr-known", "long a = 123456; long b = -654321; long c = mulshr(a, b, 12); byte n = in; long d = 0; while (n) { n--; d = mulshr(a, b, 12); d += mulshr(a, 3, 1); } print c, \" \", d;", b"-19721644 -19536460", b"\x01")
 case("mulshr-rec", "rec proc long f(long n) { if (n == 0) { return 1; } return f(n - 1) * 3; } print mulshr(f(5), f(4) - 100, 3);", b"-578")
 case("div-zero", "byte a = in; print a / 0, \" \", a % 0;", b"0 23", b"\x17")   # defined as 0 and a
+# arithmetic shared within a block: several multiplies, mulshr, divisions or remainders of one kind run
+# through one copy of the routine, in the terms of a sum or across a run of statements
+case("share-sum-mul", "long a = in; a = a * 1000 - 77777; long b = in; b = b * 300 + 5; dword c = in; c = c * 70000 + 9; int d = int(in) - 300; int e = int(in) * 3;"
+     " long x = a * b - b * b + a * a; print x, \" \"; dword y = c * c + c * 3 + dword(a) * c; print y, \" \"; int z = d * e - e * e - d * d + 1; print z;",
+     b"1593169919 350551307 11670", b"\x0b\x63\x05\x02\x41")
+case("share-sum-mulshr", "long a = in; a = a * 100000 - 9000000; long b = in; b = b * 3001; int c = int(in) - 200; int d = int(in) * 9;"
+     " long x = mulshr(a, b, 12) - mulshr(b, b, 12) + mulshr(a, -b, 12); int y = -mulshr(c, d, 4) - mulshr(d, d, 4); print x, \" \", y;",
+     b"-141853311 -11711", b"\x11\xfe\x07\x3c")
+case("share-run-chain", "long a = in; a = a * 1000 - 77777; long b = in; b = b * 300 - 50000; long c = in; c = c + 4500; long arr[3];"
+     " long x = a * b; long y = (c * x) >> 3; x = x * c + 5; arr[1] = b * c - x; y += a * a; long z = (b * c) / 7 + (x * y) * 3;"
+     " print x, \" \", y, \" \", z, \" \", arr[1];", b"-1882229075 -234674906 -907861985 1995204075", b"\x4d\xfa\x13")
+case("share-run-mulshr", "long a = in; a = a * 12345 - 1000000; long d = in; long f = in; f = f * 1000 + 99999;"
+     " long u = mulshr(a, d, 12); long v = mulshr(u, a, 12) + 1; long w = -mulshr(v, f, 12); u = mulshr(w, w, 8); print u, \" \", v, \" \", w;",
+     b"1411812071 649041 -31532839", b"\x21\x1f\x63")
+case("share-run-div", "long a = in; a = a * 100000 - 7000000; long d = int(in) - 50; dword p = in; p = p * 70000 + 4; dword q = in;"
+     " long q1 = a / d; long q2 = q1 % (d - 3); long q3 = (q2 * 1000) / (a - a); dword r1 = p / q; dword r2 = p % (q + 1); dword r3 = (r1 + r2) / q;"
+     " print q1, \" \", q2, \" \", q3, \" \", r1, \" \", r2, \" \", r3;", b"84848 32 0 2000000 4 285714", b"\x2a\x11\xc8\x07")
+case("share-apart", "long a = in; a = a * 1000 - 77777; long b = in; b = b * 300 + 1; long c = in;"
+     " long x = ((a * b) >> 3) + ((b * c) >> 5) - long(int(a * c)); word w = word(a * b) ^ word(b * c); print x, \" \", w;",
+     b"-96484580 57416", b"\x3c\x91\x77")
+# values known before the loop stay known after it unless a statement in it writes them
+case("share-known-values", "long a = in; long b = in; b = b * 1000 + 3; long x = 7; long y = 3; long k = 11; long arr[3]; arr[0] = 5;"
+     " x = a * b; arr[2] = b * b; y = x * a + y; print x, \" \", y, \" \", k * 2, \" \", x + 1, \" \", arr[0], \" \", arr[2];",
+     b"117039 1521510 22 117040 5 81054009", b"\x0d\x09")
+case("share-in-loop", "long a = in; long b = in; long s = 0; byte i; for (i = 0; i < 5; i++) { if (i == 3) { continue; } long x = a * b; long y = x * a; s += y * b - x * x + x; if (s > 100000000) { break; } a += 1000; }"
+     " print s, \" \", a;", b"142508 4049", b"\x31\x17")
+case("share-rec", "rec proc long f(long n, long m) { if (n == 0) { return m; } long x = n * m; long y = x * x - n * n; return f(n - 1, y % 1000003) + x * n; } print f(4, 12345);",
+     b"-2088721")
 case("array-const-index", "byte a[4]; a[0] = 'a'; a[1] = a[0] + 1; a[3] = a[1] + 2; a[2] = a[3] - 1; out a[0], a[1], a[2], a[3];", b"abcd")
 case("array-runtime", """
 byte a[6]; byte i;
@@ -643,6 +672,43 @@ def deterministic():
     return ok
 
 
+SHARE_MAP_SRC = """long a = in; a = a * 1000 - 77777;
+long b = in; b = b * 300 - 50000;
+long x = a * b;
+long y = x * b + a;
+x = x * a - y * 3;
+print x, " ", y;
+"""
+
+
+def share_map():
+    """A run of statements sharing a multiply: smaller than without sharing (BFL_SHARE=0), the same
+    output, a step mark in the statement map (a range that is not a continuation) for each of its
+    statements, and bf --profile counting each of their lines."""
+    src = os.path.join(TMP, "share_map.bfl")
+    open(src, "w", newline="\n").write(SHARE_MAP_SRC)
+    sizes, outs = [], []
+    for share in ("2", "0"):
+        env = dict(os.environ, BFL_SHARE=share)
+        b = os.path.join(TMP, f"share_map{share}.b")
+        r = subprocess.run([BF, "--emit", b, src], capture_output=True, text=True, timeout=60, env=env)
+        m = re.search(r"(\d+) commands", r.stdout + r.stderr)
+        sizes.append(int(m.group(1)) if r.returncode == 0 and m else 0)
+        outs.append(subprocess.run([BF, "--quiet-devices", src], input=b"\x4d\xfa", capture_output=True, timeout=60, env=env).stdout)
+    marks = set()
+    for line in open(os.path.join(TMP, "share_map2.b.map")):
+        f = line.split()
+        if f and f[0] == "S" and f[7] == "0":
+            marks.add(int(f[1]))
+    r = subprocess.run([BF, "--profile", src], input=b"\x4d\xfa", capture_output=True, timeout=120)
+    counted = {int(m.group(1)) for m in re.finditer(rb"^\s*\d+\s+[\d.]+%\s+(\d+)\s", r.stdout + r.stderr, re.M)}
+    ok = 0 < sizes[0] < sizes[1] and outs[0] == outs[1] == b"-1205555197 -293696329" and {3, 4, 5} <= marks and {3, 4, 5} <= counted
+    print(("PASS " if ok else "FAIL ") + "share-map")
+    if not ok:
+        print(f"   sizes {sizes}, outputs {outs}, marked lines {sorted(marks)}, profiled lines {sorted(counted)}")
+    return ok
+
+
 def shared_fuzz():
     """A few programs of tests/fuzz_shared.py: shared and inlined procedures agree."""
     sys.path.insert(0, os.path.dirname(__file__))
@@ -678,6 +744,8 @@ def main():
     update = "--update-golden" in sys.argv
     fails = 0
     if not deterministic():
+        fails += 1
+    if not share_map():
         fails += 1
     if not shared_fuzz():
         fails += 1
@@ -735,7 +803,7 @@ def main():
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1
-    total = len(CASES) + 6 + len(errors) + len(DIAGS) + len(GRIDS) + len(MULSHR_GRIDS) + n_samples
+    total = len(CASES) + 7 + len(errors) + len(DIAGS) + len(GRIDS) + len(MULSHR_GRIDS) + n_samples
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 
