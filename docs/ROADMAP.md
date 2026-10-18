@@ -247,14 +247,15 @@ and the run time. The phases below were planned from there; each has a **Built**
 or **Done** note saying what was made.
 
 Where they leave things, measured with `tools/bench.py` against the commit before
-phase 10:
+phase 10 (frame times are the fastest of three runs, both builds timed one after the
+other on an otherwise idle machine):
 
 | | before | now |
 |---|---:|---:|
-| `raytracer.bfl`: ms a frame / light map / commands | 75.0 / 175 / 5.67 M | 54.5 / 86 / 4.06 M |
-| `raytracer_text.bfl` | 36.5 / 174 / 5.18 M | 23.7 / 83 / 3.59 M |
-| `cube.bfl`: ms a frame / commands | 1.52 / 537 K | 1.32 / 313 K |
-| `starfield.bfl` | 1.25 / 1.81 M | 1.07 / 1.79 M |
+| `raytracer.bfl`: ms a frame / light map / commands | 71.0 / 167 / 5.67 M | 55.0 / 86 / 4.06 M |
+| `raytracer_text.bfl` | 32.4 / 162 / 5.18 M | 23.7 / 81 / 3.59 M |
+| `cube.bfl`: ms a frame / commands | 1.38 / 537 K | 1.33 / 313 K |
+| `starfield.bfl` | 1.17 / 1.81 M | 1.07 / 1.79 M |
 | `long / long`, IR instructions / commands | 7 147 / 15 776 | 201 / 7 467 |
 | `int / int` | 2 301 / 5 826 | 200 / 3 683 |
 | `word / word` | 2 198 / 3 721 | 81 / 1 946 |
@@ -353,7 +354,7 @@ a signed product is formed from magnitudes with the accumulator starting at `2^k
 when it is negative, so negating the rounded-up magnitude gives the floor. The
 pattern `(a * b) >> k` is not rewritten, since its wrapping product is defined
 behaviour. Tests: a grid per integer type in `tests/test_lang.py` against Python with
-counts 0 to 70 (including 7, 8, 12, 15, 16, 31 and the width and twice it), targeted
+every count from 0 to twice the width plus 6 (0 to 70 for 32-bit types), targeted
 cases (constant folding, operand order, known values, a `rec` call inside, errors),
 and `MulShr` in the fuzzer's generator and model; `--bfl 1500 --bf 300` ran clean.
 
@@ -365,17 +366,21 @@ Measured with `tools/bench.py` against the commit before:
 | the same, commands | 18 077 | 11 864 |
 | `(int * int) >> 7` → `mulshr`, IR instructions | 690 | 487 |
 | the same, commands | 9 963 | 4 932 |
-| `raytracer.bfl`: ms a frame / light map / commands | 75.0 / 175 / 5.67 M | 66.3 / 160 / 5.12 M |
-| `raytracer_text.bfl` | 36.5 / 174 / 5.18 M | 30.1 / 153 / 4.64 M |
-| `cube.bfl`: ms a frame / commands | 1.52 / 537 K | 1.40 / 388 K |
-| `starfield.bfl` | 1.25 / 1.81 M | 1.19 / 1.80 M |
+| `raytracer.bfl`: ms a frame / light map / commands | 71.0 / 167 / 5.67 M | 65.0 / 160 / 5.12 M |
+| `raytracer_text.bfl` | 32.4 / 162 / 5.18 M | 29.6 / 155 / 4.64 M |
+| `cube.bfl`: ms a frame / commands | 1.38 / 537 K | 1.38 / 388 K |
+| `starfield.bfl` | 1.17 / 1.81 M | 1.16 / 1.80 M |
 
 The raytracers use it for every single product and for the dot products (a sum of
 `mulshr` terms rounds each term down: rendered headless against the commit before,
 0.8 to 2.2% of a frame's pixels change, 1.5% over 16 frames; two thirds of those by
 one level of a colour channel (a dither step), the rest by up to 7 levels, mostly in
 the spheres' reflections, where a ray now meets a slightly different point; a lamp
-moves by a pixel in three of the 16 frames (4, 8, 12). The pictures look the same).
+moves by a pixel in three of the 16 frames (4, 8, 12). One change is visible: in
+frame 0 a small pink patch at the upper left of the chrome sphere is gone. Since the
+red sphere is in front of it and to the right, that patch was probably an artefact of
+a 32-bit product that overflowed before the shift, which the exact product no longer
+does; this has not been traced to a statement).
 `cube.bfl` rotates in `int`s, because the exact product no longer needs `long`s, with
 shifts instead of `/ 1024`: a corner sometimes lands one cell over, since the shift
 rounds down where the division truncated. `starfield.bfl` has no fixed-point products
@@ -514,7 +519,7 @@ instead of 777 M (1.5% more: the loop's flags, the moves into the operand cells,
 factors evaluated inside the loop without known values), but its machine code is a third
 smaller (3.1 MB of x64 instead of 4.6 MB, 206 K IR instructions instead of 302 K), and the
 frames got faster rather than slower. Against the commit before phase 10 the raytracer's
-code went from 5.67 M to 4.06 M commands and its frame from 75 to 54 ms.
+code went from 5.67 M to 4.06 M commands and its frame from 71 to 55 ms.
 
 ### Phase 12: faster division
 
@@ -558,9 +563,9 @@ Measured with `tools/bench.py` against the commit before (after phase 10):
 | the same with `BF_NO_IDIOMS`, IR instructions | 121 200 | 290 500 |
 | `int / int`, IR instructions / commands | 2 301 / 5 826 | 200 / 3 683 |
 | `word / word` | 2 198 / 3 721 | 81 / 1 946 |
-| `raytracer.bfl`: ms a frame / light map / commands | 65.3 / 158 / 5.12 M | 57.8 / 89 / 4.80 M |
-| `raytracer_text.bfl` | 29.5 / 152 / 4.64 M | 24.9 / 85 / 4.31 M |
-| `cube.bfl`, `starfield.bfl`: ms a frame | 1.38, 1.16 | 1.35, 1.08 |
+| `raytracer.bfl`: ms a frame / light map / commands | 65.0 / 160 / 5.12 M | 57.7 / 91 / 4.80 M |
+| `raytracer_text.bfl` | 29.6 / 155 / 4.64 M | 25.4 / 85 / 4.31 M |
+| `cube.bfl`, `starfield.bfl`: ms a frame | 1.38, 1.16 | 1.37, 1.10 |
 
 The unoptimised count is for the benchmark's operands (`892200 / 1006`); the loop's
 passes cost more the larger the values, so the loop alone runs from about 0.4 M commands
@@ -568,7 +573,7 @@ passes cost more the larger the values, so the loop alone runs from about 0.4 M 
 
 A raytracer frame executes 181 M IR instructions instead of 225 M: its 8 000 divisions
 took about 45 M and now take 1.6 M. (Against the commit before phase 10 a frame went
-from 75 to 58 ms.) `text.bfl` grows by 3% although its `dword / 10` shrinks from 10.7 K
+from 71 to 58 ms.) `text.bfl` grows by 3% although its `dword / 10` shrinks from 10.7 K
 to 4.1 K commands: the loop's 50 cells raise the temporaries' high-water mark, so the
 heap sits 38 cells further up and every heap access walks there and back (pointer moves
 only, which fold into the moves already there: its IR is 3% smaller).
@@ -623,7 +628,7 @@ recorded when a frame took 2.3 s. Re-record it now that a frame takes 70 ms, and
 commit it with a mention in README.md, or drop it.
 
 **Done**: `tools/rt_gif.py OUT.gif` renders the 16 frames headless (2 s in all, a
-frame about 54 ms); README.md shows the re-recorded `docs/raytracer.gif`.
+frame about 55 ms); README.md shows the re-recorded `docs/raytracer.gif`.
 
 ## 12. Decisions for you
 

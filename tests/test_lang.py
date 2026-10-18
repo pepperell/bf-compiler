@@ -256,10 +256,12 @@ def typed_grid(name, typ, values, ops, shift_counts=(0, 1, 3, 7, 15, 31)):
     return check(name, "\n".join(lines), exp.encode(), stdin)
 
 
-def mulshr_grid(name, typ, values, counts=(0, 1, 7, 8, 9, 12, 15, 16, 17, 24, 31, 32, 33, 47, 48, 63, 64, 70)):
-    """r = mulshr(a, b, k) for every pair of values and every constant count: one loop over the pairs,
-    read with `in`, so each count is one statement.  The model: the exact product, shifted right."""
+def mulshr_grid(name, typ, values, counts=None):
+    """r = mulshr(a, b, k) for every pair of values and every constant count k from 0 to past the
+    double width: one loop over the pairs, read with `in`, so each count is one statement.  The model:
+    the exact product, shifted right."""
     bits, signed = TYPES[typ]
+    counts = counts or range(2 * bits + 7)
     nb = bits // 8
     def load(var):
         return f"{var} = in;" + "".join(f" {var} = {var} * 256 + in;" for _ in range(nb - 1))

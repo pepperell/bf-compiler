@@ -148,7 +148,7 @@ input to give it, and the test suite runs the terminating ones through every exe
 
 `programs/samples/raytracer.bfl` on the framebuffer: four reflective spheres, two
 coloured lamps with soft shadows and a checkerboard floor, in fixed-point BFL. A 128x64
-frame takes about 54 ms with the JIT (2.3 s before the loop idioms; see Speed).
+frame takes about 55 ms with the JIT (2.3 s before the loop idioms; see Speed).
 `python tools/rt_gif.py docs/raytracer.gif` renders these 16 frames headless and writes
 the GIF (it needs Pillow).
 
@@ -179,9 +179,9 @@ one holds something else the body runs as written. `bf --dump` shows them. On
 double-width product, computed by one shift-and-add loop that keeps only the bytes
 surviving the shift (docs/LANG.md). A Q12 `long` product of two variables runs 1 100
 IR instructions instead of 1 900 and is a third smaller (a constant factor is still
-faster with `*` and `>>`); with it the raytracer's frame went from 75 to
-66 ms and its code from 5.67 M to 5.12 M commands, and `raytracer_text.bfl` from 36.5 to
-30 ms.
+faster with `*` and `>>`); with it the raytracer's frame went from 71 to
+65 ms and its code from 5.67 M to 5.12 M commands, and `raytracer_text.bfl` from 32.4 to
+29.6 ms.
 
 **Division.** A word or long `/` or `%` is one bit-by-bit loop of 16 or 32 passes
 (shift, subtract, add back on a borrow), too large for the symbolic matching. The
@@ -205,7 +205,7 @@ the loop. Three `long` products in a sum are 15 000 commands instead of 34 500, 
 more executed instructions. The raytracer's code went from 4.80 M to 4.06 M commands
 (`place_camera` from 1.15 M to 0.88 M) and `raytracer_text.bfl`'s from 4.31 M to 3.59 M;
 they execute 1.5% more IR instructions, yet with a third less machine code (3.1 MB of x64
-instead of 4.6 MB) their frames are faster, 54 ms instead of 58 and 23.5 instead of 25.
+instead of 4.6 MB) their frames are faster, 55 ms instead of 58 and 23.7 instead of 25.4.
 
 ## Memory map
 
