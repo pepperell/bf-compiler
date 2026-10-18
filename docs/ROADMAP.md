@@ -29,7 +29,7 @@ plus the type system, library and tooling they need.
 | 9 | A differential fuzzer for the compiler, the optimiser and the JIT | nothing |
 | 10 | Fused multiply-and-shift for fixed-point arithmetic | 9 |
 | 11 | Planned: arithmetic shared within a block, without the trampoline | 9 |
-| 12 | Planned: faster division | 9 |
+| 12 | Faster division | 9 |
 | 13 | Planned: the profiler in the UI | nothing |
 | 14 | Planned: housekeeping (the raytracer animation) | nothing |
 
@@ -233,7 +233,7 @@ touches breakpoint backgrounds nor fills the undo history. Watch rows show
 multi-byte, signed and pointer values whole. Run > Check heap accesses and Run >
 Check recursion stack match the `bf` flags.
 
-## 11. Phases 9 to 14 (9 built, the rest planned)
+## 11. Phases 9 to 14 (9, 10 and 12 built, the rest planned)
 
 After phase 8 the optimiser learnt loop idioms (multi-byte carries, compares,
 halving and byte division each run in one step), known cell values carried
@@ -397,6 +397,61 @@ at a time; skip more leading zero bits of the divisor and dividend.
 
 Done when: `/` and `%` are measurably cheaper in executed instructions and the
 raytracer frame time drops, with the grids green.
+
+**Built** as an idiom recognised by its text (`IDIOM_DIVIDE`; "the division loop" in
+`src/ir.cpp`, `bf::division_loop` and `bf::DivisionLayout` in `src/bf.h`). The symbolic
+execution behind the other idioms cannot take this loop, whose body holds byte loops
+with data-dependent trip counts. Instead the compiler emits the loop from a generator in
+the executor, and the optimiser compares the commands of each loop with its text for 2
+and 4 bytes, the widths BFL divides: a loop with exactly that text computes the rule
+wherever it appears. The other cells it touches are guards, so a loop entered with one
+of them non-zero runs as written. The rule, in the interpreter and through the same call
+in the JIT, is up to 255 shift-and-subtract steps on 64-bit values. The loop was
+rewritten for this: `A`, `R`
+and a borrow byte `X` get a group of six cells each (the byte, two cells for a zero
+test, a counter, and in R's groups B's byte and a temporary). A pass shifts `A:R` high
+byte first (a byte counts its old value up twice, and when it wraps the byte above gets
+the carry), subtracts `B` with a borrow chain into `X`, and adds `B` back on a borrow.
+The zero test `t+ c[>-]>[- … >]` does not copy the cell, so the loop as written is
+linear in the values. The skip over the dividend's whole zero bytes is gone, since the
+idiom does every pass in one step. Tests: `word-divide` and `long-divide` in
+`IDIOM_PROGRAMS` (`tests/test.py`), poked at every cell of the loop as well; the typed
+grids; and a check of the rule against the text on random states (counter, `A`, `R`,
+`B` and poked scratch cells) for every width from 2 to 8, run while building it. The
+fuzzer ran `--bfl 1500 --bf 500` clean, and `--bfl 400 --bf 200` with `BF_NO_IDIOMS=1`.
+
+Measured with `tools/bench.py` against the commit before (after phase 10):
+
+| | before | after |
+|---|---:|---:|
+| `long / long`, IR instructions | 7 147 | 201 |
+| the same, commands | 15 776 | 7 467 |
+| the same, unoptimised: commands executed | 27.2 M | 0.85 M |
+| the same with `BF_NO_IDIOMS`, IR instructions | 121 200 | 290 500 |
+| `int / int`, IR instructions / commands | 2 301 / 5 826 | 200 / 3 683 |
+| `word / word` | 2 198 / 3 721 | 81 / 1 946 |
+| `raytracer.bfl`: ms a frame / light map / commands | 65.3 / 158 / 5.12 M | 57.8 / 89 / 4.80 M |
+| `raytracer_text.bfl` | 29.5 / 152 / 4.64 M | 24.9 / 85 / 4.31 M |
+| `cube.bfl`, `starfield.bfl`: ms a frame | 1.38, 1.16 | 1.35, 1.08 |
+
+A raytracer frame executes 181 M IR instructions instead of 225 M: its 8 000 divisions
+took about 45 M and now take 1.6 M. (Against the commit before phase 10 a frame went
+from 75 to 58 ms.) `text.bfl` grows by 3% although its `dword / 10` shrinks from 10.7 K
+to 4.1 K commands: the loop's 50 cells raise the temporaries' high-water mark, so the
+heap sits 38 cells further up and every heap access walks there and back (pointer moves
+only, which fold into the moves already there: its IR is 3% smaller).
+
+The other options, measured on the operands of every division in the raytracer (logged
+by an instrumented build), would have saved much less at about 300 IR instructions a
+pass:
+
+- Skipping the dividend's leading zero bits as well as its whole zero bytes removes 2.8
+  of the 18.8 passes of a frame's average division (15%).
+- Starting where the remainder can first reach the divisor (the difference of their bit
+  lengths) removes 10 passes (53%).
+- Dividing a byte at a time applies only when the divisor fits in a byte (63% of a
+  frame's divisions, 12% of the light map's), and each step divides 16 bits by 8, which
+  the byte division idiom does not do.
 
 ### Phase 13: the profiler in the UI
 

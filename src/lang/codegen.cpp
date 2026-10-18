@@ -28,6 +28,7 @@
 #include "ast.h"
 #include "sema.h"
 #include "../registers.h"
+#include "../bf.h"
 #include "stdlib_gen.h"
 #include <algorithm>
 #include <filesystem>
@@ -930,6 +931,8 @@ struct Gen {
         if (sgn) release(neg);
     }
     // q += a / b, r += a % b (unsigned; b == 0 gives q = 0, r = a).  a consumed, b cleared; q and r start at zero.
+    // The 8n passes of shift and subtract are bf::division_loop(n), which the optimiser runs in
+    // one step; its cells are a block of fresh temporaries laid out as bf::DivisionLayout says.
     void divmodN(int64_t a, int64_t b, int64_t q, int64_t r, int n) {
         if (n == 1) { divmod8(a, b, q, r); return; }
         int64_t z = tmp();
@@ -937,48 +940,23 @@ struct Gen {
         int64_t f = tmp(); set(f, 1);
         if_nonzero(z, [&] { moveN(a, r, n); clear(f); });
         if_nonzero(f, [&] {
-            int64_t cnt = tmp(); set(cnt, 8 * n);
-            // While the remainder is still 0, the dividend's leading zero bits only shift
-            // it along: skip whole zero bytes with byte moves instead of 8 steps each.
-            if (n > 1) {
-                int64_t go = tmp(); set(go, 1);
-                for (int j = 0; j < n - 1; j++) {
-                    int64_t nz = tmp(); copy(a + n - 1, nz);
-                    if_nonzero(nz, [&] { clear(go); });
-                    release(nz);
-                    int64_t g = tmp(); copy(go, g);
-                    if_nonzero(g, [&] { shift_bytes(a, n, 1, true, false); add(cnt, -8); });
-                    release(g);
-                }
-                release(go);
-            }
-            open(cnt);
-            {
-                add(cnt, -1);
-                shlN(q, n);
-                int64_t bit = tmp();
-                sign_flag(a + n - 1, bit);
-                shlN(a, n);
-                shlN(r, n);
-                if_nonzero(bit, [&] { add(r, 1); });
-                release(bit);
-                int64_t lt = tmp(); ltN_cells(r, b, n, lt, 1);
-                int64_t ge = tmp(); not8(lt, ge, 1);
-                if_nonzero(ge, [&] {
-                    int64_t t = tmpN(n);
-                    for (int k = 0; k < n; k++) copy(b + k, t + k);
-                    subN(r, t, n);
-                    releaseN(t, n);
-                    add(q, 1);
-                });
-                release(ge); release(lt);
-            }
-            close();
-            release(cnt);
+            bf::DivisionLayout L{n};
+            int64_t c = tmpN(L.cells());
+            for (int k = 0; k < n; k++) { move(a + k, {{c + L.a(k), 1}}); move(b + k, {{c + L.b(k), 1}}); }
+            set(c, 8 * n);
+            go(c);
+            out += bf::division_loop(n);
+            known.clear();
+            for (int64_t s = c; s < c + L.cells(); s++) if (trackable(s)) known[s] = 0;
+            for (int k = 0; k < n; k++) { forget(c + L.a(k)); forget(c + L.r(k)); forget(c + L.b(k)); }
+            for (int k = 0; k < n; k++) { move(c + L.a(k), {{q + k, 1}}); move(c + L.r(k), {{r + k, 1}}); clear(c + L.b(k)); }
+            releaseN(c, L.cells());
         });
         release(f); release(z);
-        clearN(a, n);
-        clearN(b, n);
+        for (int k = 0; k < n; k++) {                  // moved on either way, and b is 0 when not
+            if (trackable(a + k)) known[a + k] = 0; else clear(a + k);
+            if (trackable(b + k)) known[b + k] = 0; else clear(b + k);
+        }
     }
     // signed: the quotient truncates towards zero, the remainder takes the sign of the dividend
     void sdivmodN(int64_t a, int64_t b, int64_t q, int64_t r, int n) {

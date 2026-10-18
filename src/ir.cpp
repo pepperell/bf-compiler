@@ -7,6 +7,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <optional>
+#include <functional>
+#include <mutex>
 
 namespace bf {
 
@@ -925,8 +927,143 @@ static bool match_idiom(const Code& c, size_t b, size_t e, Idiom& id) {
 
 } // namespace
 
+// ---- the division loop -------------------------------------------------------------
+// The bit-by-bit loop of BFL's multi-byte division is too large for the symbolic
+// execution above (its body holds byte loops whose trip counts are data), so it is
+// recognised by its text instead: the compiler emits exactly division_loop(n), and a
+// loop whose commands are that text computes the rule below, whatever program it
+// sits in.  The cells it touches besides A, R and B are guards as for the other
+// idioms: a loop entered with one of them non-zero runs as written.
+//
+// As written it runs in time linear in the values: a byte's zero test is
+// t+ c[>-]> [- body >] (t, s the two cells after c, both 0), which lands on s
+// whichever way it goes and does not loop over c.
+namespace {
+
+struct Text {                                // brainfuck text with a pointer position
+    std::string s;
+    int cur = 0;
+    std::vector<int> loops;
+    std::set<int> touched;
+    void go(int c) { s.append((size_t)std::abs(c - cur), c > cur ? '>' : '<'); cur = c; }
+    void add(int c, int v) {
+        v &= 255;
+        if (!v) return;
+        go(c);
+        touched.insert(c);
+        if (v <= 128) s.append((size_t)v, '+'); else s.append((size_t)(256 - v), '-');
+    }
+    void open(int c) { go(c); touched.insert(c); s += '['; loops.push_back(c); }
+    void close() { go(loops.back()); loops.pop_back(); s += ']'; }
+    void clear(int c) { open(c); s += '-'; close(); }
+    void move(int from, std::initializer_list<std::pair<int, int>> to) {    // to += sign * from; from = 0
+        open(from);
+        add(from, -1);
+        for (auto& d : to) add(d.first, d.second);
+        close();
+    }
+    void copy(int from, int to, int t) { move(from, {{to, 1}, {t, 1}}); move(t, {{from, 1}}); }   // t zero
+    template <class F> void if_nz(int z, F body) { open(z); body(); clear(z); close(); }
+    template <class F> void if_zero(int c, F body) {     // body runs when c is 0; c+1 and c+2 zero
+        add(c + 1, 1);
+        go(c);
+        touched.insert(c + 2);
+        s += "[>-]>[-";                        // now on c+2 (c != 0, c+1 cleared) or on c+1 (c == 0)
+        cur = c + 1;
+        body();
+        go(c + 2);
+        s += ']';
+    }
+};
+
+std::string make_division_loop(int n, std::set<int>* touched = nullptr) {
+    DivisionLayout L{n};
+    auto chain = [&](int j) { return DivisionLayout::group(j); };      // A0..An-1, R0..Rn-1, X
+    Text t;
+    // (R:X) -= 256^k or += 256^k: a borrow or carry chain through R's bytes into X
+    std::function<void(int, int)> step = [&](int k, int d) {
+        if (k == n) { t.add(L.x(), d); return; }
+        int c = L.r(k);
+        if (d > 0) t.add(c, 1);
+        t.if_zero(c, [&] { step(k + 1, d); });
+        if (d < 0) t.add(c, -1);
+    };
+    auto add_b = [&](int d) {                // (R:X) += d * B, one unit at a time
+        for (int k = 0; k < n; k++) {
+            int cnt = L.r(k) + 3;
+            t.copy(L.b(k), cnt, L.r(k) + 5);
+            t.open(cnt); t.add(cnt, -1); step(k, d); t.close();
+        }
+    };
+    t.open(0);
+    t.add(0, -1);
+    // (A:R) <<= 1, high byte first: each byte w counts its old value up twice from 0, and
+    // when it wraps the byte above (already doubled, so even) gets the carry
+    for (int j = 2 * n - 1; j >= 0; j--) {
+        int w = chain(j), cnt = w + 3;
+        t.move(w, {{cnt, 1}});
+        t.open(cnt);
+        t.add(cnt, -1);
+        t.add(w, 2);
+        if (j + 1 < 2 * n) t.if_zero(w, [&] { t.add(chain(j + 1), 1); });     // the top bit is shifted out
+        t.close();
+    }
+    // R -= B; on a borrow X is 255 and B is added back, which returns X to 0
+    add_b(-1);
+    t.add(L.a(0), 1);
+    t.if_nz(L.x(), [&] { add_b(1); t.add(L.a(0), -1); });
+    t.close();
+    if (touched) *touched = t.touched;
+    return t.s;
+}
+
+// Does the loop from '[' at b to its ']' at e consist of exactly the commands of t?
+bool text_is(const std::string& src, size_t b, size_t e, const std::string& t) {
+    size_t k = 0;
+    for (size_t i = b; i <= e; i++) {
+        char ch = src[i];
+        if (!ch || !strchr("+-<>.,[]", ch)) continue;
+        if (k == t.size() || t[k] != ch) return false;
+        k++;
+    }
+    return k == t.size();
+}
+
+std::set<int> division_touched[9];
+
+// The widths BFL divides (word, int: 2 bytes; dword, long: 4), which the tests cover.
+bool match_division(const std::string& src, size_t b, size_t e, Idiom& id) {
+    if (e >= src.size() || src[b] != '[' || src[e] != ']') return false;
+    for (int n : {2, 4}) {
+        const std::string& t = division_loop(n);
+        if (e - b + 1 < t.size() || !text_is(src, b, e, t)) continue;
+        DivisionLayout L{n};
+        id = Idiom{};
+        id.kind = IDIOM_DIVIDE;
+        id.bytes = (uint8_t)n;
+        std::set<int> data;
+        for (int k = 0; k < n; k++) { id.cells.push_back(L.a(k)); data.insert(L.a(k)); }
+        for (int k = 0; k < n; k++) { id.cells.push_back(L.r(k)); data.insert(L.r(k)); }
+        for (int k = 0; k < n; k++) { id.cells.push_back(L.b(k)); data.insert(L.b(k)); }
+        for (int c : division_touched[n]) if (c > 0 && !data.count(c)) id.guards.push_back({c, 0, true});
+        id.lo = 0;
+        id.hi = L.cells() - 1;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+const std::string& division_loop(int n) {
+    static std::string t[9];
+    static std::once_flag once;
+    std::call_once(once, [] { for (int k = 2; k <= 8; k++) t[k] = make_division_loop(k, &division_touched[k]); });
+    return t[std::clamp(n, 2, 8)];
+}
+
 // Put an IDIOM instruction at the top of every loop that matches one.
-static void find_idioms(Code& c, std::vector<Idiom>& table) {
+static void find_idioms(Code& c, const std::string& src, std::vector<Idiom>& table) {
     std::vector<size_t> closer(c.size(), SIZE_MAX), st;
     for (size_t i = 0; i < c.size(); i++) {
         if (c[i].op == JZ) st.push_back(i);
@@ -939,6 +1076,12 @@ static void find_idioms(Code& c, std::vector<Idiom>& table) {
         if (c[i].op != JZ) continue;
         size_t j = closer[i];
         if (j == SIZE_MAX || c[j].op != JNZ) continue;
+        Idiom dv;
+        if (c[i].src >= 0 && c[j].src > c[i].src && match_division(src, (size_t)c[i].src, (size_t)c[j].src, dv)) {
+            table.push_back(std::move(dv));
+            out.push_back({IDIOM, table.back().lo, (int32_t)table.size() - 1, 0, c[i + 1].src});
+            continue;
+        }
         bool simple = true;
         for (size_t k = i + 1; k < j && simple; k++) {
             Op o = c[k].op;
@@ -974,6 +1117,19 @@ bool idiom_exec(const Idiom& d, uint8_t* p) {
         uint8_t& r = p[d.cells[0]]; uint8_t& cc = p[d.cells[1]]; uint8_t& q = p[d.cells[2]];
         uint8_t b = p[d.cells[3]];
         for (unsigned i = 0; i < x; i++) { r++; cc--; if (!cc) { q++; r = 0; cc = b; } }
+        break;
+    }
+    case IDIOM_DIVIDE: {
+        int n = d.bytes;
+        auto load = [&](int i) { uint64_t v = 0; for (int k = n - 1; k >= 0; k--) v = v << 8 | p[d.cells[(size_t)(i * n + k)]]; return v; };
+        uint64_t a = load(0), r = load(1), b = load(2);
+        uint64_t mask = n >= 8 ? ~0ull : (1ull << (8 * n)) - 1;
+        for (unsigned i = 0; i < x; i++) {
+            r = (r << 1 | a >> (8 * n - 1)) & mask;
+            a = (a << 1) & mask;
+            if (r >= b) { r -= b; a |= 1; }
+        }
+        for (int k = 0; k < n; k++) { p[d.cells[(size_t)k]] = (uint8_t)(a >> (8 * k)); p[d.cells[(size_t)(n + k)]] = (uint8_t)(r >> (8 * k)); }
         break;
     }
     }
@@ -1049,7 +1205,7 @@ Program compile(const std::string& src, bool optimise) {
     static const bool no_idioms = getenv("BF_NO_IDIOMS") != nullptr;    // for measuring
     static const bool no_rebuild = getenv("BF_NO_REBUILD") != nullptr;
     if (!no_rebuild) rebuild_blocks(c);
-    if (!no_idioms) find_idioms(c, p.idioms);
+    if (!no_idioms) find_idioms(c, src, p.idioms);
     if (!fix_targets(c, p.error)) return p;
     p.code = std::move(c);
     return p;
@@ -1076,13 +1232,14 @@ std::string disassemble(const Program& p) {
         case ENDIF: snprintf(buf, sizeof buf, "ENDIF\n"); break;
         case SCAN:  snprintf(buf, sizeof buf, "SCAN  %+d\n", x.arg); break;
         case IDIOM: {
-            static const char* names[] = {"add", "satsub", "halve", "divmod"};
+            static const char* names[] = {"add", "satsub", "halve", "divmod", "divide"};
             const Idiom& d = p.idioms[(size_t)x.arg];
             std::string cells;
             for (int32_t o : d.cells) cells += (cells.empty() ? "" : ",") + std::to_string(o);
             std::string g;
             for (const Idiom::Guard& gd : d.guards) g += " [" + std::to_string(gd.off) + "]" + (gd.check ? "==" : "=") + std::to_string(gd.val);
             s += std::string("IDIOM ") + names[d.kind] + (d.kind == IDIOM_ADD ? (d.sign > 0 ? "+" : "-") : "") +
+                 (d.kind == IDIOM_DIVIDE ? std::to_string(d.bytes) : "") +
                  " [" + cells + "] scratch" + g + " -> " + std::to_string(x.target) + "\n";
             buf[0] = 0;
             break;

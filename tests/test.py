@@ -185,6 +185,13 @@ IDIOM_PROGRAMS = [
     ("byte-divmod", "byte a = in; byte b = in; out a / b, a % b;"),
     ("signed", "int a = in; int b = in; a = a - 100; int c = a * b; out byte(c), byte(c >> 8); c = a / 7; out byte(c), byte(c >> 8);"
                " if (a < b) { out 1; } else { out 2; }"),
+    # the division loop (ir.cpp, "the division loop"); its cells lie above the operands, so these
+    # are also poked further up (with the first input), into the counter, A, R, B and every scratch cell
+    ("word-divide", "word a = in; word b = in; a = a * 300 + b; word d = b + 1; word c = a / d; out byte(c), byte(c >> 8);"
+                    " c = a % d; out byte(c), byte(c >> 8);", range(16, 48)),
+    ("long-divide", "long a = in; long b = in; a = a * 100003 - 7000000; long d = b - 3; long c = a / d;"
+                    " out byte(c), byte(c >> 8), byte(c >> 16), byte(c >> 24); dword u = dword(a) % dword(d * 1000);"
+                    " out byte(u), byte(u >> 8), byte(u >> 16), byte(u >> 24);", range(16, 96)),
 ]
 IDIOM_INPUTS = [b"\xc8\x4d", b"\x00\x00", b"\xff\x01", b"\x05\x05"]
 
@@ -193,7 +200,7 @@ def idiom_cases():
     import tempfile
     fails = 0
     tmp = tempfile.mkdtemp()
-    for name, prog in IDIOM_PROGRAMS:
+    for name, prog, *more in IDIOM_PROGRAMS:
         bfl = os.path.join(tmp, name + ".bfl")
         out_b = os.path.join(tmp, name + ".b")
         open(bfl, "w").write(prog + "\n")
@@ -205,9 +212,10 @@ def idiom_cases():
         base = "".join(ch for ch in open(out_b, encoding="latin-1").read() if ch in "+-<>.,[]")
         variants = [("", base)] + [(f"poke{k}:{v}", ">" * k + "+" * v + "<" * k + base) for k in range(2, 16) for v in (1,)] \
                    + [(f"poke{k}:255", ">" * k + "-" + "<" * k + base) for k in (3, 5, 7, 9)]
+        further = [(f"poke{k}:{v}", ">" * k + ("+" if v == 1 else "-") + "<" * k + base) for k in (more[0] if more else ()) for v in (1, 255)]
         bad = []
         for stdin in IDIOM_INPUTS:
-            for vname, src in variants:
+            for vname, src in variants + (further if stdin == IDIOM_INPUTS[0] else []):
                 # the unoptimised run executes every command as written (checked against the
                 # reference interpreter by the other cases); a poke may make a program spin
                 path = os.path.join(tmp, "variant.b")

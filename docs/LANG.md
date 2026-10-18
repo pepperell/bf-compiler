@@ -458,14 +458,16 @@ Cost model, roughly, per operation on bytes:
 | `a[i]` read / write | ~70 | ~15·i |
 
 Word operations are 5 to 20 times a byte's; word `/` and `%` loop once per bit
-of the dividend. The executed column is what a plain brainfuck interpreter does.
-On this machine the IR optimiser turns the common idioms (clear, move, copy,
-constant multiply) into single instructions, and it also recognises the loops
-whose trip count is a value: the byte compare, the carry and borrow chains of
-multi-byte `+` and `-`, halving (shifts, bitwise operators) and byte division
-each run as one step (`src/ir.cpp`, "loop idioms"). Measured in IR instructions
-executed, a 32-bit `+` is about 40, `<` about 120, `*` about 2 400 and `/` about
-7 000, against 10 000, 2 300, 129 000 and 108 000 without those idioms.
+of the dividend (16 passes for a word, 32 for a long). The executed column is
+what a plain brainfuck interpreter does. On this machine the IR optimiser turns
+the common idioms (clear, move, copy, constant multiply) into single
+instructions, and it also recognises the loops whose trip count is a value: the
+byte compare, the carry and borrow chains of multi-byte `+` and `-`, halving
+(shifts, bitwise operators) and byte division each run as one step (`src/ir.cpp`,
+"loop idioms"), and so does the whole multi-byte division loop ("the division
+loop"). Measured in IR instructions executed, a 32-bit `+` is about 40, `<` about
+120, `*` about 2 400 and `/` about 200, against 10 000, 2 300, 129 000 and
+290 000 without those idioms.
 `bf --profile` shows where a program's instructions go, by statement. The compiler also tracks cells whose value it knows in straight-line
 code: constants, string output and copies of known variables are emitted as the
 shortest delta, and expressions over known variables fold entirely.
@@ -495,6 +497,21 @@ These are the building blocks; knowing them helps read the output and write
   `reg` (0) or on `P` (0); moving `M - reg` cells right then lands on `M`,
   prepared with 1, or on `P + M - reg`, which is free and 0; `[- >·D ]` with
   `D = P - reg` brings the first case to the same cell. Costs about 70 commands.
+- **Division** of words and longs (`n` bytes) is one loop on a block of
+  `12n + 2` temporaries (`bf::division_loop` and `bf::DivisionLayout` in
+  `src/bf.h`): the pass counter, set to `8n`, then six cells for each byte of
+  `A` (the dividend, which becomes the quotient), `R` (the remainder) and a
+  borrow byte `X`: the byte, two cells for its zero test, a counter, and in R's
+  groups a byte of the divisor `B` and a temporary. Each pass shifts `A:R` left
+  by one bit, high byte first (a byte counts its old value up twice, and when it
+  wraps the byte above gets the carry), subtracts `B` from `R` one unit at a time
+  with a borrow chain into `X`, sets `A`'s low bit, and on a borrow adds `B`
+  back and clears the bit again. A byte's zero test is `t+ c[>-]>[- … >]` with
+  `t` and the cell after it free: it ends on that cell either way, without
+  looping over `c`, so the loop runs in time linear in the values (about 850 000
+  commands for a 32-bit `/` as written). The optimiser recognises the loop by its
+  exact text and runs all the passes in one step; signs, division by zero and
+  the moves in and out are done around it.
 - **Byte arrays** occupy `3·(n+1)` cells: a zero header triple, then per element
   `(C, V, D)`: counter, value carry, data. A read moves the index into `C₀`,
   walks `[-[->>>+<<<]+>>>]` leaving markers, copies `D` into `V` using `C` as the

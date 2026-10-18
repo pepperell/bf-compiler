@@ -115,7 +115,7 @@ bool jit_compile(const Program& p, JitCode& out) {
                 guard = e.jcc(Emitter::CC_B);
             }
             const Idiom& d = p.idioms[(size_t)x.arg];
-            if (d.kind == IDIOM_DIVMOD) {
+            if (d.kind == IDIOM_DIVMOD || d.kind == IDIOM_DIVIDE) {
                 e.mov_ctxptr_from_r12();
                 e.mov_rcx_rbx();
                 e.b({0xBA}); e.d32(x.arg);                         // mov edx, idx

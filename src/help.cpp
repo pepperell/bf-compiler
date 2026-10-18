@@ -122,9 +122,10 @@ OPTIMISATION AND DEVICES
   Loops such as [>+<-] are compiled into single multiply-add instructions.
   Loops that run a cell's value times with tests inside (a carry chain, a
   compare, halving, byte division: what BFL's multi-byte arithmetic is made
-  of) are recognised as idioms and run in one step.  Known cell values are
-  carried from block to block, so stores of a value a cell already holds
-  disappear.
+  of) are recognised as idioms and run in one step, and so is the whole
+  bit-by-bit loop of BFL's word and long division, recognised by its exact
+  text.  Known cell values are carried from block to block, so stores of a
+  value a cell already holds disappear.
   None of this changes what a device sees: whenever the pointer can reach the
   device window the executor runs the literal program, one command at a time
   (only runs of < and > are merged, since moving touches no cell), so a

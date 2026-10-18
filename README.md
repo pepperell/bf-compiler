@@ -162,6 +162,17 @@ faster with `*` and `>>`); with it the raytracer's frame went from 75 to
 66 ms and its code from 5.67 M to 5.12 M commands, and `raytracer_text.bfl` from 36.5 to
 30 ms.
 
+**Division.** A word or long `/` or `%` is one bit-by-bit loop of 16 or 32 passes
+(shift, subtract, add back on a borrow), too large for the symbolic matching. The
+compiler emits it from a generator in the executor (`bf::division_loop`), and the
+optimiser recognises a loop whose commands are exactly that text and runs all its
+passes in one step, with its scratch cells checked on entry as for the other idioms. A
+32-bit `/` runs about 200 IR instructions instead of 7 150 and is half the code; even as
+written it runs in linear time (850 000 commands instead of 27 million), since a byte's
+zero test there does not copy the byte. The raytracer's frame went from 65 to 58 ms (its
+light map from 158 to 89 ms) and its code to 4.80 M commands, and `raytracer_text.bfl`
+from 29.5 to 25 ms.
+
 ## Memory map
 
 Cells are 8-bit. The tape is `mmio_size` device cells followed by `ram_size` RAM cells.

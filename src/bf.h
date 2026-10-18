@@ -62,10 +62,13 @@ enum IdiomKind : uint8_t {
     IDIOM_SATSUB,   // cells[0] = max(cells[0] - passes, 0)
     IDIOM_HALVE,    // cells[0] += passes / 2, cells[1] += passes % 2
     IDIOM_DIVMOD,   // cells R, C, Q, B: per pass R++, C--, and when C reaches 0: Q++, R = 0, C = B
+    IDIOM_DIVIDE,   // the division loop (division_loop): cells the bytes of A, R and B, `bytes` each;
+                    // per pass (A:R) <<= 1, and when R >= B: R -= B, A |= 1
 };
 struct Idiom {
     IdiomKind kind;
     int8_t    sign = 1;                 // IDIOM_ADD
+    uint8_t   bytes = 0;                // IDIOM_DIVIDE
     std::vector<int32_t> cells;
     struct Guard { int32_t off; uint8_t val; bool check; };
     std::vector<Guard> guards;          // scratch cells: hold val after every pass; check: must hold it on entry
@@ -89,6 +92,26 @@ Program     compile(const std::string& source, bool optimise = true);
 std::string disassemble(const Program& p);
 // Size in bytes of the x64 code the JIT produces for p (0 if it cannot be compiled).
 size_t      jit_code_size(const Program& p);
+
+// The BFL compiler's bit-by-bit division of n-byte numbers (2 <= n <= 8) as brainfuck text:
+// one loop on the pass counter at cell 0, which the optimiser recognises by its text (for
+// n = 2 and 4, the widths BFL divides) and runs in one step (ir.cpp, "the division loop").
+// Each pass shifts the 2n-byte number (A:R) left by one bit and, when R >= B, subtracts B
+// from R and sets A's low bit; after 8n passes from R = 0, A holds the quotient and R the
+// remainder.  Cells, relative to the counter: a group of 6 per byte of the chain A0..An-1,
+// R0..Rn-1, X (the byte, two cells for its zero test, a counter, and in R's groups B's byte
+// and a temporary).  Every cell but A, R and B is zero on entry and after every pass; B is
+// unchanged.
+struct DivisionLayout {
+    int n;
+    static int group(int j) { return 1 + 6 * j; }
+    int a(int k) const { return group(k); }
+    int r(int k) const { return group(n + k); }
+    int x() const { return group(2 * n); }       // R's borrow byte
+    int b(int k) const { return group(n + k) + 4; }
+    int cells() const { return group(2 * n) + 1; }
+};
+const std::string& division_loop(int n);
 
 // ---- hardware -----------------------------------------------------------------
 struct Device {
