@@ -482,20 +482,33 @@ void edit_select(HWND ed, int32_t a, int32_t b, bool scroll) {
 void editor_select(int32_t a, int32_t b, bool scroll) { edit_select(app.editor, a, b, scroll); }
 void editor_get_sel(CHARRANGE& cr) { SendMessageW(app.editor, EM_EXGETSEL, 0, (LPARAM)&cr); }
 
+// WM_SETREDRAW TRUE shows a hidden window (the editor behind the viewer, or the
+// reverse), so only a visible one is frozen while it is worked on.
+struct NoRedraw {
+    HWND h; bool on;
+    explicit NoRedraw(HWND w) : h(w), on((GetWindowLongW(w, GWL_STYLE) & WS_VISIBLE) != 0) { if (on) SendMessageW(h, WM_SETREDRAW, FALSE, 0); }
+    ~NoRedraw() { if (on) { SendMessageW(h, WM_SETREDRAW, TRUE, 0); InvalidateRect(h, nullptr, FALSE); } }
+};
+ITextDocument* text_doc(HWND ed);
 // Breakpoints show as a red background on one character (the editor or the viewer).
+// Undo is suspended: a mark is not an edit, and undoing one (or a theme's re-marking)
+// would bring back a background that start_debug no longer reads as a breakpoint.
 void mark_char(HWND ed, int32_t pos, bool on) {
     app.suppress_change++;
+    ITextDocument* doc = text_doc(ed);
+    if (doc) doc->Undo(tomSuspend, nullptr);
     CHARRANGE save; SendMessageW(ed, EM_EXGETSEL, 0, (LPARAM)&save);
-    SendMessageW(ed, WM_SETREDRAW, FALSE, 0);
-    edit_select(ed, pos, pos + 1, false);
-    CHARFORMAT2W cf{};
-    cf.cbSize = sizeof cf;
-    cf.dwMask = CFM_BACKCOLOR;
-    if (on) cf.crBackColor = th.bp; else cf.dwEffects = CFE_AUTOBACKCOLOR;
-    SendMessageW(ed, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-    SendMessageW(ed, EM_EXSETSEL, 0, (LPARAM)&save);
-    SendMessageW(ed, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(ed, nullptr, FALSE);
+    {
+        NoRedraw nr(ed);
+        edit_select(ed, pos, pos + 1, false);
+        CHARFORMAT2W cf{};
+        cf.cbSize = sizeof cf;
+        cf.dwMask = CFM_BACKCOLOR;
+        if (on) cf.crBackColor = th.bp; else cf.dwEffects = CFE_AUTOBACKCOLOR;
+        SendMessageW(ed, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+        SendMessageW(ed, EM_EXSETSEL, 0, (LPARAM)&save);
+    }
+    if (doc) { doc->Undo(tomResume, nullptr); doc->Release(); }
     app.suppress_change--;
 }
 void mark_bp(int32_t pos, bool on) { mark_char(app.editor, pos, on); }
@@ -579,14 +592,15 @@ void colour_source(HWND ed, bool bfl) {
     app.suppress_change--;
 }
 
-// Recover breakpoints from the red background marks (they move with edits).
+// Recover breakpoints from the red background marks (they move with edits).  Either
+// theme's mark counts: undoing a deletion brings text back with the colour it had.
 void collect_bps(const std::wstring& text, int32_t a, int32_t b, std::set<int32_t>& out) {
     if (a >= b) return;
     editor_select(a, b, false);
     CHARFORMAT2W cf{}; cf.cbSize = sizeof cf;
     SendMessageW(app.editor, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
     if (cf.dwMask & CFM_BACKCOLOR) {                     // uniform over the range
-        if (!(cf.dwEffects & CFE_AUTOBACKCOLOR) && cf.crBackColor == th.bp)
+        if (!(cf.dwEffects & CFE_AUTOBACKCOLOR) && (cf.crBackColor == make_theme(false).bp || cf.crBackColor == make_theme(true).bp))
             for (int32_t i = a; i < b; i++) if (is_bp_char(text[i])) out.insert(i);
         return;
     }
@@ -597,12 +611,13 @@ void collect_bps(const std::wstring& text, int32_t a, int32_t b, std::set<int32_
 void sync_bps_from_editor(const std::wstring& text) {
     app.suppress_change++;
     CHARRANGE save; editor_get_sel(save);
-    SendMessageW(app.editor, WM_SETREDRAW, FALSE, 0);
-    app.bps.clear();
-    collect_bps(text, 0, (int32_t)text.size(), app.bps);
-    SendMessageW(app.editor, EM_EXSETSEL, 0, (LPARAM)&save);
-    SendMessageW(app.editor, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(app.editor, nullptr, FALSE);
+    {
+        NoRedraw nr(app.editor);
+        app.bps.clear();
+        collect_bps(text, 0, (int32_t)text.size(), app.bps);
+        for (int32_t p : app.bps) mark_bp(p, true);          // one restored by undo may have the other theme's colour
+        SendMessageW(app.editor, EM_EXSETSEL, 0, (LPARAM)&save);
+    }
     app.suppress_change--;
 }
 
@@ -854,7 +869,10 @@ void lang_changed() {
     layout();
 }
 
+// Not while a run or a debug session is on: the machine thread runs app.prog (its code
+// and idiom tables) and the UI maps pcs back through app.lr until the run ends.
 bool compile_editor(bool optimise) {
+    if (app.mode != Mode::Idle) { set_status(L"Stop the program first."); return false; }
     std::wstring text = editor_text();
     std::string s = latin1(text);
     if (app.lang) {
@@ -1471,7 +1489,7 @@ void gen_create(HINSTANCE inst) {
 void gen_show(bool show) {
     ShowWindow(app.genwnd, show ? SW_SHOWNOACTIVATE : SW_HIDE);
     CheckMenuItem(app.menu, ID_VIEW_GEN, show ? MF_CHECKED : MF_UNCHECKED);
-    if (show) { if (app.lang) compile_editor(true); else gen_update(); }
+    if (show) { if (app.lang && app.mode == Mode::Idle) compile_editor(true); else gen_update(); }   // running: what runs
 }
 
 // ---- serial port selection ------------------------------------------------------------------
@@ -1686,6 +1704,28 @@ LRESULT CALLBACK list_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_P
         if (cd->dwDrawStage == CDDS_ITEMPREPAINT) { SetTextColor(cd->hdc, th.dim); return CDRF_DODEFAULT; }
     }
     return DefSubclassProc(h, m, w, l);
+}
+// A disabled push button in the dark theme: the dark visual style draws it nearly as
+// bright as an enabled one, so it is drawn here, flat with a faint outline and dim text.
+bool dark_disabled_button(NMCUSTOMDRAW* cd, LRESULT& r) {
+    HWND b = cd->hdr.hwndFrom;
+    wchar_t cls[16];
+    if (cd->dwDrawStage != CDDS_PREPAINT || IsWindowEnabled(b) || !GetClassNameW(b, cls, 16) || _wcsicmp(cls, L"Button") != 0) return false;
+    if ((GetWindowLongW(b, GWL_STYLE) & BS_TYPEMASK) != BS_PUSHBUTTON) return false;
+    RECT rc = cd->rc;
+    FillRect(cd->hdc, &rc, br_window);
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(56, 56, 56));
+    HGDIOBJ op = SelectObject(cd->hdc, pen), ob = SelectObject(cd->hdc, GetStockObject(NULL_BRUSH));
+    RoundRect(cd->hdc, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1, px(6), px(6));
+    SelectObject(cd->hdc, ob); SelectObject(cd->hdc, op); DeleteObject(pen);
+    wchar_t t[64]; GetWindowTextW(b, t, 64);
+    HGDIOBJ of = SelectObject(cd->hdc, (HFONT)SendMessageW(b, WM_GETFONT, 0, 0));
+    SetBkMode(cd->hdc, TRANSPARENT);
+    SetTextColor(cd->hdc, RGB(98, 98, 98));
+    DrawTextW(cd->hdc, t, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_HIDEPREFIX);
+    SelectObject(cd->hdc, of);
+    r = CDRF_SKIPDEFAULT;
+    return true;
 }
 void style_list(HWND lv) {
     SetWindowSubclass(lv, list_proc, 4, 0);              // again is harmless: the same id replaces it
@@ -2256,6 +2296,10 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_NOTIFY: {
         auto* nm = (NMHDR*)l;
+        if (nm->code == NM_CUSTOMDRAW && th.dark) {
+            LRESULT r;
+            if (dark_disabled_button((NMCUSTOMDRAW*)l, r)) return r;
+        }
         if (nm->idFrom == ID_WATCHLIST && nm->code == LVN_ITEMCHANGED) {
             auto* lv = (NMLISTVIEW*)l;
             if ((lv->uChanged & LVIF_STATE) && ((lv->uNewState ^ lv->uOldState) & LVIS_STATEIMAGEMASK) && app.dbg)

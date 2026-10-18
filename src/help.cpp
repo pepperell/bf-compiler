@@ -334,8 +334,10 @@ const wchar_t* LANGUAGE_TEXT = LR"(BFL - A LOW-LEVEL LANGUAGE THAT COMPILES TO B
 Files ending in .bfl are compiled to brainfuck before they run (Run > Source
 is BFL turns this on for other names).  Ctrl+B shows the generated brainfuck,
 either annotated (a "# L12: source" comment before each statement, indented
-by nesting) or compacted to the commands alone as one continuous string;
-Copy puts the shown form on the clipboard and File > Export writes a .b file.  The debugger steps by statement: F11
+by nesting) or compacted to the commands alone as one continuous string
+(while a program runs or is being debugged, the code of that program: edits
+are compiled at the next run); Copy puts the shown form on the clipboard and
+File > Export writes a .b file (not during a run).  The debugger steps by statement: F11
 steps into a procedure call, F10 steps over it, F9 sets a breakpoint on the
 statement at the caret, and the watch list is filled with the program's
 global variables.  The editor colours keywords, types, numbers, strings,
