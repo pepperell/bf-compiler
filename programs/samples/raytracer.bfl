@@ -403,8 +403,10 @@ proc place_camera(word ang) {
     }
 }
 
-// One pixel of a lamp's glow, if it is on the screen.
-proc glow(long x, long y, byte colour) {
+// One pixel of a lamp's glow, if it is on the screen.  Shared: draw_lamp calls it
+// 13 times, and one copy instead of 13 makes the program 2% smaller at no cost
+// in speed (docs/LANG.md, "When shared pays").
+shared proc glow(long x, long y, byte colour) {
     if (x >= 0 && x < W && y >= 0 && y < H) {
         FB_X = byte(x);
         FB_Y = byte(y);
