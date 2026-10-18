@@ -18,7 +18,7 @@ struct Ctx {
     uint32_t(*in_fn)(Ctx*);                        // 56  0..255, or 256 = leave the cell alone
     void*   (*slow_fn)(Ctx*, int32_t pc);          // 64  interpret from pc, return resume address
     int32_t (*idiom_fn)(Ctx*, int32_t idx);        // 72  run Program::idioms[idx] at ptr: 1 done, 0 run the body
-    uint8_t*  tape_end;                            // 80  tape + tape_size: an idiom runs inline only below it
+    uint8_t*  tape_end;                            // 80  tape + tape_size
     // ---- not touched by machine code ----
     uint8_t*       tape;
     size_t         tape_size;
@@ -40,6 +40,8 @@ struct Ctx {
     void*          exit_slow;     // stub: eax = ctx->status, then exit
     const uint8_t* jit_begin;
     const uint8_t* jit_end;
+    const struct JitProbe* probes;    // JitCode::probes, by address
+    size_t         n_probes;
     volatile int32_t halt_req;
     // debugger (interpreter only)
     const uint8_t* bp;            // per-pc breakpoint flags, or nullptr
@@ -102,6 +104,10 @@ inline bool has_label(const Program& p, size_t i) {
     return i == 0 || is_special(p.code[i].op) || is_special(p.code[i - 1].op);
 }
 
+// An inline idiom's opening instructions only read cells, among them its highest: a fault there (the idiom
+// reaches past the end of the tape) resumes at `resume`, the loop as written, with nothing changed.
+struct JitProbe { const uint8_t* begin; const uint8_t* end; const void* resume; };
+
 struct JitCode {
     uint8_t* mem = nullptr;
     size_t   size = 0;
@@ -109,6 +115,7 @@ struct JitCode {
     void*    exit_common = nullptr;
     void*    exit_slow = nullptr;
     std::vector<const void*> labels;
+    std::vector<JitProbe> probes;    // by address
     std::string error;
     ~JitCode();
 };

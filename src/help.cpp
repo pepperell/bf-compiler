@@ -417,10 +417,10 @@ EXPRESSIONS
   Numbers with an L suffix (5L) are long.
   && and || only evaluate the right side when needed.
   mulshr(a, b, k): (a * b) >> k for fixed point, with the exact double-width
-  product rounded down; k is a constant.  The loop runs once per bit of b and,
-  unlike *, does not swap the operands: put the smaller one second.  Then it
-  beats * then >> on two variables; a constant factor whose product fits is
-  faster as (a * 218) >> 8.
+  product rounded down; k is a constant.  It is one step like *, whatever
+  the order or size of the operands, a constant factor included, and has no
+  shift to do after it: faster than * then >> wherever >> shifts bits, and
+  as fast or within a few instructions when k is a whole number of bytes.
 
 ALLOCATION AND STRINGS
   Node* n = new Node;  int* a = new int[100];  byte* b = alloc(64);  free(n);

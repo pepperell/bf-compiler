@@ -289,7 +289,8 @@ def fault_cases():
     bad = []
     progs = {c[0]: c[1] for c in IDIOM_PROGRAMS}
     for name, prog, rams in (("word", progs["word-divide"], range(10, 46)), ("long", progs["long-divide"], range(10, 96, 2)),
-                             ("word-mul", progs["word-multiply"], range(10, 44)), ("long-mul", progs["long-multiply"], range(10, 100, 2))):
+                             ("word-mul", progs["word-multiply"], range(10, 44)), ("long-mul", progs["long-multiply"], range(10, 100, 2)),
+                             ("byte-mul", progs["byte-multiply"], range(4, 30))):
         bfl, b = os.path.join(tmp, name + ".bfl"), os.path.join(tmp, name + ".b")
         open(bfl, "w").write(prog + "\n")
         subprocess.run([BF, "--emit", b, bfl], capture_output=True, timeout=60)

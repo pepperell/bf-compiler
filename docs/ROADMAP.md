@@ -34,7 +34,7 @@ plus the type system, library and tooling they need.
 | 14 | Housekeeping (the raytracer animation) | nothing |
 | 15 | Multiplication as one IR step | 9 |
 | 16 | Planned: shorter trips to operands (placement of temporaries and globals) | 9 |
-| 17 | Planned: cheaper constant factors in `mulshr` | 10 |
+| 17 | Cheaper `mulshr`: no shift after the loop, signs as a start value, constant factors | 10, 15 |
 | 18 | Planned: loose ends of phases 11 to 13 | 11, 13 |
 | 19 | Fuzzer coverage of structs, `ref` arrays and `shared proc` | 9 |
 
@@ -730,7 +730,8 @@ Found along the way:
   loop near the end of the tape faulted at once, losing output the interpreter and the
   unoptimised run had printed (the new fault case, `long-multiply` with `--ram 70`). The
   inline code now compares the idiom's highest cell with `Ctx::tape_end` (offset 80) and
-  runs the loop as written past it.
+  runs the loop as written past it. (Phase 17 replaced the compare: the fault handler
+  now resumes such a loop as written.)
 - Without the idioms (`BF_NO_IDIOMS`) the loop always makes `8n` passes, so a 32-bit `*`
   runs 104 000 to 416 000 IR instructions instead of 35 000 to 106 000, as division did in
   phase 12; as written the loop alone is 0.2 to 2 million commands.
@@ -757,15 +758,181 @@ frame times no worse, and the tests and fuzzer are clean, also with `BFL_NO_LAYO
 
 ### Phase 17: cheaper constant factors in `mulshr`
 
-`mulshr` runs a constant factor through its general loop, so `mulshr(x, 577, 14)` is
-larger and slower than `(x * 577) >> 14`, and it takes its operands as written where
-`*` loops over the smaller one. Add an unrolled path for a constant factor (as
-`mul_constN` does for `*`) that keeps only the bytes surviving the shift, and swap
-the operands at run time by magnitude.
+As first planned, `mulshr` ran a constant factor through its general loop and took its
+operands as written where `*` looped over the smaller one. Phase 15 moved the ground:
+`*` and `mulshr` became one IR idiom (`bf::multiply_loop`), so neither the order nor
+the size of the operands matters, and a constant factor from 8 up runs the loop too.
+What was left was the work around the loop: the magnitudes and signs of the operands
+and of the result, and the last `k % 8` bits shifted by byte divisions after it
+(`mulshr(a, 218, 8)` ran 125 IR instructions against 82 for `(a * 218) >> 8`). So the
+plan became: measure `mulshr` against `*` then `>>` at every width and signedness, for
+two variables and for constant factors (small, 8 to 255, large, negative, powers of
+two), and make that work cheaper: the signs, a constant-factor path that knows the
+factor's sign and magnitude at compile time, powers of two as shifts, small factors
+unrolled. Also two points from phase 15's review: the help text on `mulshr`, and the
+cost of the JIT's `tape_end` compare before every inline idiom (2.5% on `cube.bfl`).
 
 Done when: `mulshr` is never larger or slower than `*` then `>>` for the same
 operands, measured over constant and variable factors at every width, with the
 grids and the fuzzer clean.
+
+**Built** in `mulshr` (`src/lang/codegen.cpp`), with the multiply loop as it was:
+
+- No shift after the loop. The loop's rule takes any pass count and every pass past
+  `8n` doubles `P`, so for `k % 8` not 0 `mulshr` runs `8 - k%8` passes more: `P` (still
+  `n + ceil(k/8)` bytes, at most `2n`) is then the product shifted left so far that the
+  result is the `n` bytes above the `ceil(k/8)` dropped. The byte divisions are gone. The
+  JIT runs 8n to 8n + 63 passes inline, `P = ((P << 8n) + A * B) << (passes - 8n)`
+  (before, only 8n; any other count goes through `idiom_fn` as before).
+- Signs as a start value. Signed factors are multiplied as they are stored: the product
+  of the bit patterns is the signed product plus 2^8n (`b` when `a < 0`, plus `a` when
+  `b < 0`), modulo 2^16n, and after the passes `P` is `P0 * 2^8n` plus the product, so
+  `P` starts at minus those (its low `w - n` bytes, one when `k <= 8`). The bytes kept
+  are then the rounded-down result as they stand: no negating the operands, no record
+  of the bits shifted out, no fix-up of a negative result. A sign is the byte compare
+  of the top byte with 127, its result the if-cell itself (`sign_test`).
+- Constant factors, either operand, with the sign known at compile time: a factor
+  `c >= 0` needs only `a`'s sign, and then adds a constant to `P0`; a negative one
+  starts `P0` at `-a` as well. A power of two whose shift is a whole number of bytes is
+  that shift (`mulshr(a, 4096, 12)` is `a`, `mulshr(a, 256, 16)` a byte move), 0 gives
+  0 and `k = 0` is `*`.
+- `multiply_block` frees its cells without clearing them: after the loop, as written or
+  in one step, everything but `P` and `A` is zero, and `take` empties `P`. That saved a
+  `[-]` (an IR instruction) per cell of the block and makes `*` cheaper too.
+- `sign_flag` (signed `>>`, `<<`, division, comparisons) lost a temporary and a test: the
+  compare's result goes straight into the flag.
+
+Tried and dropped: unrolling small factors as `mul_constN` does. The exact product
+needs the byte above the operand's, and copies and adds on `n + 1` bytes were slower
+than the loop (`mulshr(w, 3, 8)` on `word`s: 46 IR instructions and 852 commands,
+against 18 and 769 for the loop); and putting a byte's factors straight into the
+block, which made the pointer travel further (364 to 468 commands).
+
+Measured by a script (not in the tree) over 230 cases: `mulshr(a, f, k)` against
+`(a * f) >> k` at every type, for `f` a second variable and 2, 3, 5, 7, 16, 41, 128,
+218, 256, 577, 4096, 65536, 1103515245, -3, -218 and -577 where they fit, and two
+shift counts per width (`k` = 4 and 7 for bytes, 7 and 8 for 16 bits, 12 and 16 for 32;
+for signed types also with `a` negative). Each is the IR instructions the whole program
+executes (`bf --profile`) and its commands, less those of the same program with
+`c = a;` (or `c = a + b;`) in place of the statement, all printing `c` in a way that
+costs the same whatever its value. Before, `mulshr` was slower in 115 cases and larger
+in 57; after, slower in 6 and larger in 23. Some of them (IR instructions / commands):
+
+| | `mulshr` before | after | `*` then `>>` before | after |
+|---|---:|---:|---:|---:|
+| `byte`, k = 4, two variables | 40 / 840 | 4 / 364 | 10 / 348 | 10 / 348 |
+| `byte`, k = 4, 218 | 43 / 860 | 6 / 387 | 16 / 341 | 16 / 341 |
+| `sbyte`, k = 4, two variables | 94 / 1 642 | 28 / 1 085 | 87 / 1 992 | 67 / 1 884 |
+| `sbyte`, k = 4, -3 | 106 / 1 621 | 31 / 746 | 95 / 1 950 | 75 / 1 842 |
+| `word`, k = 7, two variables | 58 / 1 960 | 10 / 549 | 123 / 3 698 | 108 / 3 620 |
+| `word`, k = 8, two variables | 33 / 721 | 10 / 548 | 32 / 893 | 17 / 815 |
+| `word`, k = 8, 218 | 42 / 969 | 18 / 804 | 41 / 1 141 | 26 / 1 063 |
+| `word`, k = 8, 3 | 42 / 934 | 18 / 769 | 18 / 550 | 18 / 550 |
+| `word`, k = 8, 256 | 42 / 932 | 0 / 53 | 40 / 1 106 | 25 / 1 028 |
+| `int`, k = 7, two variables | 146 / 3 135 | 32 / 1 400 | 254 / 6 764 | 204 / 6 497 |
+| `int`, k = 8, two variables | 116 / 1 894 | 32 / 1 399 | 46 / 1 184 | 28 / 1 079 |
+| `int`, k = 7, 218 | 146 / 3 371 | 30 / 1 237 | 244 / 7 012 | 215 / 6 745 |
+| `int`, k = 8, 218 | 116 / 2 130 | 30 / 1 236 | 51 / 1 432 | 36 / 1 327 |
+| `int`, k = 8, -218 | 132 / 2 133 | 34 / 1 330 | 55 / 1 435 | 37 / 1 330 |
+| `int`, k = 8, 2 | 116 / 2 094 | 30 / 1 164 | 31 / 656 | 29 / 629 |
+| `dword`, k = 12, two variables | 96 / 2 298 | 11 / 868 | 147 / 8 238 | 118 / 8 090 |
+| `dword`, k = 16, two variables | 55 / 1 245 | 11 / 864 | 53 / 3 392 | 24 / 3 244 |
+| `dword`, k = 12, 1103515245 | 123 / 3 924 | 32 / 2 506 | 174 / 9 864 | 145 / 9 716 |
+| `long`, k = 12, two variables | 157 / 4 468 | 30 / 3 589 | 247 / 10 401 | 195 / 10 118 |
+| `long`, k = 16, two variables | 111 / 3 423 | 30 / 3 585 | 70 / 3 692 | 38 / 3 517 |
+| the same, `a` negative | 159 / 3 423 | 41 / 3 585 | 67 / 3 692 | 38 / 3 517 |
+| `long`, k = 12, 218 | 178 / 5 792 | 39 / 2 827 | 257 / 11 749 | 205 / 11 466 |
+| `long`, k = 16, 218 | 133 / 4 747 | 39 / 2 823 | 90 / 5 040 | 58 / 4 865 |
+| `long`, k = 12, -577 | 230 / 5 830 | 48 / 4 298 | 282 / 11 787 | 245 / 11 504 |
+| `long`, k = 12, 4096 | 172 / 5 770 | 1 / 175 | 262 / 11 729 | 210 / 11 446 |
+| `long`, k = 16, 3 | 133 / 4 712 | 39 / 2 753 | 89 / 3 228 | 84 / 3 201 |
+
+`*` then `>>` got cheaper as well, from the multiply block and `sign_flag`. So the "Done
+when" is met except where `>>` moves whole bytes, and only there:
+
+- Two signed variables (`int` with `k = 8`: 32 against 28 IR instructions, 1 399 against
+  1 079 commands; `long` with `k = 16` and `a` negative: 41 against 38). `mulshr` tests
+  both signs and corrects `P0` for each, while the wrapped `*` needs neither and the
+  byte shift one sign test.
+- A factor of 2 (`int`, `k = 8`: 30 against 29; `word`: 18 against 12) and, in commands
+  only, the other factors below 8 (`word`, `k = 8`, 3: 769 against 550): `*` unrolls
+  them into a copy or two on `n` bytes, the loop is about 430 commands.
+- Bytes, in commands only: 4 to 15% larger (the loop against the byte product and
+  four halvings), at a third of the IR instructions or less.
+
+`tools/bench.py --only ops` now counts an operation's IR instructions as the whole
+program's less the program's without it, and its output line no longer depends on the
+values (see "Found along the way"); it also has `(int * int) >> 8`, `mulshr(int, int, 8)`,
+`(long * 218) >> 8` and `mulshr(long, 218, 8)`. Before and after, both counted that way:
+
+| | before | after |
+|---|---:|---:|
+| `long * long`, IR instructions / commands | 83 / 5 945 | 54 / 5 797 |
+| `(long * long) >> 12` | 280 / 13 085 | 228 / 12 802 |
+| `mulshr(long, long, 12)` | 194 / 7 152 | 69 / 6 273 |
+| `(int * int) >> 7` | 266 / 7 322 | 219 / 7 055 |
+| `mulshr(int, int, 7)` | 160 / 3 693 | 50 / 1 958 |
+| `(int * int) >> 8` | 58 / 1 742 | 42 / 1 637 |
+| `mulshr(int, int, 8)` | 130 / 2 452 | 50 / 1 957 |
+| `(long * 218) >> 8` | 100 / 5 443 | 67 / 5 268 |
+| `mulshr(long, 218, 8)` | 125 / 4 865 | 54 / 2 949 |
+| `3 long * in a sum` | 321 / 10 210 | 233 / 10 062 |
+| `3 mulshr in 2 statements` | 788 / 14 931 | 368 / 14 076 |
+| `raytracer.bfl`: ms a frame / light map / commands | 40.3 / 40 / 3.66 M | 31.0 / 38 / 3.62 M |
+| `raytracer_text.bfl` | 15.3 / 36 / 3.18 M | 12.1 / 34 / 3.14 M |
+| `cube.bfl`: ms a frame / commands | 1.35 / 252 K | 1.29 / 250 K |
+| `starfield.bfl` | 1.06 / 1.23 M | 1.07 / 1.23 M |
+
+Frame times: tools/bench.py --only frames on the commit before (built in a temporary
+worktree) and on this one, run alternately, five rounds each, the fastest; the machine
+was shared with other work. No sample got larger; the raytracers are 1.2% and 1.3%
+smaller. The raytracer's 16 frames rendered headless are identical to the commit
+before.
+
+**The JIT's end-of-tape check.** Phase 15's compare (`lea rax, [r12+hi]`, `cmp rax,
+[rbx+80]`, `jae`) before every inline idiom is gone. The inline code of each idiom opens
+with instructions that only read cells: the scratch-cell guards, the loop cell, the
+loads of the multiply loop's operands, the first source of a product. When those do
+not read its highest cell, one load of that cell (`mov cl, [r12+hi]`) goes first (in
+`cube.bfl` 33 of 335 inline idioms need it, in `raytracer_text.bfl` 718 of 2 439). A
+fault in those instructions has changed nothing, so the fault handler (`veh` in
+`src/machine.cpp`), finding the faulting address past the tape's end and the
+instruction in one of them (`JitCode::probes`), resumes at the loop as written, which
+faults or not where it should. Keeping `tape_end` in a register (r14 less the largest
+idiom's reach, one `cmp r12, r14`) was tried first and measured no faster on
+`cube.bfl`. Measured as above, six rounds each, with the old compare / with none (unsafe,
+for reference) / with the probes: `cube.bfl` 1.34 / 1.29 / 1.29 ms, the raytracer 31.6 /
+30.7 / 30.9 ms, `starfield.bfl` 1.04 / 1.05 / 1.06 ms, `raytracer_text.bfl` 11.9 / 11.8
+/ 12.0 ms: the check cost about 4% on the cube and 3% on the raytracer, the probes 0 and 1%;
+the other two move within the noise of code alignment (a probe
+written as `movzx ecx` instead measured 3% slower on the cube). `fault-idiom-loops-at-end`
+in `tests/test.py` covers it (and now a byte product too); without any check it fails
+(`long-mul` at `--ram 70`).
+
+Tests: `mulshr-const-*` in `tests/test_lang.py`, a grid per type of `mulshr(a, C, k)`
+and `mulshr(C, a, k)` for 7 to 12 constants (0, 1, powers of two, small, negative, the
+type's extremes) and up to 22 counts from 0 to past the double width. The fuzzer gives one
+`mulshr` in three a constant factor, either side, negated in three of ten. `python
+tests/fuzz.py --bfl 1500 --bf 500` ran clean from seeds 700 000 (before the JIT change),
+710 000 (with the probe load written as `movzx`) and 720 000 (the final build), and both
+test suites pass.
+
+Found along the way:
+
+- `tools/bench.py --only ops` charged an operation the IR instructions `bf --profile`
+  gives its line, but the profiler charges a straight-line block to the statement it
+  starts in, so a line's count held some of the next line's: up to 20 IR instructions
+  that depended on what the operation left behind (`mulshr(int, int, 8)` counted 58
+  against 31 for `(int * int) >> 8`, which by the whole program's count are 50 and 42).
+  And `lc >> 8` in its output line is signed, so its cost depended on the values.
+- The IR optimiser does not know that a fresh temporary is zero, so a copy through one
+  is 5 IR instructions after a loop and 1 after a known clear: the same operation costs
+  some 5 to 15 instructions more or less depending on its neighbours (the `int`, `k = 8`
+  case above is 32 against 28 in one program and 50 against 42 in another).
+- An optimised multiply-add writes its destination even when its source is 0, so
+  `x[- y[- d+ t+] t[- y+]]` with `y` = 0 and `d` past the end of the tape faults in the
+  JIT and the interpreter where the program as written does not touch `d`. This was so
+  before; not fixed.
 
 ### Phase 18: loose ends of phases 11 to 13
 

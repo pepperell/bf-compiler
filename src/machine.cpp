@@ -2,6 +2,7 @@
 #include "internal.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <cstdio>
@@ -29,6 +30,16 @@ LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     bool in_jit = cr->Rip >= (DWORD64)c->jit_begin && cr->Rip < (DWORD64)c->jit_end;
     if (!in_jit && !c->stop) return EXCEPTION_CONTINUE_SEARCH;    // a real bug somewhere else
+    if (in_jit && !c->stop && (uintptr_t)er->ExceptionInformation[1] >= (uintptr_t)c->tape_end) {
+        // an inline idiom read a cell past the end of the tape before changing any: run the loop as written
+        const uint8_t* rip = (const uint8_t*)cr->Rip;
+        const JitProbe* end = c->probes + c->n_probes;
+        const JitProbe* pr = std::upper_bound(c->probes, end, rip, [](const uint8_t* a, const JitProbe& b) { return a < b.begin; });
+        if (pr != c->probes && rip < (--pr)->end) {
+            cr->Rip = (DWORD64)pr->resume;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
 
     c->fault_addr = (uintptr_t)er->ExceptionInformation[1];
     c->fault_ptr = in_jit ? c->fault_addr : (uintptr_t)c->ptr;    // the cell accessed, as the interpreter reports it
@@ -201,6 +212,8 @@ RunResult Machine::run(const Program& p, bool use_jit) {
         ctx.exit_slow = jit.exit_slow;
         ctx.jit_begin = jit.mem;
         ctx.jit_end = jit.mem + jit.size;
+        ctx.probes = jit.probes.data();
+        ctx.n_probes = jit.probes.size();
     }
 
     // Maps for device-window execution.  Optimised instructions must never run

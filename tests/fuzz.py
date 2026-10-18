@@ -1258,7 +1258,13 @@ class Gen:
             return Bin(op, a, b)
         if k < 0.71:
             kk = r.choice([0, 1, 4, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32, 33, 40, 48, 63, 64, 65, 100])
-            return MulShr(self.expr(cx, depth + 1), self.expr(cx, depth + 1), kk)
+            a, b = self.expr(cx, depth + 1), self.expr(cx, depth + 1)
+            if r.random() < 0.35:              # a constant factor (the compiler's own paths), either side
+                c = self.lit()
+                b = Un("-", c) if r.random() < 0.3 else c
+                if r.random() < 0.5:
+                    a, b = b, a
+            return MulShr(a, b, kk)
         if k < 0.82:
             return Cast(r.choice(TNAMES), self.expr(cx, depth + 1))
         if k < 0.91:

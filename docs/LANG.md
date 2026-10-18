@@ -354,19 +354,25 @@ int  x1 = mulshr(x, cosine, 10) + mulshr(z, sine, 10);   // the product needs 32
 - So whenever `a * b` does not overflow, `mulshr(a, b, k)` equals `(a * b) >> k`;
   when it does, `mulshr` still gives the right answer. Two constants fold exactly.
 
-Cost: the multiply loop of `*` ("Idioms used by the compiler"), on the magnitudes,
-computing only the low `n + k/8` bytes of the product (`n` the type's bytes; one more
-when `k % 8` is not 0, at most `2n`), which the optimiser runs in one step; the bytes below the shift are
-dropped and the last `k % 8` bits are one pass of byte divisions. A Q12 product of
-two `long`s runs about 190 IR instructions and compiles to about 7 300 commands,
-against 260 and 13 200 for `(a * b) >> 12` (`tools/bench.py`); for `int` it is 160
-and 3 800 against 260 and 7 700, since `>>` on an `int` is unrolled bit by bit. The
-values of the operands and their order do not change the cost. A constant factor
-runs the same loop: `mulshr(a, 218, 8)` on `long`s runs about 125 IR instructions
-against 80 for `(a * 218) >> 8` (the signs cost the difference), in about 5 100
-commands against 5 700. So `mulshr` pays wherever `a * b` could overflow and for
-two variables; a constant factor whose product fits is a little faster with `*` and
-`>>`.
+Cost: the multiply loop of `*` ("Idioms used by the compiler"), which the optimiser
+runs in one step, keeping the low `n + ceil(k/8)` bytes of the product (`n` the type's
+bytes, at most `2n`). When `k % 8` is not 0 it runs `8 - k%8` passes more, which shift
+the product left so that the result is the `n` bytes above the ones dropped: nothing
+is shifted after the loop. Signed factors are multiplied as they are stored, the
+product starting from a value that corrects for the signs, so the bytes kept are
+already the rounded-down result. A constant factor, either operand, runs the same
+loop with its sign known at compile time; a power of two whose shift is a whole
+number of bytes is just that shift (`mulshr(a, 4096, 12)` is `a`). A Q12 product of
+two `long`s runs about 70 IR instructions and compiles to about 6 300 commands,
+against 230 and 12 800 for `(a * b) >> 12` (`tools/bench.py`), since `>>` by bits is
+unrolled bit by bit; `mulshr(a, 218, 8)` on `long`s is about 55 against 65, in 2 900
+commands against 5 300. The values of the operands and their order do not change
+the cost. Only where `>>` moves whole bytes can `*` then `>>` come out a little
+ahead: on two signed variables (`mulshr` tests both signs, while the wrapped `*`
+needs neither; on `int`s with `k = 8`, about 50 IR instructions against 42), for a
+factor of 2, and in size for a constant factor below 8, which `*` unrolls into a
+few copies. So `mulshr` pays wherever `a * b` could overflow, and almost everywhere
+else as well.
 
 ## Registers
 
@@ -463,7 +469,7 @@ Cost model, roughly, per operation on bytes:
 | `a[i]` read / write | ~70 | ~15·i |
 
 Word operations are 5 to 20 times a byte's; word `*`, `mulshr`, `/` and `%` loop
-once per bit (16 passes for a word, 32 for a long). The executed column is
+once per bit (16 passes for a word, 32 for a long, up to 7 more for `mulshr`). The executed column is
 what a plain brainfuck interpreter does. On this machine the IR optimiser turns
 the common idioms (clear, move, copy, constant multiply) into single
 instructions, and it also recognises the loops whose trip count is a value: the
@@ -471,7 +477,7 @@ byte compare, the carry and borrow chains of multi-byte `+` and `-`, halving
 (shifts, bitwise operators), byte division and the byte `*` each run as one step
 (`src/ir.cpp`, "loop idioms"), and so do the whole multi-byte division and
 multiply loops ("the division loop", "the multiply loop"). Measured in IR
-instructions executed, a 32-bit `+` is about 40, `<` about 120, `*` about 85 and
+instructions executed, a 32-bit `+` is about 40, `<` about 120, `*` about 55 and
 `/` about 200, against 10 000, 2 300, 100 000 to 400 000 and 290 000 without
 those idioms; a byte `*` is about 15, where its loop took 3 a unit of a factor. Several
 of the same 16- or 32-bit `*`, `mulshr`, `/` or `%` in one sum or run of
@@ -526,18 +532,20 @@ These are the building blocks; knowing them helps read the output and write
   width, is one loop on a block of `5n + 4w + 2` temporaries
   (`bf::multiply_loop` and `bf::MultiplyLayout` in `src/bf.h`), `w` being the
   bytes of the product it keeps: `n` for `*`, which wraps, up to `2n` for
-  `mulshr`. The block holds the pass counter, set to `8n`, then a group per byte
+  `mulshr`. The block holds the pass counter, set to `8n` (for `mulshr` up to
+  7 more, see "Fixed point: mulshr"), then a group per byte
   of the product `P` (the byte, two cells for its zero test, a counter, and in
   the low `n` groups a byte of the factor `A`), four cells per byte of the other
   factor `B` (the byte, two cells for its zero test, a counter) and the bit `X`.
   Each pass doubles `P` (high byte first, as division shifts; the top bit is dropped),
   shifts `B` left by one bit into `X`, and when `X` is set adds `A` to `P`, each
   byte of `A` counted out with a carry chain up to `P`'s top byte. After the
-  `8n` passes `P` is `A * B` and `B` is 0. As written that is 32 passes for a
+  `8n` passes `P` is `A * B` plus `P`'s start value times `2^8n`, and `B` is 0;
+  each pass more doubles `P`. As written that is 32 passes for a
   long whatever the values (about 0.2 to 2 million commands for a 32-bit `*`);
   the optimiser recognises the loop by its exact text and runs all the passes in
-  one step, about 85 IR instructions for a 32-bit `*` with the moves in and out.
-  Signs and the shift of `mulshr` are done around it. A constant factor from 8
+  one step, about 55 IR instructions for a 32-bit `*` with the moves in and out.
+  `mulshr`'s signs are its start value and its shift the passes more. A constant factor from 8
   up is put into `B` and runs the same loop, which is smaller than the unrolled
   shifts and adds; a smaller one is copies, shifts and adds. A byte `*` is
   `x[- y[- d+ t+] t[- y+]]`, which the optimiser runs as one product.

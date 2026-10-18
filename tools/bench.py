@@ -11,7 +11,10 @@ Measures with out\\bf.exe of the tree it runs in (or the bf.exe given):
           Also the raytracers' light-map precompute
   ops     IR instructions executed (bf --profile) by one line doing a single
           operation on values read with 'in', so nothing folds, or a few that share
-          a routine; also the brainfuck commands the line adds to the program
+          a routine: the whole program's count less that of the program without the
+          line (the profiler charges a straight-line block to the statement it starts
+          in, so a per-line count would include some of the next line); also the
+          brainfuck commands the line adds to the program
 
 --json FILE writes the results; --compare FILE prints them next to an earlier --json
 file with the change. Takes under a minute.
@@ -123,7 +126,8 @@ byte ba = x;
 byte bb = y - 60;
 long lc; int ic; word wc; byte bc;
 '''
-TAIL = 'out byte(lc) + byte(lc >> 8) + byte(lc >> 16) + byte(lc >> 24) + byte(ic) + byte(wc) + bc;\n'
+# the same work whatever the values (unsigned shifts by whole bytes move bytes)
+TAIL = 'out byte(lc) + byte(dword(lc) >> 8) + byte(dword(lc) >> 16) + byte(dword(lc) >> 24) + byte(ic) + byte(word(ic) >> 8) + byte(wc) + bc;\n'
 
 # The cost of * depends on the operands' values: 'long * long' has the operands of the
 # shifted product, so the difference is the shift.
@@ -137,32 +141,34 @@ OPS = [('long * long', 'lc = fa * fb;'),           # 5200 * 4181, Q12-sized as i
        ('mulshr(long, long, 12)', 'lc = mulshr(fa, fb, 12);'),   # the same, fused (exact product)
        ('(int * int) >> 7', 'ic = (ia * ib) >> 7;'),     # -10600 * 47 >> 7 (* wraps, mulshr does not)
        ('mulshr(int, int, 7)', 'ic = mulshr(ia, ib, 7);'),
+       ('(int * int) >> 8', 'ic = (ia * ib) >> 8;'),     # a shift by whole bytes moves bytes
+       ('mulshr(int, int, 8)', 'ic = mulshr(ia, ib, 8);'),
+       ('(long * 218) >> 8', 'lc = (fa * 218) >> 8;'),   # a constant factor
+       ('mulshr(long, 218, 8)', 'lc = mulshr(fa, 218, 8);'),
        ('byte / byte', 'bc = ba / bb;'),           # 200 / 17
        # several operations of one kind share one copy of the routine (BFL_SHARE=0 turns that off)
        ('3 long * in a sum', 'lc = fa * fb + la * ld - lb * fa;'),
        ('3 mulshr in 2 statements', 'lc = mulshr(fa, fb, 12); lc = mulshr(lc, la, 12) - mulshr(lb, ld, 12);')]
 
-def profile_line(bf, path, line):
-    """IR instructions bf --profile charges to the statement on line"""
+def profile_total(bf, path):
+    """IR instructions bf --profile reports the program executed"""
     r = subprocess.run([bf, '--profile', path], input=bytes([200, 77]), capture_output=True, timeout=300)
     text = (r.stdout + r.stderr).decode('latin-1')        # the report is on stderr
-    if r.returncode or 'IR instructions executed' not in text:
+    m = re.search(r'profile: (\d+) IR instructions executed', text)
+    if r.returncode or not m:
         raise RuntimeError(f'--profile failed: {r.stderr.decode("latin-1").strip()}')
-    for m in re.finditer(r'^\s*(\d+)\s+[\d.]+%\s+(\d+)\s', text, flags=re.M):
-        if int(m.group(2)) == line:
-            return int(m.group(1))
-    return 0
+    return int(m.group(1))
 
 def ops(bf, tmp):
     res = {}
     base = os.path.join(tmp, 'op_base.bfl')
     open(base, 'w', newline='\n').write(SETUP + TAIL)
     base_size = emit_size(bf, base, tmp)
-    line = SETUP.count('\n') + 1
+    base_ir = profile_total(bf, base)
     for name, stmt in OPS:
         path = os.path.join(tmp, 'op.bfl')
         open(path, 'w', newline='\n').write(SETUP + stmt + '\n' + TAIL)
-        n = profile_line(bf, path, line)
+        n = profile_total(bf, path) - base_ir
         size = emit_size(bf, path, tmp)
         res[name] = n
         res[name + ' size'] = size - base_size if size is not None and base_size is not None else None

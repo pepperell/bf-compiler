@@ -488,6 +488,10 @@ struct Gen {
         if_nonzero(t, [&] { add(dst, -sign); });
     }
     void lt8_core(int64_t t1, int64_t t2, int64_t dst, int sign) {   // dst += sign*(t1 < t2); both consumed
+        lt8_loop(t1, t2);
+        if_nonzero(t2, [&] { add(dst, sign); });
+    }
+    void lt8_loop(int64_t t1, int64_t t2) {             // t2 = max(t2 - t1, 0), not 0 when t1 < t2; t1 consumed
         open(t1);
         {
             int64_t c = tmp(); copy(t2, c);
@@ -497,7 +501,6 @@ struct Gen {
             release(e); release(c);
         }
         close();
-        if_nonzero(t2, [&] { add(dst, sign); });
     }
     void eq8_cells(int64_t x, int64_t y, int64_t dst, int sign) {    // dst += sign*(x == y); preserved
         int64_t d = tmp();
@@ -515,10 +518,18 @@ struct Gen {
     void sign_flag(int64_t c, int64_t f) {
         int64_t t1 = tmp(); copy(c, t1);
         int64_t t2 = tmp(); set(t2, 128);
-        int64_t r = tmp();
-        lt8_core(t1, t2, r, 1);
-        not8(r, f, 1);
-        release(r); release(t2); release(t1);
+        lt8_loop(t1, t2);
+        not8(t2, f, 1);
+        release(t2); release(t1);
+    }
+    // a new temporary that is not 0 when the byte at c has its top bit set (c preserved): c - 127, or 0
+    int64_t sign_test(int64_t c) {
+        int64_t t = tmp(), u = tmp();
+        set(u, 127);
+        copy(c, t);
+        lt8_loop(u, t);
+        release(u);
+        return t;
     }
     // q += a / b, r += a % b.  a consumed, b cleared.
     void divmod8(int64_t a, int64_t b, int64_t q, int64_t r) {
@@ -751,13 +762,18 @@ struct Gen {
         }
     }
     // The multiply loop, bf::multiply_loop(n, w), which the optimiser runs in one step: A and B (n cells
-    // each, consumed) are moved into a block of fresh temporaries laid out as bf::MultiplyLayout says, and
-    // after its 8n passes the block's P holds A * B mod 256^w; take(c, L) moves P out of the block at c.
-    void multiply_block(int64_t a, int64_t b, int n, int w, const std::function<void(int64_t, const bf::MultiplyLayout&)>& take) {
+    // each, consumed) are moved into a block of fresh temporaries laid out as bf::MultiplyLayout says,
+    // pre(c, L) may then put a start value P0 into P, and each of the passes (8n by default; any more only
+    // double P) is P = 2P + A * (the top bit of B), B <<= 1: after them P holds
+    // (P0 * 2^8n + A * B) * 2^(passes - 8n) mod 256^w.  take(c, L) moves P out of the block at c, leaving
+    // every byte of P zero.
+    void multiply_block(int64_t a, int64_t b, int n, int w, const std::function<void(int64_t, const bf::MultiplyLayout&)>& take,
+                        int passes = 0, const std::function<void(int64_t, const bf::MultiplyLayout&)>& pre = {}) {
         bf::MultiplyLayout L{n, w};
         int64_t c = tmpN(L.cells());
         for (int k = 0; k < n; k++) { move(a + k, {{c + L.a(k), 1}}); move(b + k, {{c + L.b(k), 1}}); }
-        set(c, 8 * n);
+        if (pre) pre(c, L);
+        set(c, passes ? passes : 8 * n);
         go(c);
         out += bf::multiply_loop(n, w);
         known.clear();
@@ -766,7 +782,7 @@ struct Gen {
         for (int k = 0; k < n; k++) forget(c + L.a(k));
         take(c, L);
         for (int k = 0; k < n; k++) clear(c + L.a(k));
-        releaseN(c, L.cells());
+        drop(c, L.cells());                            // the rest of the block was zero after the loop
         for (int k = 0; k < n; k++) {
             if (trackable(a + k)) known[a + k] = 0;
             if (trackable(b + k)) known[b + k] = 0;
@@ -832,62 +848,117 @@ struct Gen {
         if (c >= 0) release(c);
     }
     // dst (n cells, known zero) = mulshr(ea, eb, k) at type t: floor(a * b / 2^k) of the exact product
-    // (2n bytes), in n bytes.  The multiply loop computes the w = n + k/8 (+1 when k%8) low bytes of the
-    // product (at most 2n): the bytes below k/8 are dropped, the n (+1) above them go to acc, and its last
-    // k%8 bits are one pass of byte divisions.  Signed values are multiplied as magnitudes; for a negative
-    // product the result is -(floor(m / 2^k) + 1 when bits shifted out were set), ~h or -h.
+    // (2n bytes), in n bytes.  The multiply loop keeps the low w = n + ceil(k/8) bytes of the product (at most
+    // 2n) and, when k % 8 is not 0, runs 8 - k%8 passes more, which shift it left so that the result is the
+    // n bytes above the ceil(k/8) dropped: no shift after the loop.  A signed product is the product of the
+    // bit patterns less 2^8n * (b when a < 0, plus a when b < 0), so P starts at minus those (mod 256^(w-n))
+    // and the floor of the two's complement value is its bytes as they stand.  From k = 8n on it is the high
+    // half shifted right by k - 8n.  A constant factor (either operand) goes into B, its sign known; a power
+    // of two whose shift is by whole bytes is that shift.
     void mulshr(const Expr& ea, const Expr& eb, int k, const Type* t, int64_t dst) {
+        const Expr* var = &ea;
+        std::optional<int64_t> c = fold(eb, true);
+        if (!c) { c = fold(ea, true); if (c) var = &eb; }
+        if (c) { mulshr(k, t, dst, [&](int64_t a, int64_t) { eval_into(*var, a, t); }, c); return; }
         mulshr(k, t, dst, [&](int64_t a, int64_t b) { eval_into(ea, a, t); eval_into(eb, b, t); });
     }
-    // the same with the factors put in a and b (n cells each, known zero) by load
-    void mulshr(int k, const Type* t, int64_t dst, const std::function<void(int64_t, int64_t)>& load) {
+    // the same with the factors put in a and b (n cells each, known zero) by load; with cst, b is that
+    // constant and load puts only a
+    void mulshr(int k, const Type* t, int64_t dst, const std::function<void(int64_t, int64_t)>& load,
+                std::optional<int64_t> cst = std::nullopt) {
         int n = std::max(t->size, 1);
         bool sgn = t->is_signed;
         k = std::min(k, 16 * n);                      // floor(a * b / 2^16n) is already 0 or -1
-        int q = k / 8, r = k % 8, w = std::min(2 * n, n + q + (r ? 1 : 0));
-        int64_t neg = sgn ? tmp() : -1, a = tmpN(n), b = tmpN(n);
-        load(a, b);
-        int64_t e = -1;                               // 1 while the bits shifted out are all zero
-        if (sgn) {
-            int64_t s2 = tmp(), c = tmp();
-            sign_flag(a + n - 1, neg);
-            copy(neg, c); if_nonzero(c, [&] { negN(a, n); });
-            sign_flag(b + n - 1, s2);
-            copy(s2, c); if_nonzero(c, [&] { negN(b, n); });
-            release(c);
-            move(s2, {{neg, -1}});                     // neg != 0: the signs differ
-            release(s2);
-            e = tmp();
-            set(e, 1);
+        uint64_t cu = cst ? (uint64_t)*cst & ((1ull << (8 * n)) - 1) : 0;
+        bool cneg = cst && sgn && (cu >> (8 * n - 1)) & 1;
+        if (cst && (!cu || k == 0 || (!cneg && !(cu & (cu - 1))))) {
+            int j = 0;
+            while (cu && !((cu >> j) & 1)) j++;
+            int s = k - j;                            // a * 2^j / 2^k: a shifted right by s, or left by -s
+            if (!cu || k == 0 || s % 8 == 0) {
+                int64_t a = tmpN(n);
+                load(a, -1);
+                if (!cu) clearN(a, n);
+                else if (k == 0) mul_constN(a, (int64_t)cu, dst, n);
+                else {
+                    if (s) shift_bytes(a, n, std::min(std::abs(s) / 8, n), s < 0, sgn);
+                    moveN(a, dst, n);
+                }
+                releaseN(a, n);
+                return;
+            }
         }
-        int64_t acc = tmpN(n + 1);
+        bool upper = k >= 8 * n;
+        int q = upper ? n : k / 8, r = upper ? 0 : k % 8;
+        int Q = q + (r ? 1 : 0), w = n + Q;           // the bytes dropped and the bytes of P (at most 2n)
+        int64_t a = tmpN(n), b = tmpN(n);
+        load(a, cst ? -1 : b);
+        if (cst) setN(b, n, (int64_t)cu);
         multiply_block(a, b, n, w, [&](int64_t c, const bf::MultiplyLayout& L) {
             for (int i = 0; i < w; i++) {
-                int64_t pc = c + L.p(i);
-                if (i >= q) move(pc, {{acc + i - q, 1}});
-                else if (sgn) if_nonzero(pc, [&] { clear(e); });
-                else clear(pc);
+                if (i >= Q) move(c + L.p(i), {{dst + i - Q, 1}});
+                else clear(c + L.p(i));
             }
+        }, 8 * n + (r ? 8 - r : 0), [&](int64_t c, const bf::MultiplyLayout& L) {
+            if (!sgn || !Q) return;
+            auto P = [&](int i) { return c + L.p(i); };
+            std::function<void(int)> dec = [&](int from) {      // P -= 256^from (mod 256^Q)
+                if (from + 1 < Q) {
+                    int64_t z = tmp(); iszero8(P(from), z);
+                    if_nonzero(z, [&] { dec(from + 1); });
+                    release(z);
+                }
+                add(P(from), -1);
+            };
+            std::function<void(int)> inc = [&](int from) {      // P += 256^from (mod 256^Q)
+                add(P(from), 1);
+                if (from + 1 < Q) {
+                    int64_t z = tmp(); iszero8(P(from), z);
+                    if_nonzero(z, [&] { inc(from + 1); });
+                    release(z);
+                }
+            };
+            auto sub_low = [&](const std::function<int64_t(int)>& x) {   // P -= the low Q bytes of x (preserved)
+                if (Q == 1) { copy(x(0), P(0), -1); return; }
+                int64_t y = tmpN(Q);
+                for (int i = 0; i < Q; i++) copy(x(i), y + i);
+                for (int i = 0; i < Q - 1; i++) { open(y + i); add(y + i, -1); dec(i); close(); }
+                move(y + Q - 1, {{P(Q - 1), -1}});
+                releaseN(y, Q);
+            };
+            auto A = [&](int i) { return c + L.a(i); };
+            auto B = [&](int i) { return c + L.b(i); };
+            uint64_t lo = cu & ((1ull << (8 * Q)) - 1);   // Q <= n <= 4
+            if (cst && cneg) sub_low(A);
+            if (cst && !lo) return;
+            int64_t sa = sign_test(A(n - 1));
+            if (cst) {
+                if_nonzero(sa, [&] {                   // P -= lo: P is 0 unless the factor is negative
+                    uint64_t v = 0 - lo;
+                    for (int i = 0; i < Q; i++) {
+                        int64_t bt = (int64_t)((v >> (8 * i)) & 255);
+                        if (!bt) continue;
+                        if (!cneg || i == Q - 1) { add(P(i), bt); continue; }
+                        int64_t u = tmp(); set(u, bt);
+                        open(u); add(u, -1); inc(i); close();
+                        release(u);
+                    }
+                });
+            } else {
+                int64_t sb = sign_test(B(n - 1));
+                if_nonzero(sa, [&] { sub_low(B); });
+                if_nonzero(sb, [&] { sub_low(A); });
+                release(sb);
+            }
+            release(sa);
         });
-        if (r) {                                       // acc >>= r: acc[i] = acc[i] / 2^r + (acc[i+1] % 2^r) << (8 - r)
-            for (int i = 0; i <= n; i++) {
-                int64_t d = tmp(), qq = tmp(), rr = tmp();
-                set(d, int64_t(1) << r);
-                divmod8(acc + i, d, qq, rr);
-                move(qq, {{acc + i, 1}});
-                if (i) move(rr, {{acc + i - 1, 1 << (8 - r)}});
-                else if (sgn) if_nonzero(rr, [&] { clear(e); });
-                else clear(rr);
-                release(rr); release(qq); release(d);
-            }
-        }
-        if (sgn) if_nonzero(neg, [&] { notN(acc, n); if_nonzero(e, [&] { incN(acc, n); }); });
-        moveN(acc, dst, n);
-        releaseN(acc, n + 1);
-        if (sgn) release(e);
         releaseN(b, n);
         releaseN(a, n);
-        if (sgn) release(neg);
+        if (upper && k > 8 * n) {                       // the high half >> (k - 8n)
+            int s = k - 8 * n;
+            if (s / 8) shift_bytes(dst, n, std::min(s / 8, n), false, sgn);
+            for (int i = 0; i < s % 8; i++) shrN(dst, n, sgn);
+        }
     }
     // q += a / b, r += a % b (unsigned; b == 0 gives q = 0, r = a).  a consumed, b cleared; q and r start at zero.
     // The 8n passes of shift and subtract are bf::division_loop(n), which the optimiser runs in

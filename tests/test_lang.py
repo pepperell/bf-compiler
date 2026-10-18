@@ -284,6 +284,37 @@ def mulshr_grid(name, typ, values, counts=None):
     return check(name, "\n".join(lines), exp.encode(), stdin)
 
 
+def mulshr_const_grid(name, typ, values, consts):
+    """r = mulshr(a, C, k) and mulshr(C, a, k) for constant factors C (powers of two, small, negative,
+    the extremes) and counts k from 0 to past the double width, a read with `in`."""
+    bits, signed = TYPES[typ]
+    nb = bits // 8
+    counts = sorted({0, 1, 3, 7, 8, 9, 12, 15, 16, 17, 23, 24, 25, 31, 32, 33, 40, 47, 48, 63, 64, 70}
+                    & set(range(2 * bits + 7)))
+    raw = lambda v: bytes(((v & ((1 << bits) - 1)) >> (8 * (nb - 1 - i))) & 255 for i in range(nb))
+    load = "a = in;" + " a = a * 256 + in;" * (nb - 1)
+    lines = [f"{typ} a; {typ} r; byte n = in;", "while (n) {", "    n--; " + load]
+    for i, c in enumerate(consts):
+        for k in counts:
+            call = f"mulshr(a, {c}, {k})" if (i + k) % 3 else f"mulshr({c}, a, {k})"
+            lines.append(f'    r = {call}; print r, " ";')
+        lines.append('    out "\\n";')
+    lines.append("}")
+    stdin = bytes([len(values)]) + b"".join(raw(a) for a in values)
+    exp = "".join("".join(str(wrap((a * c) >> k, bits, signed)) + " " for k in counts) + "\n" for a in values for c in consts)
+    return check(name, "\n".join(lines), exp.encode(), stdin)
+
+
+MULSHR_CONST_GRIDS = [
+    ("mulshr-const-byte", "byte", [0, 1, 3, 128, 200, 255], [0, 1, 2, 3, 5, 7, 8, 16, 128, 218, 255]),
+    ("mulshr-const-sbyte", "sbyte", [0, 1, -1, 5, -7, 127, -128], [0, 1, 2, 3, -1, -3, -7, 16, 64, -64, 127, -128]),
+    ("mulshr-const-word", "word", [0, 1, 255, 4096, 40000, 65535], [1, 2, 3, 7, 41, 218, 256, 577, 4096, 32768, 65535]),
+    ("mulshr-const-int", "int", [0, 1, -1, 300, -4096, 32767, -32768], [1, 2, 3, -3, 218, -218, 256, -256, 577, 16384, 32767, -32768]),
+    ("mulshr-const-dword", "dword", [0, 1, 65536, 123456789, 4294967295], [2, 5, 218, 65536, 1103515245, 2147483648, 4294967295]),
+    ("mulshr-const-long", "long", [0, 1, -1, -5200, 2147483647, -2147483648], [1, 3, -3, 218, -577, 65536, -65536, 1103515245, -2147483648]),
+]
+
+
 MULSHR_GRIDS = [
     ("mulshr-byte", "byte", [0, 1, 3, 127, 128, 200, 255]),
     ("mulshr-sbyte", "sbyte", [0, 1, -1, 5, -7, 127, -128]),
@@ -883,6 +914,9 @@ def main():
             fails += 1
     for gname, typ, vals in MULSHR_GRIDS:
         if not mulshr_grid(gname, typ, vals):
+            fails += 1
+    for gname, typ, vals, consts in MULSHR_CONST_GRIDS:
+        if not mulshr_const_grid(gname, typ, vals, consts):
             fails += 1
     errors = [
         ("err-undeclared", "x = 1;", "not declared"),
