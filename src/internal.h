@@ -105,8 +105,9 @@ inline bool has_label(const Program& p, size_t i) {
 }
 
 // An inline idiom's opening instructions only read cells, among them its highest: a fault there (the idiom
-// reaches past the end of the tape) resumes at `resume`, the loop as written, with nothing changed.
-struct JitProbe { const uint8_t* begin; const uint8_t* end; const void* resume; };
+// reaches past the end of the tape) resumes at `resume`, the loop as written, with nothing changed, and turns
+// the 5-byte nop at `begin` into a jump to `stub`, which checks the end of the tape on every later entry.
+struct JitProbe { const uint8_t* begin; const uint8_t* end; const void* resume; const uint8_t* stub; };
 
 struct JitCode {
     uint8_t* mem = nullptr;

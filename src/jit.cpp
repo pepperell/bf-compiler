@@ -82,7 +82,7 @@ bool jit_compile(const Program& p, JitCode& out) {
     std::vector<size_t> label_pos(n, SIZE_MAX);
     std::vector<Fixup> fixups;
     std::vector<size_t> end_jumps;
-    struct Probe { size_t begin, end; int32_t resume_pc; };
+    struct Probe { size_t begin, end; int32_t resume_pc, hi; };
     std::vector<Probe> probes;
 
     // prologue
@@ -129,22 +129,25 @@ bool jit_compile(const Program& p, JitCode& out) {
             // written may stop short: a loop that reaches past the end of the tape must run as written, which
             // faults (or not) where it should.  The inline code opens with instructions that only read cells,
             // the idiom's highest among them (read first when nothing else there reads it), so a fault in them
-            // changes nothing and the fault handler resumes at the loop as written (JitCode::probes).
+            // changes nothing and the fault handler resumes at the loop as written (JitCode::probes).  The
+            // opening starts with a 5-byte nop, which the handler turns into a jump to a check of the end of
+            // the tape (probe_stub), so a loop that faults once does not fault every time it is entered.
             size_t probe_at = 0;
+            auto begin_probe = [&] { probe_at = e.pos(); e.b({0x0F, 0x1F, 0x44, 0x00, 0x00}); };   // nop dword [rax+rax]
             auto open_probe = [&](int32_t also) {      // also: a cell the opening reads besides cell 0 and the guards
-                probe_at = e.pos();
+                begin_probe();
                 bool covered = d.hi == 0 || d.hi == also;
                 for (const Idiom::Guard& g : d.guards) covered = covered || (g.check && g.off == d.hi);
                 if (!covered) { e.b({0x41, 0x8A}); e.r12mem(1, d.hi); }   // mov cl, [r12+hi]
             };
-            auto close_probe = [&] { probes.push_back({probe_at, e.pos(), (int32_t)i + 1}); };
+            auto close_probe = [&] { probes.push_back({probe_at, e.pos(), (int32_t)i + 1, d.hi}); };
             if (d.kind == IDIOM_DIVMOD || d.kind == IDIOM_DIVIDE) {
                 call_idiom();
             } else if (d.kind == IDIOM_MULTIPLY) {
                 // the 8n to 8n + 63 passes the compiler sets up, inline: P = ((P << 8n) + A * B) << (passes - 8n),
                 // B = 0 (mod 2^64, which the stores cut to w bytes); any other count goes through idiom_fn
                 int nb = d.bytes, w = d.wide;
-                probe_at = e.pos();                                // the guards and the loads below read every cell
+                begin_probe();                                     // the guards and the loads below read every cell
                 e.b({0x41, 0x0F, 0xB6}); e.r12mem(1, 0);           // movzx ecx, byte [r12]
                 e.b({0x83, 0xE9}); e.d8(8 * nb);                   // sub ecx, 8n
                 e.b({0x83, 0xF9, 0x3F});                           // cmp ecx, 63
@@ -351,6 +354,17 @@ bool jit_compile(const Program& p, JitCode& out) {
     e.b({0x8B, 0x43, 0x20});                                       // mov eax, [rbx+32]
     size_t js = e.jmp(); e.bind(js, exit_normal);
 
+    // probe_stub: the end-of-tape check a probe jumps to once it has faulted: past the end, the loop as
+    // written; else back into the probe after its nop
+    std::vector<size_t> stubs;
+    for (const Probe& pr : probes) {
+        stubs.push_back(e.pos());
+        e.b({0x49, 0x8D}); e.r12mem(0, pr.hi);                     // lea rax, [r12+hi]
+        e.b({0x48, 0x3B, 0x43, 0x50});                             // cmp rax, [rbx+80]  (tape_end)
+        fixups.push_back({e.jcc(Emitter::CC_AE), pr.resume_pc});
+        size_t back = e.jmp(); e.bind(back, pr.begin + 5);
+    }
+
     for (size_t at : end_jumps) e.bind(at, exit_normal);
     for (const Fixup& f : fixups) {
         if ((size_t)f.target_pc >= n || label_pos[f.target_pc] == SIZE_MAX) { out.error = "internal: jump to unlabelled IR"; return false; }
@@ -370,9 +384,10 @@ bool jit_compile(const Program& p, JitCode& out) {
     out.exit_slow = out.mem + exit_slow;
     out.labels.assign(n, nullptr);
     for (size_t k = 0; k < n; k++) if (label_pos[k] != SIZE_MAX) out.labels[k] = out.mem + label_pos[k];
-    for (const Probe& pr : probes) {
+    for (size_t k = 0; k < probes.size(); k++) {
+        const Probe& pr = probes[k];
         if (label_pos[(size_t)pr.resume_pc] == SIZE_MAX) { out.error = "internal: idiom body unlabelled"; return false; }
-        out.probes.push_back({out.mem + pr.begin, out.mem + pr.end, out.mem + label_pos[(size_t)pr.resume_pc]});
+        out.probes.push_back({out.mem + pr.begin, out.mem + pr.end, out.mem + label_pos[(size_t)pr.resume_pc], out.mem + stubs[k]});
     }
     return true;
 }
