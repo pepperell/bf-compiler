@@ -1,6 +1,6 @@
 # Roadmap: BFL towards modern programming
 
-Status: implemented (phases 0 to 14).
+Status: implemented (phases 0 to 14); phases 15 to 19 are planned (section 12).
 Hardware and devices are out of scope here. The sections below are the plan as
 written. Where the result differs, docs/HEAP.md (phase 0), docs/TRAMPOLINE.md
 (phase 7), the note under phase 8 and the **Built** notes in section 11 say what
@@ -32,6 +32,11 @@ plus the type system, library and tooling they need.
 | 12 | Faster division | 9 |
 | 13 | The profiler in the UI | nothing |
 | 14 | Housekeeping (the raytracer animation) | nothing |
+| 15 | Planned: multiplication as one IR step | 9 |
+| 16 | Planned: shorter trips to operands (placement of temporaries and globals) | 9 |
+| 17 | Planned: cheaper constant factors in `mulshr` | 10 |
+| 18 | Planned: loose ends of phases 11 to 13 | 11, 13 |
+| 19 | Planned: fuzzer coverage of structs, `ref` arrays and `shared proc` | 9 |
 
 One change from the earlier suggestion: better compiler errors move from last to
 phase 1. Pointers, structs and signed types need a real type checker, and today
@@ -630,7 +635,79 @@ commit it with a mention in README.md, or drop it.
 **Done**: `tools/rt_gif.py OUT.gif` renders the 16 frames headless (2 s in all, a
 frame about 55 ms); README.md shows the re-recorded `docs/raytracer.gif`.
 
-## 12. Decisions for you
+## 12. Next: phases 15 to 19 (planned)
+
+Where phases 9 to 14 leave things (`tools/bench.py`): a raytracer frame takes 55 ms
+and its light map 86 ms, the program is 4.06 M commands, a 32-bit `/` executes about
+200 IR instructions, and a 32-bit `*` still 1 700 to 2 400. The phases below were
+picked from that profile and from the open points the Built notes of section 11
+list.
+
+### Phase 15: multiplication as one IR step
+
+Division became one idiom in phase 12 (7 147 to 201 IR instructions); multiplication
+is now the costliest operation and the raytracer is mostly products and `mulshr`s.
+Do the same for it: emit the shift-and-add loops of `*` and `mulshr` from one
+generator in the executor (as `bf::division_loop` does), recognise a loop whose
+commands are exactly that text, and run all its passes in one step in the JIT and
+the interpreter, behind the same entry checks of the scratch cells as the other
+idioms. Cover it with `IDIOM_PROGRAMS` cases in `tests/test.py` (including pokes)
+and the fuzzer.
+
+Done when: a 32-bit `*` and `mulshr` execute a few hundred IR instructions or fewer,
+the raytracer frame time drops, and the grids and a long fuzz run are clean.
+
+### Phase 16: shorter trips to operands
+
+A raytracer statement's 40 000 to 70 000 commands were mostly pointer moves: a
+global 900 cells from the temporaries costs about 4 x 900 commands per byte copied
+(phase 10, "Found along the way"). Options to measure: place a statement's
+temporaries next to the variables it uses rather than above all of them; lay out
+globals so that variables used together sit together (the layout of phase 8 orders
+by use count, not by co-use); keep hot locals of a procedure close to its temporaries.
+
+Done when: the samples are measurably smaller (the raytracers by at least 10%) with
+frame times no worse, and the tests and fuzzer are clean, also with `BFL_NO_LAYOUT`.
+
+### Phase 17: cheaper constant factors in `mulshr`
+
+`mulshr` runs a constant factor through its general loop, so `mulshr(x, 577, 14)` is
+larger and slower than `(x * 577) >> 14`, and it takes its operands as written where
+`*` loops over the smaller one. Add an unrolled path for a constant factor (as
+`mul_constN` does for `*`) that keeps only the bytes surviving the shift, and swap
+the operands at run time by magnitude.
+
+Done when: `mulshr` is never larger or slower than `*` then `>>` for the same
+operands, measured over constant and variable factors at every width, with the
+grids and the fuzzer clean.
+
+### Phase 18: loose ends of phases 11 to 13
+
+- The profiler (UI and `bf --profile`) does not count instructions run through the
+  literal program while the pointer can reach the device window: add a count array
+  for the literal program, mapped back to the source.
+- Statements inside a shared-arithmetic run lose the cell values the compiler knew
+  before it (phase 11): keep the values that no statement in the run writes, and
+  restore the H cells' known values after the loop.
+- The UI has no dark theme, so the profiler's heat colours were tuned for the light
+  editor only: add a dark theme (editor, file viewer, terminal, panels) and heat
+  colours readable in both.
+
+Done when: each point is fixed with a test or a screenshot check, and the docs no
+longer list it as open.
+
+### Phase 19: fuzzer coverage
+
+`tests/fuzz.py` covers the integer types, arrays, pointers, loops and inlined and
+`rec` procedures. Structs (fields, copies, arrays of structs, structs in the heap and
+through pointers), `ref` array parameters and `shared proc` are covered only by
+hand-written tests and the separate `tests/fuzz_shared.py`. Add them to the
+generator and the Python model, and fold `fuzz_shared.py` into `fuzz.py`.
+
+Done when: a long run (thousands of programs) with the new constructs finds nothing,
+and every bug it found has a minimal regression test.
+
+## 13. Decisions for you
 
 1. **Pointer syntax.** C-style `byte* p`, `*p`, `p->x` is assumed. An alternative
    is Pascal-style `^byte`, or keeping `ref` and adding `ptr`.
@@ -642,7 +719,7 @@ frame about 55 ms); README.md shows the re-recorded `docs/raytracer.gif`.
 5. **Checks.** Null, bounds and stack checks are opt-in flags, since each one
    costs on every access.
 
-## 13. Risks
+## 14. Risks
 
 - **Heap access speed** decides how usable phases 3 to 7 are. Phase 0 exists to
   find out before anything depends on it.
