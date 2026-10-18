@@ -1,10 +1,10 @@
 # Roadmap: BFL towards modern programming
 
-Status: implemented (phases 0 to 9); phases 10 to 14 are planned (section 11).
+Status: implemented (phases 0 to 14).
 Hardware and devices are out of scope here. The sections below are the plan as
 written. Where the result differs, docs/HEAP.md (phase 0), docs/TRAMPOLINE.md
-(phase 7) and the note under phase 8 say what was built, and docs/LANG.md
-describes the language as it is.
+(phase 7), the note under phase 8 and the **Built** notes in section 11 say what
+was built, and docs/LANG.md describes the language as it is.
 
 BFL today has bytes and 16-bit words, byte arrays, inlined procedures with return
 values, and recursion through `rec proc` (docs/LANG.md, docs/TRAMPOLINE.md). What
@@ -30,7 +30,7 @@ plus the type system, library and tooling they need.
 | 10 | Fused multiply-and-shift for fixed-point arithmetic | 9 |
 | 11 | Arithmetic shared within a block, without the trampoline | 9 |
 | 12 | Faster division | 9 |
-| 13 | Planned: the profiler in the UI | nothing |
+| 13 | The profiler in the UI | nothing |
 | 14 | Housekeeping (the raytracer animation) | nothing |
 
 One change from the earlier suggestion: better compiler errors move from last to
@@ -233,16 +233,40 @@ touches breakpoint backgrounds nor fills the undo history. Watch rows show
 multi-byte, signed and pointer values whole. Run > Check heap accesses and Run >
 Check recursion stack match the `bf` flags.
 
-## 11. Phases 9 to 14 (9 to 12 built, the rest planned)
+## 11. Phases 9 to 14 (built)
 
 After phase 8 the optimiser learnt loop idioms (multi-byte carries, compares,
 halving and byte division each run in one step), known cell values carried
 across blocks, automatic layout of globals, one-walk array elements, folding of
 constant arguments and `shared proc` (README.md "Speed", docs/LANG.md). Where
-that leaves things, measured on `programs/samples/raytracer.bfl`: a frame takes
-70 ms (2.3 s before), the program is 5.67M brainfuck commands (7.92M before), a
-32-bit `*` executes about 2 400 IR instructions and a `/` about 7 000, and long
-arithmetic is most of both the code and the run time.
+that left things, measured on `programs/samples/raytracer.bfl` when this section
+was planned: a frame took 70 ms (2.3 s before the idioms), the program was 5.67 M
+brainfuck commands (7.92 M before), a 32-bit `*` executed about 2 400 IR
+instructions and a `/` about 7 000, and long arithmetic was most of both the code
+and the run time. The phases below were planned from there; each has a **Built**
+or **Done** note saying what was made.
+
+Where they leave things, measured with `tools/bench.py` against the commit before
+phase 10:
+
+| | before | now |
+|---|---:|---:|
+| `raytracer.bfl`: ms a frame / light map / commands | 75.0 / 175 / 5.67 M | 54.5 / 86 / 4.06 M |
+| `raytracer_text.bfl` | 36.5 / 174 / 5.18 M | 23.7 / 83 / 3.59 M |
+| `cube.bfl`: ms a frame / commands | 1.52 / 537 K | 1.32 / 313 K |
+| `starfield.bfl` | 1.25 / 1.81 M | 1.07 / 1.79 M |
+| `long / long`, IR instructions / commands | 7 147 / 15 776 | 201 / 7 467 |
+| `int / int` | 2 301 / 5 826 | 200 / 3 683 |
+| `word / word` | 2 198 / 3 721 | 81 / 1 946 |
+| `(a * b) >> 12` on `long`, as `mulshr(a, b, 12)` | 1 893 / 18 077 | 1 088 / 11 864 |
+| `lc = fa * fb + la * ld - lb * fa;` (`BFL_SHARE=0` before) | 4 768 / 34 540 | 4 812 / 14 936 |
+
+A 32-bit `*` is unchanged (1 700 to 2 400 IR instructions, more for larger
+operands); what changed is the division loop (phase 12), fixed point through
+`mulshr` (phase 10) and one copy of the code for repeated arithmetic (phase 11).
+Of the other samples only `text.bfl` grew (470 K to 486 K commands; phase 12 says
+why). `tests/fuzz.py` (phase 9) checks the compiler, the optimiser and the JIT
+against each other and a model of BFL: `--bfl 4000 --bf 2000` finds nothing.
 
 ### Phase 9: differential fuzzer for the optimiser and JIT
 
@@ -570,6 +594,27 @@ statements in a pane; double-click jumps to the line. Multi-file programs show
 imported files' counts in the file viewer.
 
 Done when: profiling a sample in the UI agrees with `bf --profile`.
+
+**Built** as Run > Profile (Ctrl+P; README.md "Profiler", the UI's Help). It runs the
+editor contents on the interpreter with `Machine::profile` set. When the program ends,
+or Shift+F5 stops one that runs forever, a gutter at the left of the editor colours each
+line by its share of the executed IR instructions (pale yellow to red) and prints the
+percentage, and a pane under the editor lists the lines that executed the most;
+double-clicking a row goes to the line. For a multi-file program the File box shows each
+file's share, and an imported file picked there has the gutter too. For brainfuck the
+list gives each instruction's line and column. The next edit or run clears the profile.
+The attribution to statements moved from `src/cli.cpp` into `src/profile.h`, which
+`bf --profile` and the UI share, so the two give the same counts: `queens.bfl` 1 293 774
+instructions, 46.8% outside statements, line 46 242 868; `maze.bfl` 4 289 120, with
+`queue.bfl:30` at 9.0% and the File box at 81.6% for `maze.bfl`. Ctrl+P typed in the
+terminal while a program runs goes to the program (as key 0x10), not to the profiler.
+
+Testing it showed that a fault on the interpreter reported a garbage cell (the cell index
+was stored where `Machine::run` expects an address). The fix for faults past the tape's
+end (phase 12's review) corrected the same thing, so profiling a run that leaves the tape
+now reports the cell it touched, as the JIT does. Still not counted: instructions run
+through the literal program while the pointer can reach the device window
+(`src/interp.cpp`), so such programs under-report, in the UI and in `bf --profile` alike.
 
 ### Phase 14: housekeeping
 
