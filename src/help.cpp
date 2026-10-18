@@ -34,7 +34,8 @@ KEYS
   Shift+F5    stop
   Ctrl+F5     start debugging, paused on the first command
   Ctrl+P      profile: run on the interpreter, then show where the
-              instructions went (see "Debugger")
+              instructions went (see "Debugger"); typed in the terminal
+              while a program runs, Ctrl+P goes to the program
   F11         step one command            F10   step over a [ ] loop
   Ctrl+F10    run to the caret            F6    pause a running debug session
   F9          toggle a breakpoint on the command at the caret

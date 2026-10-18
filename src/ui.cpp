@@ -659,10 +659,10 @@ void show_file(int f) {
     ShowWindow(app.editor, f == 0 ? SW_SHOW : SW_HIDE);
     if (app.filesel) SendMessageW(app.filesel, CB_SETCURSEL, f, 0);
 }
-// A file selector entry; with a profile shown, the file's share of the instructions.
+// A file selector entry; with a profile of a multi-file program shown, the file's share of the instructions.
 std::wstring filesel_label(size_t i) {
     std::wstring s = L"File: " + short_name(app.lr.files[i]) + (i == 0 ? L"  (editor)" : L"");
-    if (app.prof_shown && app.prof_total && i < app.prof_files.size()) {
+    if (app.prof_shown && app.prof_total && app.lr.files.size() > 1 && i < app.prof_files.size()) {
         wchar_t b[32]; swprintf(b, 32, L"   %.1f%%", 100.0 * (double)app.prof_files[i] / (double)app.prof_total);
         s += b;
     }
@@ -2121,7 +2121,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
-        if (!TranslateAcceleratorW(h, app.accel, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+        // While a program runs, Ctrl+P typed in the terminal is the program's key (0x10), not Profile.
+        bool to_term = app.running && msg.hwnd == app.console && msg.message == WM_KEYDOWN && msg.wParam == 'P' && GetKeyState(VK_CONTROL) < 0;
+        if (to_term || !TranslateAcceleratorW(h, app.accel, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
     if (app.worker.joinable()) app.worker.join();
     app.dbg.reset();
