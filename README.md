@@ -164,7 +164,10 @@ its lowest reachable address once and hands off to the interpreter if it could r
 device window. There is no stop poll in generated code: `request_stop()` revokes page
 access on RAM, the next access faults, and a vectored exception handler unwinds to the exit
 stub. The tape sits between two 1 GiB guard regions, so a pointer that leaves it is
-reported as a fault with the cell it touched.
+reported as a fault with the cell it touched. The same handler resumes an inline idiom
+that reached past the end of the tape: the idiom's code opens by reading its highest
+cell, so the fault changes nothing, and the handler runs the loop as written instead
+and patches that idiom to check the end of the tape on later entries.
 
 ## Licence
 

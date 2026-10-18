@@ -36,6 +36,15 @@ LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         const JitProbe* end = c->probes + c->n_probes;
         const JitProbe* pr = std::upper_bound(c->probes, end, rip, [](const uint8_t* a, const JitProbe& b) { return a < b.begin; });
         if (pr != c->probes && rip < (--pr)->end) {
+            uint8_t* at = const_cast<uint8_t*>(pr->begin);     // the code is this run's own
+            DWORD old;
+            if (at[0] != 0xE9 && VirtualProtect(at, 5, PAGE_EXECUTE_READWRITE, &old)) {
+                int32_t rel = (int32_t)(pr->stub - (at + 5));
+                at[0] = 0xE9;                                    // jmp stub
+                memcpy(at + 1, &rel, 4);
+                VirtualProtect(at, 5, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), at, 5);
+            }
             cr->Rip = (DWORD64)pr->resume;
             return EXCEPTION_CONTINUE_EXECUTION;
         }

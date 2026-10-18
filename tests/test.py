@@ -249,6 +249,13 @@ def idiom_cases():
     return fails, len(IDIOM_PROGRAMS)
 
 
+# A 4-byte carry loop (the IR's add idiom, with scratch cells above it) entered 62 500 times, whose highest
+# cell is past the end of a 14-cell RAM, while the loop as written never reaches it: the JIT's inline idiom
+# faults on its opening read, the fault handler resumes at the loop as written, and the run ends normally.
+CARRY = "+[->>>>>>>>>+>+<<<<<<<<<<]>>>>>>>>>>[-<<<<<<<<<<+>>>>>>>>>>]<<+>[<->[-]]<["
+PROBE_FAULT = ("------[>------[>>>>>+[-<<<<" + CARRY + "<<<<<<<" + CARRY + "<<<<<<<" + CARRY
+               + "<<<<<<<+>>>>>>>[-]]<[-]]<[-]]<<<<]<<<<<-]<-]>>.>.>.>.")
+
 # A pointer that leaves the tape: every executor must fault at the same cell.  Native code
 # relies on the page after the tape being inaccessible, so the tape ends at a page end.
 FAULT_PROGRAMS = [
@@ -257,6 +264,7 @@ FAULT_PROGRAMS = [
     ("fault-past-end", ">" * 1000 + "+.", ["--ram", "1000"], b"", 1256),
     ("fault-loop-past-end", "+[>+]", ["--ram", "1000"], b"", 1256),
     ("fault-mul-past-end", ">" * 998 + "+[>>+<<-]", ["--ram", "1000"], b"", 1256),
+    ("fault-probe-then-runs", PROBE_FAULT, ["--ram", "14"], b"$\xf4\x00\x00", None),
     ("fault-past-start", "<" * 300 + "+", [], b"", -44),
     ("fault-past-default-ram", ">" * 1048576 + "+", [], b"", 1048832),
     # a loop of multiply-adds whose counter (read with ',') is 0 runs no pass, so the cells it would add to
@@ -291,6 +299,13 @@ def fault_cases():
             fails += 1
             for k, v in res.items():
                 print(f"   {k}: rc={v[0]} out={v[1][:20]!r} err={v[2]!r}")
+    # The idiom faults on its first entry only: the fault handler patches it to check the end of the tape
+    # (src/machine.cpp), where each fault would take a microsecond or more.
+    path = os.path.join(tmp, "fault-probe-then-runs.b")
+    secs = min(float(re.search(r"([\d.]+) s", run_path(path, b"", ["--ram", "14", "--time"])[2]).group(1)) for _ in range(3))
+    ok = secs < 0.03
+    print(("PASS " if ok else "FAIL ") + f"fault-probe-once ({secs:.3f} s)")
+    fails += not ok
     # division and multiply loops (src/ir.cpp) cut off by the end of RAM: the idiom must not run, and
     # the loop as written faults.  The executors touch cells in different orders (an idiom's guards, merged
     # blocks), so they may report different cells, but each must be past the end.
@@ -315,7 +330,7 @@ def fault_cases():
     print(("PASS " if not bad else "FAIL ") + "fault-idiom-loops-at-end")
     for x in bad[:6]:
         print("   " + x)
-    return fails + bool(bad), len(FAULT_PROGRAMS) + 1
+    return fails + bool(bad), len(FAULT_PROGRAMS) + 2
 
 
 def bf_fuzz():
