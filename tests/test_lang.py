@@ -456,6 +456,22 @@ case("for-break-skips-step", "byte c; for (c = 0; c < 5; c++) { if (c == 2) { br
      " for (c = 0; c < 5; c++) { if (c < 4) { continue; } break; } print c, \" \";"
      " rec proc word f(byte n) { byte d; for (d = 0; d < 2; d++) { return 7; } if (n != 0) { f(n - 1); } return 9; } print f(1);",
      b"2 4 7")
+# found while extending tests/fuzz.py to structs (phase 19): a part of a returned struct deeper than one
+# field was rejected ("this cannot be assigned to"), also in out
+case("returned-struct-part", "struct A { byte a; } struct P { int x; A q; byte d[3]; A e[2]; } proc P mk(int x) { P r; r.x = x; r.q.a = 9;"
+     " r.d[2] = 4; r.e[1].a = 77; return r; } print mk(1).q.a, \" \", mk(2).d[2], \" \", mk(3).e[1].a, \" \", mk(-4).x; out ' ', mk(65).q.a + 56;",
+     b"9 4 77 -4 A")
+# ... and a heap location with two runtime indices (an array field of an element reached by index) was rejected
+case("heap-two-runtime-indices", "struct E { byte d[3]; } struct P { int x; E e[2]; byte d[3]; } heap P pool[3]; byte i = in; byte j = in; byte k = in;"
+     " pool[i].d[j] = 5; pool[i].e[j].d[k] = 6; P* p = &pool[0]; p[i].e[k].d[j] = 7; p->e[j].d[i] = 8;"
+     " print pool[1].d[1], \" \", pool[1].e[1].d[0], \" \", pool[1].e[0].d[1], \" \", pool[i].e[j].d[k], \" \", pool[0].e[1].d[1];",
+     b"5 6 7 6 8", b"\x01\x01\x00")
+# ... and a ref argument outside cells is copied back to the place it was read from, even when the call
+# changes what its index reads (inlined, it was computed again; shared, it depended on the order of the arguments)
+case("ref-arg-place-fixed", "heap byte h[3]; proc f(ref byte x, ref byte y) { x = 2; y = 9; } shared proc g(ref byte x, ref byte y) { x = 2; y = 9; }"
+     " shared proc g2(ref byte y, ref byte x) { x = 2; y = 9; } byte a[3]; byte i = 0; f(i, a[i]); i = 0; f(i, h[i]); print a[0], a[2], h[0], h[2], \" \";"
+     " byte b[3]; byte c[3]; byte j = 0; g(j, b[j]); j = 0; g2(c[j], j); j = 0; h[0] = 0; g2(h[j], j); print b[0], b[2], c[0], c[2], h[0], h[2];",
+     b"9090 909090")
 case("mul-const", "byte a = in; print a * 10, \" \", 7 * a;", b"230 161", b"\x17")
 # mulshr: the exact product shifted right (the grids cover every type and count)
 case("mulshr-const", "print mulshr(-3, 5, 1), \" \", mulshr(100000, 100000, 20), \" \", mulshr(4294967295, 4294967295, 64), \" \", mulshr(-2147483648, 4294967295, 70);", b"-8 9536 0 -1")
@@ -749,33 +765,37 @@ def share_setting():
 
 
 def shared_fuzz():
-    """A few programs of tests/fuzz_shared.py: shared and inlined procedures agree."""
+    """A few programs of tests/fuzz.py --focus shared: random BFL with shared procedures, checked against
+    the model and against the same program with those procedures inlined."""
     sys.path.insert(0, os.path.dirname(__file__))
     sys.dont_write_bytecode = True
-    import fuzz_shared
-    msgs = []
-    ran, fails = fuzz_shared.run(12, 5000, BF, TMP, log=msgs.append)
-    ok = fails == 0 and ran >= 6
-    print(("PASS " if ok else "FAIL ") + f"shared-vs-inlined ({ran} random programs)")
-    for m in msgs:
-        print(m)
+    import fuzz
+    results = fuzz.run_cases(BF, 12, 0, 5000, TMP, log=lambda m: None, focus="shared")
+    bad = [r for r in results if r.status == "fail"]
+    ran = sum(r.status != "skip" for r in results)
+    ok = not bad and ran >= 9 and sum(r.procs_shared for r in results) >= 6
+    print(("PASS " if ok else "FAIL ") + f"fuzz-shared ({ran} random programs, {sum(r.procs_shared for r in results)} with shared procs)")
+    for r in bad:
+        print(f"   seed {r.seed}: " + "; ".join(str(f) for f in r.fails[:3]))
+        print(f"   ({r.replay()})")
     return ok
 
 
 def bfl_fuzz():
     """A few programs of tests/fuzz.py: random BFL checked against a model of the
-    language in Python, through every executor."""
+    language in Python, through every executor (and some of --focus struct)."""
     sys.path.insert(0, os.path.dirname(__file__))
     sys.dont_write_bytecode = True
     import fuzz
-    results = fuzz.run_cases(BF, 16, 0, 9000, TMP, log=lambda m: None)
+    results = fuzz.run_cases(BF, 16, 0, 9000, TMP, log=lambda m: None) + \
+        fuzz.run_cases(BF, 8, 0, 9000, TMP, log=lambda m: None, focus="struct")
     bad = [r for r in results if r.status == "fail"]
     ran = sum(r.status != "skip" for r in results)
-    ok = not bad and ran >= 12
+    ok = not bad and ran >= 18
     print(("PASS " if ok else "FAIL ") + f"fuzz-bfl ({ran} random programs)")
     for r in bad:
         print(f"   seed {r.seed}: " + "; ".join(str(f) for f in r.fails[:3]))
-        print(f"   (python tests/fuzz.py --replay bfl {r.seed})")
+        print(f"   ({r.replay()})")
     return ok
 
 

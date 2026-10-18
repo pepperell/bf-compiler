@@ -77,7 +77,8 @@ padding. A struct can be assigned, passed and returned by value, passed by `ref`
 stored in arrays and in the heap, and contain other structs and arrays; it
 cannot contain itself (use a pointer). Structs cannot be compared or printed.
 An array field of a struct held in cells needs a constant index; in the heap any
-index works. A field of a returned struct can be read directly (`mk().x`).
+index works (`pool[i].data[j]`). A part of a returned struct can be read directly,
+through fields and constant indices (`mk().x`, `mk().a.data[2]`).
 
 ## Pointers and the heap
 
@@ -206,7 +207,11 @@ reaches its closing brace returns 0. A call with a result can be used as an
 expression; a call statement discards the result. Parameters are passed by value
 unless marked `ref`; a `ref` argument must be a variable (or any other
 assignable location, such as `p->x`) of the same type, and an array parameter
-(`ref byte name[]`) must be an array of that element type.
+(`ref byte name[]`) must be an array of that element type. A `ref` argument held
+in cells is the variable itself; one elsewhere (an element reached by a runtime
+index, a location in the heap) is copied in at the call and back out when it
+returns, to the place it was read from: its index or address is computed once, at
+the call.
 
 A plain `proc` is **inlined** at every call: its body is copied into the caller
 with its own locals, so it cannot call itself. A value parameter of an integer
@@ -247,7 +252,8 @@ often it is called; both are compiled as a **trampoline** (docs/TRAMPOLINE.md):
   as pointers, so the argument must be a heap array or another such parameter
   or local; an array held in cells has no address.
 - `ref` parameters are copied in at the call and copied back when it returns,
-  which works for any assignable argument, including heap locations.
+  which works for any assignable argument, including heap locations; the place
+  is fixed at the call, as for an inlined procedure.
 - Variables declared in code that calls a `rec` or `shared` proc must have
   names unique within that procedure; the right operand of `&&` / `||`
   containing such a call is always evaluated, and calls in an expression run

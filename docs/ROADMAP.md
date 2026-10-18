@@ -36,7 +36,7 @@ plus the type system, library and tooling they need.
 | 16 | Planned: shorter trips to operands (placement of temporaries and globals) | 9 |
 | 17 | Planned: cheaper constant factors in `mulshr` | 10 |
 | 18 | Planned: loose ends of phases 11 to 13 | 11, 13 |
-| 19 | Planned: fuzzer coverage of structs, `ref` arrays and `shared proc` | 9 |
+| 19 | Fuzzer coverage of structs, `ref` arrays and `shared proc` | 9 |
 
 One change from the earlier suggestion: better compiler errors move from last to
 phase 1. Pointers, structs and signed types need a real type checker, and today
@@ -278,9 +278,10 @@ against each other and a model of BFL: `--bfl 4000 --bf 2000` finds nothing.
 
 The loop idioms, the block rebuilding and the inline idiom code in the JIT are
 the most intricate parts of the executor, and each is checked by a handful of
-test programs. `tests/fuzz_shared.py` (shared against inlined procedures) found
-a miscompile on its first run that no hand-written test had: a dangling pointer
-that made the same source compile differently now and then.
+test programs. `tests/fuzz_shared.py` (shared against inlined procedures, part of
+`tests/fuzz.py` since phase 19) found a miscompile on its first run that no
+hand-written test had: a dangling pointer that made the same source compile
+differently now and then.
 
 - Generate random BFL programs over every integer type: arithmetic, shifts,
   compares, casts, arrays in cells and in the heap, loops with `break` and
@@ -706,6 +707,57 @@ generator and the Python model, and fold `fuzz_shared.py` into `fuzz.py`.
 
 Done when: a long run (thousands of programs) with the new constructs finds nothing,
 and every bug it found has a minimal regression test.
+
+**Built** in `tests/fuzz.py`. The generator declares up to three struct types
+(integer fields, array fields, earlier structs and arrays of them as fields, at
+most 20 bytes), a variable of each, arrays of structs in cells and in the heap, and
+pointers into the heap ones, globally and as locals. Places inside them are reached
+through fields and indices (an array field of a struct held in cells by a constant,
+in the heap by anything) from a variable, an array element, `p->f`, `(*p).f`,
+`p[i].f` and `mk(1).f`. Fields are read and written; whole structs are copied by
+assignment and declaration, passed by value and by `ref` and returned, also from
+`rec` procedures; `sizeof` of every type. Procedures take `ref T a[]` (T an integer
+type or a struct): bound to arrays in cells when inlined, and when trampolined to
+heap arrays, the caller's own array parameters and the local arrays of a
+re-entrant procedure. A fifth of the procedures that are not `rec` are marked
+`shared`, and such a program is also compiled with them inlined, which must agree
+with it. In the model a struct is a dict, an array field a list, and a `ref`
+parameter bound to something other than a whole variable is an alias of that
+place. `--focus shared` and `--focus struct` make those constructs more frequent.
+`tests/fuzz_shared.py` is gone: its two constraints are the generator's (only pure
+procedures are called in expressions; a procedure with `ref` parameters touches no
+globals, and the `ref` arguments of one call share no storage, now also counting
+arrays, structs and the heap array a pointer points into), and
+`tests/test_lang.py` runs 12 programs of `--focus shared` in its place, and 8 of
+`--focus struct` besides the 16 it ran. Of the 3 000 programs of the final run, 60%
+have structs (46% in the heap, 40% arrays of them in cells, 32% copy whole
+structs as they run), 41% `ref` array parameters and 26% shared procedures; 81%
+have at least one of the three.
+
+All three bugs were in the compiler, each with a case in `tests/test_lang.py`.
+They turned up while writing the generator and the model (the first two by trying
+the constructs, the third by reading how `ref` arguments are passed); against the
+compiler as it was, the generator finds the first two in 25 of 600 programs.
+
+- A part of a returned struct deeper than one field (`mk().p.x`, `mk().d[2]`)
+  passed the semantic pass and then failed to compile ("this cannot be assigned
+  to"), and so did `out mk().x` (`returned-struct-part`).
+- A heap location with two runtime indices (`pool[i].d[j]`, `p[i].e[j].d[k]`) was
+  rejected ("use a pointer for this second runtime index") although any index
+  works in the heap; its address now adds up any number of scaled runtime
+  indices (`heap-two-runtime-indices`).
+- A `ref` argument outside cells (an element reached by a runtime index, a heap
+  location) is copied in and back out, and the copy back computed its index
+  again after the call: `f(i, a[i])` with `f` changing `i` wrote another element.
+  Trampolined, the result depended on the order of the arguments, since the copies
+  back run last to first. The index or address is now computed once, at the call:
+  into temporaries for an inlined call, into hidden variables of the caller for a
+  trampolined one (`ref-arg-place-fixed`). docs/LANG.md says so.
+
+The final run of 3 000 BFL and 3 000 brainfuck programs (seed 200 000) found
+nothing, nor did 500 programs each of `--focus shared` and `--focus struct`.
+Still open: an assignment to a part of a returned struct (`mk().x = 1;`) is
+rejected by code generation, not by the semantic pass, with the same message.
 
 ## 13. Decisions for you
 
