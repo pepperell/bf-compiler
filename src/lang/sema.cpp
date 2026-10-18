@@ -508,8 +508,17 @@ struct Sema {
         if (bt->kind == TK::Array) {
             if (e.b->is_const && (e.b->cval < 0 || e.b->cval >= bt->count))
                 error(e.b->pos, "index " + std::to_string(e.b->cval) + " is outside the array of " + std::to_string(bt->count));
-            if (!in_heap(base) && !e.b->is_const)
-                error(e.b->pos, "an array field of a struct held in cells needs a constant index; put the struct in the heap");
+            if (!in_heap(base) && !e.b->is_const) {
+                const Expr* root = &base;
+                while (root->kind == Expr::Field || root->kind == Expr::Index) root = root->a.get();
+                Sym* s = root->kind == Expr::Name ? lookup(root->text) : nullptr;
+                // An array parameter may be bound to a heap array, and the local arrays of a re-entrant
+                // procedure live in the heap: the code generator, which knows, checks those.
+                if (root->kind == Expr::Call)
+                    error(e.b->pos, "an array field of a returned struct needs a constant index");
+                else if (!(s && cur && !s->global && s->type->kind == TK::Array))
+                    error(e.b->pos, "an array field of a struct held in cells needs a constant index; put the struct in the heap");
+            }
             return bt->elem;
         }
         error(e.pos, "only arrays and pointers can be indexed");

@@ -814,10 +814,7 @@ procedures are called in expressions; a procedure with `ref` parameters touches 
 globals, and the `ref` arguments of one call share no storage, now also counting
 arrays, structs and the heap array a pointer points into), and
 `tests/test_lang.py` runs 12 programs of `--focus shared` in its place, and 8 of
-`--focus struct` besides the 16 it ran. Of the 3 000 programs of the final run, 60%
-have structs (46% in the heap, 40% arrays of them in cells, 32% copy whole
-structs as they run), 41% `ref` array parameters and 26% shared procedures; 81%
-have at least one of the three.
+`--focus struct` besides the 16 it ran.
 
 All three bugs were in the compiler, each with a case in `tests/test_lang.py`.
 They turned up while writing the generator and the model (the first two by trying
@@ -843,6 +840,71 @@ The final run of 3 000 BFL and 3 000 brainfuck programs (seed 200 000) found
 nothing, nor did 500 programs each of `--focus shared` and `--focus struct`.
 Still open: an assignment to a part of a returned struct (`mk().x = 1;`) is
 rejected by code generation, not by the semantic pass, with the same message.
+
+A review found that the generator's coverage figures counted declarations, not what
+runs: two thirds of the programs declared a procedure that was never called (and an
+uncalled inline procedure is not even compiled). Since then:
+
+- Every procedure runs. `gen_bfl` runs the model, and a procedure that did not run
+  gets a call statement, at the top level of the main program or of a later
+  procedure that ran and may call it; in the main program the variables and arrays
+  its `ref` and array arguments need are declared first when there are none, and
+  printed after it. Up to three rounds, kept only while the model can still run
+  the program.
+- `f(i, a[i])` where `f` writes `i` is frequent, in both orders and trampolined
+  too: a call chooses variables for some integer `ref` parameters first, and the
+  places it passes to the others prefer indices that read them; a `ref` procedure
+  often has two integer `ref` parameters, and writes each with probability 0.6.
+  Against the compiler from before the fix (commit fb1ae6f, built in a temporary
+  worktree), the generator now finds that bug in 6 of 600 programs and 5 of 400 of
+  `--focus shared` (as wrong output; the other failures there are compile errors
+  from the first two bugs and the rejected indices below); all 6 and 2 of the 5,
+  shrunk, are calls such as `p0(mv4, ha0[mv4])` and `p0(ma17[mv16], mv16, ha0[0])`. As first built, the generator ran that shape
+  in 0.2% of programs, and against the old compiler it found only the first two
+  bugs.
+- A false alarm in waiting: in an impure procedure an array parameter may be the
+  global array of its element type that another argument of the same call names
+  (`p0(ga0[g0 % 3], p1a0)` with `p1a0` bound to `ga0`: the model printed 6, the
+  compiler 1). The no-shared-storage rule now counts an array parameter as any
+  global array of its element type.
+- The semantic pass rejected a runtime index into an array field of a struct
+  that is in the heap behind an array parameter (`shared proc g(ref C a[], byte i,
+  byte j) { a[i].d[j] = 1; }`, and an inlined procedure given a heap array) or in a
+  re-entrant procedure's local array, with "an array field of a struct held in
+  cells needs a constant index". It now leaves those to code generation, which
+  knows where the array is and already took any number of runtime heap indices;
+  an inlined procedure given an array in cells still fails, with "the array passed
+  for 'a' is in cells: pass a heap array", and `mk().d[i]` with "an array field of
+  a returned struct needs a constant index" (`heap-field-index-param` and three
+  diagnostics in `tests/test_lang.py`). The generator indexes such fields at run
+  time: a struct array parameter of an inlined procedure is sometimes given only
+  heap arrays, a trampolined one always is.
+- A failure of the fuzzer itself is written out (it crashed `save_failure`), the
+  `bf.exe` path is made absolute, and the temporary folder is removed after a run
+  without failures.
+
+Executed coverage, measured by hooking the model (3 000 programs from seed
+200 000; percent of programs, inlined / trampolined callee), before and after:
+
+| what the program ran | before | after |
+|---|---|---|
+| a call with an array argument | 3.5 / 1.0 | 21.0 / 15.1 |
+| ... a struct array | 1.2 / 0.4 | 7.4 / 4.9 |
+| a call to a shared procedure | 9.7 | 24.9 |
+| a `ref` argument that is a place, not a whole variable | 4.5 / 0.9 | 13.4 / 3.3 |
+| `f(i, a[i])` with `f` writing `i` | 0.2 / 0.0 | 2.9 / 0.8 |
+| a runtime index into an array field of a struct | 4.4 | 8.0 |
+| ... through an array parameter | 0 | 1.4 |
+| a whole struct copied | 29.1 | 38.5 |
+| a place in a struct | 59.9 | 59.9 |
+| a declared procedure that never ran | 67.4 | 6.8 |
+
+With `--focus shared` (500 programs) shared calls ran in 43% before and 89% after,
+array arguments to trampolined procedures in 2.8% and 43%, and 94% then 6.4% had a
+procedure that never ran; with `--focus struct` whole struct copies ran in 47% and 65%.
+After these changes a run of 2 000 BFL and 300 brainfuck programs (seed 600 000)
+found nothing, nor did 500 programs each of `--focus shared` (seed 610 000) and
+`--focus struct` (seed 620 000).
 
 ## 13. Decisions for you
 
