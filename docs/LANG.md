@@ -185,6 +185,7 @@ name(a + 1, w, buf);            // call: inlined here
 y = sq(3) + sq(4);              // calls in expressions
 return;  return e;              // leave a procedure (or end the main program)
 rec proc byte fib(byte n) { ... }            // may call itself: see below
+shared proc glow(long x, long y) { ... }     // one copy, called through the trampoline
 stack 64;                       // cells of recursion stack (default 128, top level)
 { ... }                         // a block with its own scope
 ```
@@ -213,15 +214,24 @@ type that the body never assigns (nor passes to a `ref` parameter) and that
 receives a constant argument becomes a constant in that copy, so everything
 computed from it folds, inside loops and branches too: `plot(x, 3)` costs no
 more than writing the 3 into the body by hand. A `rec proc` may call itself and
-other `rec proc`s freely; it is compiled as a **trampoline** (docs/TRAMPOLINE.md):
+other `rec proc`s freely, and a `shared proc` exists once in the output however
+often it is called; both are compiled as a **trampoline** (docs/TRAMPOLINE.md):
 
-- Its body is cut into numbered blocks at every call to a `rec proc`. A state
-  cell names the next block and one dispatcher loop runs them. Every procedure
-  that calls a `rec proc`, and the main program when it does, is compiled the
-  same way (the compiler promotes them automatically).
+- Its body is cut into numbered blocks at every call to a `rec` or `shared`
+  proc. A state cell names the next block and one dispatcher loop runs them.
+  Every procedure that calls one, and the main program when it does, is
+  compiled the same way (the compiler promotes them automatically). When the
+  rest of a statement list calls none, it stays ordinary code in one block.
 - The current activation's parameters and locals live in fixed cells, so the
-  watch list shows them by name (`fib.n`). A call saves them to the save stack
-  with the state to resume and a return restores them. `stack N;` at the top
+  watch list shows them by name (`fib.n`). Procedures that can never be active
+  at the same time share those cells, laid out like a call stack, and a return
+  leaves its cells zero.
+- A procedure that can come back to itself through calls (it is in a cycle) is
+  *re-entrant*: a call within its cycle saves the caller's parameters and
+  locals to the save stack with the state to resume, and a return restores
+  them. Any other procedure keeps its resume state in a cell of its own, and a
+  call to it saves nothing (the stack pointer moves by one so the debugger's
+  step over still works). `stack N;` at the top
   level sets its size in cells (default 128, at most 32768); each call uses one
   cell per byte of parameters and locals, plus one (two above 254 blocks). Up
   to 256 cells the stack is a fast byte-indexed array; above that it uses the
@@ -229,20 +239,35 @@ other `rec proc`s freely; it is compiled as a **trampoline** (docs/TRAMPOLINE.md
   Overflow is not checked unless the program is compiled with `--check-stack`
   (bf.exe) or Run > Check recursion stack (UI), which print
   `recursion stack overflow` and halt.
-- Local arrays of a `rec proc` live in the heap: each call takes their space
-  from the top of the heap (the allocator's end-of-heap word moves down), zeroes
-  it, and gives it back on return. Array parameters (`ref byte a[]`) are passed
+- Local arrays of a re-entrant procedure live in the heap: each call takes
+  their space from the top of the heap (the allocator's end-of-heap word moves
+  down), zeroes it, and gives it back on return; those of any other trampolined
+  procedure live in its cells and are cleared at the declaration. Array
+  parameters (`ref byte a[]`) are passed
   as pointers, so the argument must be a heap array or another such parameter
   or local; an array held in cells has no address.
 - `ref` parameters are copied in at the call and copied back when it returns,
   which works for any assignable argument, including heap locations.
-- Variables declared in code that calls a `rec proc` must have names unique
-  within that procedure; the right operand of `&&` / `||` containing such a
-  call is always evaluated.
-- Cost: a call is about 1 000 commands plus 70 per cell saved and restored;
-  see docs/TRAMPOLINE.md for measurements.
+- Variables declared in code that calls a `rec` or `shared` proc must have
+  names unique within that procedure; the right operand of `&&` / `||`
+  containing such a call is always evaluated, and calls in an expression run
+  before the rest of it.
+- Cost: a call to a small procedure runs about 450 IR instructions (60 ns on
+  the JIT) with nothing to save; within a cycle add the frame saved and
+  restored (a one-byte recursive call is about twice that). See
+  docs/TRAMPOLINE.md.
 
-A plain `proc` that calls itself without `rec` is a compile error.
+A plain `proc` that calls itself without `rec` is a compile error, and so is a
+`shared proc` that calls itself.
+
+**When `shared` pays.** Sharing removes the copies of the body at every call
+site, but trampolines the callers, all the way up to the main program, which
+then pay the dispatcher, lose the compiler's knowledge of cell values at every
+call, and keep the variables that live across a call in fixed cells. It suits
+a sizeable procedure called from many places that are not themselves deep in
+hot loops. In `programs/samples/raytracer.bfl`, sharing `glow` (13 call sites)
+makes the program 2% smaller at the same speed; sharing `isqrt`, called inside
+the per-pixel loops, makes it 15% larger and 45% slower.
 
 `print` of a `word` costs several 16-bit comparisons; `print` of a byte is a
 division by 100 and by 10.

@@ -165,7 +165,7 @@ struct Parser {
         std::string n = tok.text; advance(); return n;
     }
     static bool is_keyword(const std::string& w) {
-        static const char* kws[] = {"byte", "sbyte", "word", "int", "dword", "long", "string", "const", "proc", "rec", "ref",
+        static const char* kws[] = {"byte", "sbyte", "word", "int", "dword", "long", "string", "const", "proc", "rec", "shared", "ref",
                                     "if", "else", "while", "for", "break", "continue", "out", "print", "pulse", "halt", "asm",
                                     "in", "input", "return", "stack", "heap", "struct", "import", "sizeof", "new", "null", nullptr};
         for (const char** k = kws; *k; k++) if (w == *k) return true;
@@ -435,9 +435,10 @@ struct Parser {
             auto s = mks(Stmt::Const, p); advance(); s->name = ident(); expect("="); s->e = expr(); expect(";");
             return finish(std::move(s));
         }
-        if (is_ident("rec") || is_ident("proc")) {
+        if (is_ident("rec") || is_ident("shared") || is_ident("proc")) {
             auto s = mks(Stmt::Proc, p);
             if (is_ident("rec")) { s->rec = true; advance(); if (!is_ident("proc")) fail("expected 'proc' after 'rec'"); }
+            else if (is_ident("shared")) { s->shared = true; advance(); if (!is_ident("proc")) fail("expected 'proc' after 'shared'"); }
             advance();
             if (type_starts()) s->ts = type_spec();
             s->name = ident(); expect("(");

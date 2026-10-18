@@ -928,8 +928,8 @@ struct Sema {
             }
             if (cyc) error(kv.second.decl->pos, "'" + kv.first + "' is recursive; declare it 'rec proc'");
         }
-        // trampolined: rec procs and everything that calls one
-        for (auto& kv : procs) if (kv.second.decl->rec) R.tramp.insert(kv.first);
+        // trampolined: rec and shared procs and everything that calls one
+        for (auto& kv : procs) if (kv.second.decl->rec || kv.second.decl->shared) R.tramp.insert(kv.first);
         for (bool changed = true; changed;) {
             changed = false;
             for (auto& kv : procs) {
@@ -971,7 +971,7 @@ struct Sema {
     void check_tramp_names(const std::vector<std::pair<std::string, Pos>>& locals, const std::string& where, const Stmt* proc) {
         std::map<std::string, Pos> seen;
         for (auto& l : locals) {
-            if (seen.count(l.first)) error(l.second, "'" + l.first + "' is declared twice in " + where + "; variables of code that calls a rec proc need unique names");
+            if (seen.count(l.first)) error(l.second, "'" + l.first + "' is declared twice in " + where + "; variables of code that calls a rec or shared proc need unique names");
             else seen[l.first] = l.second;
         }
         if (!proc) return;

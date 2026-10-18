@@ -26,6 +26,32 @@ Phase 7 of docs/ROADMAP.md extended this:
 - `--check-stack` adds an overflow check before every push (and before taking
   heap space for local arrays).
 
+Later, `shared proc` (one copy of a procedure that may not recurse) brought
+these changes, which also apply to `rec proc`:
+
+- **Re-entrant or not.** The compiler works out which trampolined procedures
+  can reach themselves through calls. A call saves the caller's frame only when
+  caller and callee are in one cycle; the resume state goes on the stack only
+  for a re-entrant callee, and otherwise into a cell of the callee's own. The
+  stack pointer still moves by one on such a call so that the debugger's step
+  over can wait for it. Local arrays of procedures outside a cycle stay in cells.
+- **Frames like a call stack.** Each frame sits just above the highest frame of
+  anything that can call it, so procedures that are never active together share
+  cells. A return clears its frame (the caller's resume code moves the result and
+  `ref` parameters out), so the cells above a running procedure's frame are zero
+  and its temporaries start right there, instead of above every frame of the
+  program. The main program's frame (the globals) is ordered by use, as in
+  inlined code.
+- **Flat dispatcher.** The countdown runs as one sequence of tests instead of
+  nested ones, so every block's temporaries start at the same height, and the
+  dispatcher's own cells sit below the frames.
+- **Plain runs.** When the rest of a statement list calls no trampolined
+  procedure, it is generated as ordinary code in one block, its variables scoped
+  locals rather than frame cells.
+
+With these, `mergesort.bfl` went from 272 000 to 190 000 commands, `calc.bfl`
+from 1 048 000 to 963 000 and `bst.bfl` from 639 000 to 605 000.
+
 BFL inlines every procedure because brainfuck has no jump to an address, and
 because the compiler addresses every variable as a fixed cell. This note works
 out how recursion could be added anyway, measures a hand-made version, and

@@ -84,7 +84,7 @@ struct ProcInfo {
 
 // ---- trampoline structures -------------------------------------------------------------
 struct Action {
-    enum Kind { Plain, SetState, IfGoto, Call, Ret, Pop, Clear, FrameEnter };
+    enum Kind { Plain, PlainRun, SetState, IfGoto, Call, Ret, Pop, Clear, FrameEnter };
     Kind kind;
     const Stmt* s = nullptr;        // Plain: statement to generate (original or synthetic)
     const Stmt* src = nullptr;      // statement for the map
@@ -95,10 +95,14 @@ struct Action {
     std::string result;             // Pop: hidden variable receiving the callee's result ("" none); Clear: variable
     std::vector<std::pair<const Expr*, int>> copy_out;   // Pop: (caller lvalue, callee param index) for ref params
     ExprP ret;                      // Ret: value or null
+    const std::vector<StmtP>* list = nullptr;   // PlainRun: statements list[from..] in one scope
+    size_t from = 0;
+    bool cont = false;              // Plain: continues a statement split at a call (no debugger stop)
 };
 struct LBlock {
     int id;
     TProc* owner;
+    int64_t temp_base = -1;         // where its temporaries start: above every frame live while it runs
     int break_state = -1, cont_state = -1;
     std::vector<Action> acts;
 };
@@ -112,6 +116,13 @@ struct TProc {
     std::vector<Var> consts;
     int hidden_n = 0;
     int heap_frame = 0;             // bytes of local arrays taken from the top of the heap on entry
+    int idx = 0;                    // index in Gen::tprocs
+    // Re-entrant: it can be active more than once (it is in a cycle of calls), so its
+    // resume state goes on the save stack.  Otherwise its one resume state lives in
+    // ret_cell and its local arrays in cells.
+    bool reentrant = true;
+    int64_t ret_cell = -1;
+    int64_t frame_hi = 0;           // first cell above its frame
     bool is_main() const { return decl == nullptr; }
     int save_count() const {        // cells pushed on a call (not for main)
         if (is_main()) return 0;
@@ -1628,6 +1639,7 @@ struct Gen {
 
     // ---- statement map ----------------------------------------------------------------------------------
     bool mapping() const { return prelude_depth == 0; }
+    bool next_is_cont = false;      // the next statement continues one split at a call
     void begin_stmt(const Stmt& s, bool cont = false) {
         if (!mapping() || s.pos.file < 0 || s.pos.file >= (int)texts.size()) return;
         const std::string& src = texts[(size_t)s.pos.file];
@@ -2173,7 +2185,8 @@ struct Gen {
         }
         default: break;
         }
-        begin_stmt(s);
+        begin_stmt(s, next_is_cont);
+        next_is_cont = false;
         switch (s.kind) {
         case Stmt::Decl:   gen_decl(s); break;
         case Stmt::Assign: gen_assign(s); break;
@@ -2263,7 +2276,7 @@ struct Gen {
     Action& act(LowCtx& L, Action::Kind k, const Stmt* from) { Action a; a.kind = k; a.src = from; B(L.block).acts.push_back(std::move(a)); return B(L.block).acts.back(); }
 
     void frame_add(TProc* p, Var v, Pos pos) {
-        for (const Var& f : p->frame) if (f.name == v.name) fail(pos, "'" + v.name + "' is declared twice in " + (p->is_main() ? "the main program" : "'" + p->name + "'") + "; variables of code that calls a rec proc need unique names");
+        for (const Var& f : p->frame) if (f.name == v.name) fail(pos, "'" + v.name + "' is declared twice in " + (p->is_main() ? "the main program" : "'" + p->name + "'") + "; variables of code that calls a rec or shared proc need unique names");
         for (const Var& f : p->consts) if (f.name == v.name) fail(pos, "'" + v.name + "' is already a constant");
         p->frame.push_back(v);
     }
@@ -2324,9 +2337,30 @@ struct Gen {
     }
 
     void plain(LowCtx& L, const Stmt& s) { Action& a = act(L, Action::Plain, &s); a.s = &s; }
-    void synth_plain(LowCtx& L, StmtP s, const Stmt& from) { Action& a = act(L, Action::Plain, &from); a.s = s.get(); synth.push_back(std::move(s)); }
+    // The rest of a statement whose calls were hoisted before it: when it follows a
+    // call (cont), the debugger does not stop on it again.
+    void synth_plain(LowCtx& L, StmtP s, const Stmt& from, bool cont = true) {
+        Action& a = act(L, Action::Plain, &from); a.s = s.get(); a.cont = cont; synth.push_back(std::move(s));
+    }
 
-    void lower_stmts(const std::vector<StmtP>& v, LowCtx& L) { for (auto& s : v) lower_stmt(*s, L); }
+    // When the rest of a statement list calls nothing compiled as blocks, it runs
+    // within one block, so it is generated as ordinary code in one scope: its
+    // variables are scoped locals on the temporary stack instead of frame cells.
+    // (Not the main program's top level, whose variables are the globals.)
+    void lower_stmts(const std::vector<StmtP>& v, LowCtx& L, bool top = false) {
+        for (size_t i = 0; i < v.size(); i++) {
+            if (!top) {
+                bool calls = false, decls = false;
+                for (size_t j = i; j < v.size() && !calls; j++) { calls = calls_tramp(*v[j]); decls = decls || v[j]->kind == Stmt::Decl; }
+                if (!calls && decls) {
+                    Action& a = act(L, Action::PlainRun, v[i].get());
+                    a.list = &v; a.from = i;
+                    return;
+                }
+            }
+            lower_stmt(*v[i], L);
+        }
+    }
 
     void lower_stmt(const Stmt& s, LowCtx& L) {
         TProc* p = L.p;
@@ -2341,7 +2375,7 @@ struct Gen {
         case Stmt::Decl: {
             Var v; v.name = s.name; v.type = s.vtype; v.count = s.count;
             if (s.in_heap) { v.is_const = true; v.cval = s.cval; v.owned = false; p->consts.push_back(v); return; }
-            if (s.count >= 0 && !p->is_main()) {
+            if (s.count >= 0 && !p->is_main() && p->reentrant) {
                 // a local array of a recursive procedure lives in its heap frame
                 Var a; a.name = s.name; a.type = T->ptr(s.vtype); a.arr_ptr = true; a.arr_off = p->heap_frame;
                 p->heap_frame += std::max(s.vtype->size, 1) * s.count;
@@ -2349,10 +2383,14 @@ struct Gen {
                 return;
             }
             frame_add(p, v, s.pos);
-            if (s.count >= 0) return;                      // global array: zero from the start
+            if (s.count >= 0) {                            // main: zero from the start; a shared proc's: cleared on every call
+                if (!p->is_main()) { Action& a = act(L, Action::Clear, &s); a.result = s.name; }
+                return;
+            }
             if (!s.e) { Action& a = act(L, Action::Clear, &s); a.result = s.name; return; }
+            bool after_call = calls_tramp(*s.e);
             ExprP init = hoist(*s.e, L, s);
-            synth_plain(L, mk_assign(s, s.name, std::move(init), s.vtype), s);
+            synth_plain(L, mk_assign(s, s.name, std::move(init), s.vtype), s, after_call);
             return;
         }
         default: break;
@@ -2452,7 +2490,7 @@ struct Gen {
                 frame_add(p, v, prm.pos);
             }
         }
-        lower_stmts(body, L);
+        lower_stmts(body, L, p->is_main());
         act(L, Action::Ret, nullptr);      // implicit return at the end
         if (p->heap_frame > 0) {
             Action fe; fe.kind = Action::FrameEnter;
@@ -2582,17 +2620,33 @@ struct Gen {
         drop(e, 2);
     }
 
-    void gen_tramp_return(const Expr* value, Pos pos) {
+    // implicit: the end of the body, where a procedure with a result returns 0
+    void gen_tramp_return(const Expr* value, Pos pos, bool implicit = false) {
         TProc* p = cur_tp;
-        if (p->ret && !value) fail(pos, "'" + p->name + "' returns a value");
+        if (p->ret && !value && !implicit) fail(pos, "'" + p->name + "' returns a value");
         if (!p->ret && value) fail(pos, p->is_main() ? "the main program returns nothing" : "'" + p->name + "' returns nothing");
         if (value) store_result(*value, p->retval, p->ret);
+        else if (p->ret) clearN(p->retval, std::max(p->ret->size, 1));
         if (p->is_main()) set_state_cell(0);
         else {
             frame_leave(p);
-            std::vector<int64_t> st;
-            for (int k = 0; k < state_n; k++) st.push_back(state_cell + k);
-            stack_run(-state_n, st, false);
+            // Leave the frame zero: frames of procedures that are not running share
+            // cells with each other and with the temporaries of the ones that are.
+            // ref parameters and the result are taken (and cleared) by the caller.
+            for (size_t i = 0; i < p->frame.size(); i++) {
+                const Var& v = p->frame[i];
+                if (i < p->decl->params.size() && p->decl->params[i].ref && !p->decl->params[i].array) continue;
+                if (v.count >= 0) { for (int k = 0; k < v.count; k++) for (int b = 0; b < v.size(); b++) clear(array_cell(v.cell, k, b, v.size())); }
+                else clearN(v.cell, v.size());
+            }
+            if (!p->reentrant) {                    // the resume state its caller left in ret_cell
+                clearN(state_cell, state_n);
+                moveN(p->ret_cell, state_cell, state_n);
+            } else {
+                std::vector<int64_t> st;
+                for (int k = 0; k < state_n; k++) st.push_back(state_cell + k);
+                stack_run(-state_n, st, false);
+            }
         }
         size_t b = ctxs.size();
         while (b-- > 0) if (ctxs[b].kind == ExitCtx::Block) break;
@@ -2611,7 +2665,14 @@ struct Gen {
     void gen_action(Action& a, LBlock& blk) {
         switch (a.kind) {
         case Action::Plain:
+            next_is_cont = a.cont;
             gen_stmt(*a.s);
+            next_is_cont = false;
+            return;
+        case Action::PlainRun:
+            push_scope();
+            gen_stmts(*a.list, a.from);
+            pop_scope();
             return;
         case Action::SetState:
             set_state_cell(a.a);
@@ -2623,7 +2684,8 @@ struct Gen {
             Var* v = find_var(a.result);
             if (!v) internal("cleared variable missing");
             if (a.src) begin_stmt(*a.src);
-            clearN(v->cell, v->size());
+            if (v->count >= 0) { for (int k = 0; k < v->count; k++) for (int b = 0; b < v->size(); b++) clear(array_cell(v->cell, k, b, v->size())); }
+            else clearN(v->cell, v->size());
             if (a.src) end_stmt();
             return;
         }
@@ -2640,6 +2702,8 @@ struct Gen {
         case Action::Call: {
             TProc* callee = a.callee;
             const Stmt& decl = *callee->decl;
+            int64_t base = next_free;                   // its arguments must not land in the callee's frame
+            next_free = std::max(next_free, callee->frame_hi);
             if (a.src) begin_stmt(*a.src);
             // arguments first (they may read the caller's frame)
             int64_t mark = next_free;
@@ -2654,12 +2718,20 @@ struct Gen {
                 else eval_into(*a.args[i], t, prm.type);
                 vals.push_back(t);
             }
-            // save the caller's frame and the resume state
+            // Save the caller's frame when the callee can come back into the caller
+            // (they are in one cycle of calls), and the resume state: on the stack
+            // for a re-entrant callee, else in the callee's own ret_cell.  A call that
+            // pushes nothing still moves the stack pointer by one, so the debugger's
+            // step over can tell when it has returned.
             TProc* me = blk.owner;
-            std::vector<int64_t> cells = frame_cells(me);
+            std::vector<int64_t> cells = same_cycle(me, callee) ? frame_cells(me) : std::vector<int64_t>();
             int off = (int)cells.size();
-            stack_check(off + state_n);
-            if (sp_n == 1 && state_n == 1) {
+            int pushed = pushed_by(me, callee);
+            stack_check(pushed);
+            if (!callee->reentrant) {
+                setN(callee->ret_cell, state_n, a.a);
+                stack_run(0, cells, true);
+            } else if (sp_n == 1 && state_n == 1) {
                 stack_run(0, cells, true);
                 int64_t r = tmp(); set(r, a.a); int64_t i = stack_index(off); array_write(stack_base, i, r); drop(i); drop(r);
             } else {
@@ -2668,7 +2740,7 @@ struct Gen {
                 stack_run(0, cells, true);
                 releaseN(r, state_n);
             }
-            addN_const(sp_cell, sp_n, off + state_n);
+            addN_const(sp_cell, sp_n, pushed);
             // load the callee's parameters
             for (size_t i = 0; i < vals.size(); i++) {
                 const Var& prm = callee->frame[i];
@@ -2678,10 +2750,13 @@ struct Gen {
             next_free = mark;
             set_state_cell(callee->entry);
             if (a.src) end_stmt();
+            next_free = base;
             return;
         }
         case Action::Pop: {
             TProc* me = blk.owner;
+            int64_t base = next_free;                   // above the callee's frame until its results are taken
+            next_free = std::max(next_free, a.callee->frame_hi);
             if (a.src) begin_stmt(*a.src, true);
             // ref parameters: take the callee's final values before the pop may overwrite them (self-recursion)
             int64_t mark = next_free;
@@ -2689,12 +2764,11 @@ struct Gen {
             for (auto& co : a.copy_out) {
                 const Var& prm = a.callee->frame[(size_t)co.second];
                 int64_t t = tmpN(prm.size());
-                copyN(prm.cell, t, prm.size());
+                moveN(prm.cell, t, prm.size());
                 saved.push_back(t);
             }
-            int n = me->save_count();
-            addN_const(sp_cell, sp_n, -(n + state_n));
-            stack_run(0, frame_cells(me), false);
+            addN_const(sp_cell, sp_n, -pushed_by(me, a.callee));
+            if (same_cycle(me, a.callee)) stack_run(0, frame_cells(me), false);
             for (size_t i = a.copy_out.size(); i-- > 0;) {
                 LV lv = lvalue(*a.copy_out[i].first);
                 const Var& prm = a.callee->frame[(size_t)a.copy_out[i].second];
@@ -2708,14 +2782,15 @@ struct Gen {
                 Var* h = find_var(a.result);
                 if (!h) internal("hidden result variable missing");
                 clearN(h->cell, h->size());
-                copyN(a.callee->retval, h->cell, h->size());
-            }
+                moveN(a.callee->retval, h->cell, h->size());
+            } else if (a.callee->ret) clearN(a.callee->retval, std::max(a.callee->ret->size, 1));
             if (a.src) end_stmt();
+            next_free = base;
             return;
         }
         case Action::Ret: {
             if (a.src) begin_stmt(*a.src);
-            gen_tramp_return(a.ret.get(), a.src ? a.src->pos : Pos{});
+            gen_tramp_return(a.ret.get(), a.src ? a.src->pos : Pos{}, a.src == nullptr);
             if (a.src) end_stmt();
             return;
         }
@@ -2724,16 +2799,23 @@ struct Gen {
 
     static bool action_may_exit(const Action& a) {
         if (a.kind == Action::Plain) return may_exit(*a.s);
+        if (a.kind == Action::PlainRun) { for (size_t i = a.from; i < a.list->size(); i++) if (may_exit(*(*a.list)[i])) return true; return false; }
         return a.kind == Action::Ret;
     }
     void gen_actions(std::vector<Action>& acts, LBlock& blk, size_t from = 0) {
         for (size_t i = from; i < acts.size(); i++) {
             gen_action(acts[i], blk);
             if (i + 1 < acts.size() && action_may_exit(acts[i])) {
+                // the test cell lives across the rest, so it must be above the frame of
+                // any procedure the rest calls (or takes results from)
+                int64_t base = next_free;
+                for (size_t j = i + 1; j < acts.size(); j++)
+                    if ((acts[j].kind == Action::Call || acts[j].kind == Action::Pop) && acts[j].callee) next_free = std::max(next_free, acts[j].callee->frame_hi);
                 int64_t t = tmp();
                 copy(alive_cell, t);
                 if_nonzero(t, [&] { gen_actions(acts, blk, i + 1); });
                 release(t);
+                next_free = base;
                 return;
             }
         }
@@ -2741,6 +2823,9 @@ struct Gen {
 
     void gen_block(LBlock& blk) {
         TProc* p = blk.owner;
+        int64_t saved_free = next_free;
+        if (blk.temp_base >= 0) next_free = blk.temp_base;
+        int64_t base_free = next_free;
         set(alive_cell, 1);
         cur_tp = p;
         cur_proc = p->name;
@@ -2752,44 +2837,152 @@ struct Gen {
         pop_scope();
         cur_tp = nullptr;
         cur_proc.clear();
+        if (next_free != base_free) internal("block temporaries not released");
+        next_free = saved_free;
     }
 
-    // Dispatch by countdown over blocks first..last: level `id` runs that block when
-    // cnt (= state - id) is 0, else decrements and tries the next.  About ten
-    // commands per level passed.
-    void gen_dispatch(int64_t cnt, int id, int last) {
-        if (id > last) return;
-        int64_t f = tmp(); set(f, 1);
-        open(cnt);
-        {
-            clear(f);
-            add(cnt, -1);
-            gen_dispatch(cnt, id + 1, last);
+    // Dispatch by countdown: t holds state - (first - 1), and every level, one per
+    // block first..last, decrements it and runs its block when it reaches 0.  The
+    // levels follow each other instead of nesting, so every block runs with its
+    // temporaries at the same height; a block sets the state cell, not t, so one
+    // pass runs one block.  (t passes 0 once in up to 256 levels.)
+    int64_t disp_scratch = -1;      // a few cells below the frames for the dispatcher's own temporaries
+    void gen_dispatch(int64_t t, int first, int last) {
+        for (int id = first; id <= last; id++) {
+            next_free = disp_scratch;
+            add(t, -1);
+            int64_t z = tmp();
+            iszero8(t, z);
+            if_nonzero(z, [&] { gen_block(blocks[(size_t)id - 1]); });
+            release(z);
         }
-        close();
-        if_nonzero(f, [&] { gen_block(blocks[(size_t)id - 1]); });
-        release(f);
     }
     // 16-bit state: choose the group of 256 by the high byte, then the block by the low byte.
-    void gen_dispatch16(int64_t h, int g, int groups) {
-        if (g >= groups) return;
-        int64_t f = tmp(); set(f, 1);
-        open(h);
-        {
-            clear(f);
+    int64_t disp_t2 = -1, disp_z2 = -1;
+    void gen_dispatch16(int64_t h, int groups) {
+        add(h, 1);
+        for (int g = 0; g < groups; g++) {
+            next_free = disp_scratch;
             add(h, -1);
-            gen_dispatch16(h, g + 1, groups);
+            iszero8(h, disp_z2);
+            if_nonzero(disp_z2, [&] {
+                int first = std::max(1, g * 256), last = std::min((int)blocks.size(), g * 256 + 255);
+                next_free = disp_scratch;
+                copy(state_cell, disp_t2);
+                add(disp_t2, -(first - g * 256) + 1);
+                gen_dispatch(disp_t2, first, last);
+                next_free = disp_scratch;
+                clear(disp_t2);
+            });
         }
-        close();
-        if_nonzero(f, [&] {
-            int first = std::max(1, g * 256), last = std::min((int)blocks.size(), g * 256 + 255);
-            int64_t cnt = tmp();
-            copy(state_cell, cnt);
-            add(cnt, -(first - g * 256));
-            gen_dispatch(cnt, first, last);
-            release(cnt);
-        });
-        release(f);
+    }
+
+    // ---- trampoline: who can reach whom ------------------------------------------------------------------
+    std::vector<std::vector<bool>> reach;           // reach[a][b]: a call from tprocs[a] can lead to tprocs[b]
+    void tramp_calls(const Expr& e, std::set<int>& found) {
+        if (e.kind == Expr::Call) if (ProcInfo* pi = find_proc(e.text); pi && pi->tp) found.insert(pi->tp->idx);
+        if (e.a) tramp_calls(*e.a, found);
+        if (e.b) tramp_calls(*e.b, found);
+        for (auto& x : e.args) tramp_calls(*x, found);
+    }
+    void tramp_calls(const Stmt& s, std::set<int>& found) {
+        if (s.kind == Stmt::Call) if (ProcInfo* pi = find_proc(s.name); pi && pi->tp) found.insert(pi->tp->idx);
+        if (s.target) tramp_calls(*s.target, found);
+        if (s.e) tramp_calls(*s.e, found);
+        if (s.init) tramp_calls(*s.init, found);
+        if (s.step) tramp_calls(*s.step, found);
+        for (auto& x : s.args) tramp_calls(*x, found);
+        for (auto& x : s.body) tramp_calls(*x, found);
+        for (auto& x : s.else_body) tramp_calls(*x, found);
+    }
+    void compute_reach() {
+        size_t n = tprocs.size();
+        std::vector<std::set<int>> calls(n);
+        for (size_t i = 1; i < n; i++) for (auto& st : tprocs[i]->decl->body) tramp_calls(*st, calls[i]);
+        reach.assign(n, std::vector<bool>(n, false));
+        for (size_t i = 1; i < n; i++) {
+            std::vector<int> work(calls[i].begin(), calls[i].end());
+            while (!work.empty()) {
+                int c = work.back(); work.pop_back();
+                if (reach[i][(size_t)c]) continue;
+                reach[i][(size_t)c] = true;
+                for (int d : calls[(size_t)c]) work.push_back(d);
+            }
+            tprocs[i]->reentrant = reach[i][i];
+        }
+    }
+    // a call between procedures that can each lead back to the other
+    bool same_cycle(const TProc* caller, const TProc* callee) const {
+        return !caller->is_main() && reach[(size_t)caller->idx][(size_t)callee->idx] && reach[(size_t)callee->idx][(size_t)caller->idx];
+    }
+    // cells a call moves the stack pointer by
+    int pushed_by(const TProc* caller, const TProc* callee) const {
+        if (!callee->reentrant) return 1;
+        return (same_cycle(caller, callee) ? caller->save_count() : 0) + state_n;
+    }
+
+    // Frames: every variable of a trampolined procedure has a fixed cell.  Two
+    // procedures that can never be active at once (neither can lead to the other)
+    // share cells; the main program's frame is live throughout.  Within a frame the
+    // variables are ordered by references per cell, the densest highest, next to the
+    // temporaries (as layout_globals does for inlined code).
+    void place_frames(const Program& prog) {
+        size_t n = tprocs.size();
+        std::vector<std::unordered_map<std::string, double>> refs(n);
+        std::unordered_set<std::string> none;
+        refs[0] = global_refs(prog);                    // main's frame holds the globals: count every use
+        for (size_t i = 1; i < n; i++) {
+            std::unordered_map<std::string, double> calls;
+            for (auto& st : tprocs[i]->decl->body) count_refs(*st, 1.0, refs[i], calls, none);
+        }
+        struct Slot { Var* v; int64_t* where; int64_t size; double density; };
+        std::vector<std::vector<Slot>> slots(n);
+        std::vector<int64_t> size(n, 0);
+        for (size_t i = 0; i < n; i++) {
+            TProc* tp = tprocs[i].get();
+            for (Var& v : tp->frame) {
+                int64_t c = v.count >= 0 ? array_total(v) : v.size();
+                double r = refs[i].count(v.name) ? refs[i][v.name] : 0.0;
+                slots[i].push_back({&v, &v.cell, c, r / (double)std::max<int64_t>(c, 1)});
+            }
+            if (tp->ret) slots[i].push_back({nullptr, &tp->retval, std::max(tp->ret->size, 1), 1e9});
+            if (!tp->is_main() && !tp->reentrant) slots[i].push_back({nullptr, &tp->ret_cell, state_n, 1e9});
+            std::stable_sort(slots[i].begin(), slots[i].end(), [](const Slot& a, const Slot& b) { return a.density < b.density; });
+            for (const Slot& sl : slots[i]) size[i] += sl.size;
+        }
+        // Like a call stack: callers before callees (cycles in any order), each frame
+        // just above the highest frame of anything that can lead to it.  While a block
+        // runs, the frames that hold live values are its own and its callers' (callers
+        // in its own cycle have saved theirs on the stack), all at or below its own.
+        std::vector<int64_t> off(n, 0);
+        std::vector<bool> placed(n, false);
+        placed[0] = true;
+        int64_t extent = size[0];
+        for (size_t done = 1; done < n; done++) {
+            size_t pick = 0;
+            for (size_t i = 1; i < n && !pick; i++) {
+                if (placed[i]) continue;
+                bool ready = true;               // every caller outside its cycle is placed
+                for (size_t j = 1; j < n && ready; j++)
+                    if (!placed[j] && j != i && reach[j][i] && !reach[i][j]) ready = false;
+                if (ready) pick = i;
+            }
+            if (!pick) internal("frame order");
+            int64_t o = size[0];
+            for (size_t j = 1; j < n; j++) if (placed[j] && reach[j][pick]) o = std::max(o, off[j] + size[j]);
+            off[pick] = o;
+            placed[pick] = true;
+            extent = std::max(extent, o + size[pick]);
+        }
+        int64_t base = alloc((int)extent);
+        for (size_t i = 0; i < n; i++) {
+            tprocs[i]->frame_hi = base + off[i] + size[i];
+            int64_t c = base + off[i];
+            for (const Slot& sl : slots[i]) { *sl.where = c; c += sl.size; }
+            TProc* tp = tprocs[i].get();
+            for (Var& v : tp->frame)
+                if (v.name.rfind("__h", 0) != 0) add_symbol(tp->is_main() ? v.name : tp->name + "." + v.name, v.cell, v.type, v.count, "");
+        }
     }
 
     void gen_trampoline(const Program& prog) {
@@ -2798,9 +2991,11 @@ struct Gen {
             if (!kv.second.tramp) continue;
             auto tp = std::make_unique<TProc>();
             tp->name = kv.first; tp->decl = kv.second.decl; tp->ret = ret_of(kv.second.decl);
+            tp->idx = (int)tprocs.size();
             kv.second.tp = tp.get();
             tprocs.push_back(std::move(tp));
         }
+        compute_reach();
         if (sr && sr->stack_size > 0) stack_size = sr->stack_size;
         lower_proc(tprocs[0].get(), prog.items);               // main first: its consts are visible to the others
         for (size_t i = 1; i < tprocs.size(); i++) lower_proc(tprocs[i].get(), tprocs[i]->decl->body);
@@ -2812,18 +3007,23 @@ struct Gen {
         else stack_e0 = alloc((int)((int64_t)HK * (HOP + stack_size))) + (int64_t)HK * HOP;
         state_cell = alloc(state_n); alive_cell = alloc(1); sp_cell = alloc(sp_n);
         int64_t run_cell = state_n == 2 ? alloc(1) : -1;
+        int64_t disp_t = alloc(1), disp_h = -1;
+        if (state_n == 2) { disp_h = alloc(1); disp_t2 = alloc(1); disp_z2 = alloc(1); }
+        disp_scratch = alloc(4);
         res.symbols.push_back(Symbol{"__state", state_cell, state_n, state_n == 1 ? 'b' : 'w', 1, "", state_n, false});
         res.symbols.push_back(Symbol{"__sp", sp_cell, sp_n, sp_n == 1 ? 'b' : 'w', 1, "", sp_n, false});
         res.sp_cell = sp_cell;
         res.sp_bytes = sp_n;
-        for (auto& tp : tprocs) {
-            for (Var& v : tp->frame) {
-                int cells = v.count >= 0 ? (int)array_total(v) : v.size();
-                v.cell = alloc(cells);
-                if (v.name.rfind("__h", 0) != 0) add_symbol(tp->is_main() ? v.name : tp->name + "." + v.name, v.cell, v.type, v.count, "");
-            }
-            if (tp->ret) tp->retval = alloc(std::max(tp->ret->size, 1));
+        place_frames(prog);
+        // (a call and the code taking its result use temporaries above the callee's frame too:
+        // gen_action raises the base for just those)
+        for (LBlock& b : blocks) {
+            int64_t t = b.owner->frame_hi;
+            if (b.owner->reentrant)                     // a suspended caller in its cycle may sit above it
+                for (auto& q : tprocs) if (!q->is_main() && reach[(size_t)b.owner->idx][(size_t)q->idx] && reach[(size_t)q->idx][(size_t)b.owner->idx]) t = std::max(t, q->frame_hi);
+            b.temp_base = t;
         }
+        int64_t after_frames = next_free;
 
         out += "\n# trampoline: stack of " + std::to_string(stack_size) + " cells and " + std::to_string(blocks.size()) + " blocks\n";
         push_frame_scope(tprocs[0].get());
@@ -2832,11 +3032,11 @@ struct Gen {
         if (state_n == 1) {
             open(state_cell);
             {
-                int64_t cnt = tmp();
-                copy(state_cell, cnt);
-                add(cnt, -1);
-                gen_dispatch(cnt, 1, (int)blocks.size());
-                release(cnt);
+                next_free = disp_scratch;
+                copy(state_cell, disp_t);
+                gen_dispatch(disp_t, 1, (int)blocks.size());
+                next_free = disp_scratch;
+                clear(disp_t);
             }
             close();
         } else {
@@ -2844,14 +3044,16 @@ struct Gen {
             open(run_cell);
             {
                 clear(run_cell);
-                int64_t h = tmp();
-                copy(state_cell + 1, h);
-                gen_dispatch16(h, 0, (int)blocks.size() / 256 + 1);
-                release(h);
+                next_free = disp_scratch;
+                copy(state_cell + 1, disp_h);
+                gen_dispatch16(disp_h, (int)blocks.size() / 256 + 1);
+                next_free = disp_scratch;
+                clear(disp_h);
                 nonzeroN(state_cell, run_cell, 2);
             }
             close();
         }
+        next_free = after_frames;
         pop_scope();
     }
 
@@ -2901,7 +3103,7 @@ struct Gen {
             declared_names(s->else_body, out);
         }
     }
-    void layout_globals(const Program& prog) {
+    std::unordered_map<std::string, double> global_refs(const Program& prog) {
         std::unordered_map<std::string, double> refs, calls;
         std::unordered_set<std::string> none;
         for (auto& s : prog.items) count_refs(*s, 1.0, refs, calls, none);
@@ -2918,9 +3120,14 @@ struct Gen {
             for (auto& s : d.body) count_refs(*s, 1.0, pr.refs, pr.calls, shadow);
         }
         std::unordered_map<std::string, double> times;          // inlined copies of each procedure
+        std::unordered_set<std::string> emitted_once;           // trampolined: one copy, however often called
         std::function<void(const std::string&, double, int)> visit = [&](const std::string& p, double w, int depth) {
             auto it = per.find(p);
             if (it == per.end() || depth > 64) return;
+            if (ProcInfo* pi = find_proc(p); pi && pi->tramp) {
+                if (!emitted_once.insert(p).second) return;
+                w = 1.0;
+            }
             times[p] += w;
             for (auto& c : it->second.calls) visit(c.first, w * c.second, depth + 1);
         };
@@ -2929,6 +3136,10 @@ struct Gen {
             double t = times.count(kv.first) ? times[kv.first] : 0.0;
             for (auto& r : kv.second.refs) refs[r.first] += t * r.second;
         }
+        return refs;
+    }
+    void layout_globals(const Program& prog) {
+        std::unordered_map<std::string, double> refs = global_refs(prog);
         // Groups: runs of declarations with no code between them.  A group is laid out
         // when its first declaration is reached, so code before it keeps its
         // temporaries close to the variables that exist then.

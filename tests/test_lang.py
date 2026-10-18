@@ -82,6 +82,7 @@ DIAGS = [
      ["1:30: warning: comparing or combining signed 'int' with unsigned 'word' treats both as unsigned"], ["--warn"], 0),
     ("err-addr-of-cell", "byte x; byte* p = &x;", ["1:19: '&' needs something in the heap; variables held in cells have no address"], (), 1),
     ("err-deref-int", "byte x; out *x;", ["1:13: '*' needs a pointer, not 'byte'"], (), 1),
+    ("err-shared-recursive", "shared proc byte f(byte n) { return f(n); } print f(1);", ["1:1: 'f' is recursive; declare it 'rec proc'"], (), 1),
     ("err-heap-too-small", "heap 100; heap byte b[200];", ["1:1: heap arrays and string literals need 207 bytes of heap but the heap has 100; declare a larger one with 'heap N;'"], (), 1),
     ("err-pointer-int-assign", "heap byte b[2]; byte* p = 5;", ["1:27: cannot convert 'byte' to 'byte*' without a cast"], (), 1),
     ("err-struct-unknown-field", "struct Point { int x; int y; } Point p; p.z = 1;", ["1:42: 'Point' has no field 'z'"], (), 1),
@@ -332,7 +333,22 @@ case("struct-array-field", "struct Buf { byte data[4]; byte len; } Buf b; b.data
 case("struct-heap-copy", "struct Point { int x; int y; } heap Point hp[2]; Point a; a.x = 11; a.y = -22; hp[1] = a; Point b = hp[1]; Point* pp = &hp[1]; pp->x += 1; print b.x, \" \", b.y, \" \", hp[1].x, \" \", (*pp).y;", b"11 -22 12 -22")
 case("rec-struct-list", "struct Node { int val; Node* next; } heap Node pool[5]; rec proc int total(Node* p) { if (!p) { return 0; } return p->val + total(p->next); } byte i; for (i = 0; i < 5; i++) { pool[i].val = int(i) + 1; if (i < 4) { pool[i].next = &pool[i + 1]; } } print total(pool);",
      b"15")
-case("rec-struct-local", "struct Point { int x; int y; } rec proc int f(byte n) { Point p; p.x = int(n); p.y = 1; if (n == 0) { return p.y; } return p.x + f(n - 1); } print f(5);", b"16")
+# ---- shared procedures: one copy, called through the trampoline ----
+case("shared-basic", "shared proc long sq(long x) { return x * x; } long a = sq(12); long b = sq(-7) + sq(3); byte i; long s = 0;"
+     " for (i = 1; i <= 4; i++) { s += sq(long(i)); } print a, \" \", b, \" \", s;", b"144 58 30")
+case("shared-nested", "shared proc word sum3(word a, word b, word c) { return a + b + c; } shared proc word twice(word v) { return sum3(v, v, 0); }"
+     " proc word inl(word v) { return twice(v) + 1; } print sum3(1, 2, 3), \" \", twice(50), \" \", inl(7);", b"6 100 15")
+case("shared-local-array", "shared proc word mark(byte at) { word t[3]; t[at] = 5; return t[0] + t[1] + t[2]; } print mark(0), \" \", mark(1), \" \", mark(2);",
+     b"5 5 5")
+case("shared-ref", "shared proc swap(ref int a, ref int b) { int t = a; a = b; b = t; } int x = 3; int y = -9; swap(x, y); print x, \" \", y;",
+     b"-9 3")
+case("shared-and-rec", "shared proc word add1(word v) { return v + 1; } rec proc word fact(word n) { if (n <= 1) { return add1(0); } return n * fact(n - 1); }"
+     " shared proc word viarec(word n) { return fact(n) + add1(n); } print fact(5), \" \", viarec(4);", b"120 29")
+case("shared-in-cycle", "rec proc byte down(byte n) { if (n == 0) { return 0; } return hop(n - 1) + 1; }"
+     " shared proc byte hop(byte n) { byte arr[2]; arr[1] = n; return down(arr[1]); } print down(5);", b"5")
+case("shared-in-loops", "shared proc byte f(byte v) { if (v > 9) { return v - 9; } return v * 2; } byte i; byte j; word t = 0;"
+     " for (i = 0; i < 6; i++) { j = 0; while (j < i) { t += f(i + j); j++; } if (f(i) > 4) { t += 100; } } print t;", b"450")
+case("rec-struct-local","struct Point { int x; int y; } rec proc int f(byte n) { Point p; p.x = int(n); p.y = 1; if (n == 0) { return p.y; } return p.x + f(n - 1); } print f(5);", b"16")
 
 case("wide-arrays-cells", "word w[5]; long l[3]; byte i; for (i = 0; i < 5; i++) { w[i] = word(i) * 1000; } for (i = 0; i < 3; i++) { l[i] = -long(i) * 100000; } i = 4; print w[i], \" \", w[2] + w[3], \" \", l[2], \" \", l[i - 3];",
      b"4000 5000 -200000 -100000")
@@ -559,9 +575,45 @@ def samples(update):
     return checked, fails
 
 
+def deterministic():
+    """The same source must always compile to the same brainfuck.  (A Var* held
+    across the inlining of a call in an expression once dangled when the scope
+    list grew, so that, now and then, an array was read from the wrong cells.)"""
+    src = os.path.join(TMP, "determinism.bfl")
+    open(src, "w").write("byte ga[4]; ga[2] = 7; proc byte p1() { byte w = 3; return 2; } byte g2 = ga[p1()]; out '0' + g2;\n")
+    outs = set()
+    for i in range(40):
+        path = os.path.join(TMP, "determinism.b")
+        r = subprocess.run([BF, "--emit", path, src], capture_output=True, timeout=60)
+        outs.add(open(path, "rb").read() if r.returncode == 0 else b"error")
+    ok = len(outs) == 1
+    print(("PASS " if ok else "FAIL ") + "compile-deterministic")
+    if not ok:
+        print(f"   {len(outs)} different outputs from 40 compilations")
+    return ok
+
+
+def shared_fuzz():
+    """A few programs of tests/fuzz_shared.py: shared and inlined procedures agree."""
+    sys.path.insert(0, os.path.dirname(__file__))
+    sys.dont_write_bytecode = True
+    import fuzz_shared
+    msgs = []
+    ran, fails = fuzz_shared.run(12, 5000, BF, TMP, log=msgs.append)
+    ok = fails == 0 and ran >= 6
+    print(("PASS " if ok else "FAIL ") + f"shared-vs-inlined ({ran} random programs)")
+    for m in msgs:
+        print(m)
+    return ok
+
+
 def main():
     update = "--update-golden" in sys.argv
     fails = 0
+    if not deterministic():
+        fails += 1
+    if not shared_fuzz():
+        fails += 1
     if not golden(update):
         fails += 1
     n_samples, f_samples = samples(update)
@@ -607,7 +659,7 @@ def main():
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1
-    total = len(CASES) + 3 + len(errors) + len(DIAGS) + len(GRIDS) + n_samples
+    total = len(CASES) + 5 + len(errors) + len(DIAGS) + len(GRIDS) + n_samples
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

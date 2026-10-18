@@ -346,6 +346,7 @@ STATEMENTS
   proc name(byte a, ref word w, ref byte buf[]) { ... }    name(1, w, buf);
   proc byte sq(byte x) { return x * x; }     y = sq(3) + 1;   return e; / return;
   rec proc byte fib(byte n) { ... }          a procedure that may call itself
+  shared proc glow(long x) { ... }           one copy, called through the trampoline
   stack 64;                  cells of recursion stack (top level; default 128)
 
 PROCEDURES AND RECURSION
@@ -362,7 +363,13 @@ PROCEDURES AND RECURSION
   out, and variables of code that calls a rec proc need unique names.
   stack N; sets the save stack (default 128 cells, up to 32768; above 256
   it is slower).  bf --check-stack halts on overflow with a message.  A
-  call costs roughly 1000 commands plus 70 per cell saved.
+  call to a small procedure is about 60 ns on the JIT, more for each cell
+  saved.
+  A shared proc is compiled the same way but must not call itself: its
+  body exists once however many places call it.  Only calls within a
+  cycle of procedures save anything on the stack.  Sharing trampolines the
+  callers too, so it pays for a sizeable procedure called from many places
+  outside hot loops.
 
 EXPRESSIONS
   Operators, loosest first:  ||  &&  |  ^  &  == !=  < <= > >=  << >>  + -  * / %

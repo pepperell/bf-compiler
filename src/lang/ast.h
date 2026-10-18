@@ -80,6 +80,7 @@ struct Stmt {
     std::string op;                 // Assign: "=", "+=", ...; IncDec: "++" / "--"
     std::string text;               // Asm: raw brainfuck
     bool        rec = false;        // Proc: declared "rec proc" (compiled as a trampoline)
+    bool        shared = false;     // Proc: declared "shared proc" (one copy, called through the trampoline)
     bool        in_heap = false;    // Decl: "heap T name[n]"
     TypeSpec    ts;                 // Decl: variable type; Proc: result type (empty = none)
     ExprP       count_e;            // Decl: array length; Stack/Heap: size
