@@ -115,19 +115,75 @@ bool jit_compile(const Program& p, JitCode& out) {
                 guard = e.jcc(Emitter::CC_B);
             }
             const Idiom& d = p.idioms[(size_t)x.arg];
-            if (d.kind == IDIOM_DIVMOD || d.kind == IDIOM_DIVIDE || d.kind == IDIOM_MULTIPLY || d.kind == IDIOM_PRODUCT) {
+            auto call_idiom = [&] {                                // idiom_fn: done, or on to the body
                 e.mov_ctxptr_from_r12();
                 e.mov_rcx_rbx();
                 e.b({0xBA}); e.d32(x.arg);                         // mov edx, idx
                 e.call_ctx(72);                                    // idiom_fn
                 e.b({0x85, 0xC0});                                 // test eax, eax
                 fixups.push_back({e.jcc(Emitter::CC_NE), x.target});
-            } else {
-                // a loop that reaches the end of the tape runs as written, which faults (or not) where it should:
-                // the code below touches every cell of a carry chain and reads every scratch cell
+            };
+            // Inline code: a loop that reaches the end of the tape runs as written, which faults (or not) where
+            // it should, since the code below touches every cell of a carry chain and reads every scratch cell.
+            auto check_end = [&] {
                 e.b({0x49, 0x8D}); e.r12mem(0, d.hi);              // lea rax, [r12+hi]
                 e.b({0x48, 0x3B, 0x43, 0x50});                     // cmp rax, [rbx+80]  (tape_end)
                 fixups.push_back({e.jcc(Emitter::CC_AE), (int32_t)i + 1});
+            };
+            if (d.kind == IDIOM_DIVMOD || d.kind == IDIOM_DIVIDE) {
+                call_idiom();
+            } else if (d.kind == IDIOM_MULTIPLY) {
+                // the 8n passes the compiler sets up, inline: P = (P << 8n) + A * B, B = 0 (mod 2^64, which
+                // the stores cut to w bytes); any other count goes through idiom_fn
+                int nb = d.bytes, w = d.wide;
+                check_end();
+                e.b({0x41, 0x80}); e.r12mem(7, 0); e.d8(8 * nb); // cmp byte [r12], 8n
+                size_t other = e.jcc(Emitter::CC_NE);
+                for (size_t k = 0; k < d.guards.size(); k++) {   // the scratch cells are all 0: or them together
+                    e.b({0x41, (uint8_t)(k ? 0x0A : 0x8A)}); e.r12mem(0, d.guards[k].off);    // mov / or al, [r12+g]
+                }
+                if (!d.guards.empty()) {
+                    e.b({0x84, 0xC0});                             // test al, al
+                    fixups.push_back({e.jcc(Emitter::CC_NE), (int32_t)i + 1});
+                }
+                auto load = [&](int reg, size_t at, int len) {     // reg = the len bytes at cells[at..], high first
+                    for (int k = len - 1; k >= 0; k--) {
+                        int32_t o = d.cells[at + (size_t)k];
+                        if (k == len - 1) { e.b({0x41, 0x0F, 0xB6}); e.r12mem(reg, o); }       // movzx reg32, byte [r12+o]
+                        else {
+                            e.b({0x48, 0xC1, (uint8_t)(0xE0 | reg), 8});                     // shl reg, 8
+                            e.b({0x41, 0x8A}); e.r12mem(reg, o);                               // mov reg8, [r12+o]
+                        }
+                    }
+                };
+                load(0, 0, w);                                     // rax = P
+                load(1, (size_t)w, nb);                            // rcx = A
+                load(2, (size_t)(w + nb), nb);                     // rdx = B
+                e.b({0x48, 0xC1, 0xE0, (uint8_t)(8 * nb)});        // shl rax, 8n
+                e.b({0x48, 0x0F, 0xAF, 0xCA});                     // imul rcx, rdx
+                e.b({0x48, 0x01, 0xC8});                           // add rax, rcx
+                for (int k = 0; k < w; k++) {
+                    if (k) e.b({0x48, 0xC1, 0xE8, 8});             // shr rax, 8
+                    e.b({0x41, 0x88}); e.r12mem(0, d.cells[(size_t)k]);                        // mov [r12+p], al
+                }
+                for (int k = 0; k < nb; k++) { e.b({0x41, 0xC6}); e.r12mem(0, d.cells[(size_t)(w + nb + k)]); e.d8(0); }
+                e.b({0x41, 0xC6}); e.r12mem(0, 0); e.d8(0);        // mov byte [r12], 0
+                fixups.push_back({e.jmp(), x.target});
+                e.bind(other, e.pos());
+                call_idiom();
+            } else if (d.kind == IDIOM_PRODUCT) {
+                check_end();
+                e.b({0x41, 0x0F, 0xB6}); e.r12mem(0, 0);           // movzx eax, byte [r12]  (the pass count)
+                for (size_t k = 0; k < d.factors.size(); k++) {
+                    e.b({0x41, 0x0F, 0xB6}); e.r12mem(1, d.cells[2 * k + 1]);              // movzx ecx, byte [r12+s]
+                    e.b({0x0F, 0xAF, 0xC8});                                               // imul ecx, eax
+                    if (d.factors[k] != 1) { e.b({0x6B, 0xC9}); e.d8((int8_t)d.factors[k]); }   // imul ecx, ecx, f
+                    e.b({0x41, 0x00}); e.r12mem(1, d.cells[2 * k]);                        // add [r12+d], cl
+                }
+                e.b({0x41, 0xC6}); e.r12mem(0, 0); e.d8(0);        // mov byte [r12], 0
+                fixups.push_back({e.jmp(), x.target});
+            } else {
+                check_end();
                 for (const Idiom::Guard& g : d.guards) {           // scratch cells: else run the body
                     if (!g.check) continue;
                     e.b({0x41, 0x80}); e.r12mem(7, g.off); e.d8(g.val);         // cmp byte [r12+off], val

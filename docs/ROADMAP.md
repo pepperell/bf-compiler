@@ -32,7 +32,7 @@ plus the type system, library and tooling they need.
 | 12 | Faster division | 9 |
 | 13 | The profiler in the UI | nothing |
 | 14 | Housekeeping (the raytracer animation) | nothing |
-| 15 | Planned: multiplication as one IR step | 9 |
+| 15 | Multiplication as one IR step | 9 |
 | 16 | Planned: shorter trips to operands (placement of temporaries and globals) | 9 |
 | 17 | Planned: cheaper constant factors in `mulshr` | 10 |
 | 18 | Planned: loose ends of phases 11 to 13 | 11, 13 |
@@ -657,6 +657,91 @@ and the fuzzer.
 
 Done when: a 32-bit `*` and `mulshr` execute a few hundred IR instructions or fewer,
 the raytracer frame time drops, and the grids and a long fuzz run are clean.
+
+**Built** as an idiom recognised by its text, as phase 12 did for division
+(`IDIOM_MULTIPLY`; "the multiply loop" in `src/ir.cpp`, `bf::multiply_loop` and
+`bf::MultiplyLayout` in `src/bf.h`). One generator gives the loop for factors `A` and `B`
+of `n` bytes and a product `P` of `w` bytes (`n <= w <= 2n`); the optimiser matches it
+for `n` = 1, 2 and 4 and every `w`. Each pass doubles `P` (high byte first, the top bit
+dropped), shifts `B` left by one bit into a cell `X`, and when `X` is set adds `A` to `P`,
+each byte of `A` counted out with a carry chain up to `P`'s top; after `8n` passes `P` is
+`A * B` mod 256^w and `B` is 0. The block is the counter, five cells per byte of `P` below
+`n` (the byte, two for its zero test, a counter, a byte of `A`) and four above, four per
+byte of `B`, and `X`: `9n + 2` cells for `*`, up to `13n + 2` for `mulshr`. The rule takes
+any pass count (the top bits of `B` times `A`, added to `P` shifted); the JIT does the
+compiler's `8n` passes inline (the scratch cells or-ed together and tested, then
+`P << 8n + A * B` in a 64-bit register) and other counts through `idiom_fn`.
+
+In the compiler, `mulN` is the loop with `w = n`: the wrapped product is the same signed or
+not, so the compare and swap of the operands and their signs are gone. `mulshr` multiplies
+the magnitudes with `w = min(2n, n + k/8 (+1 when k%8))`, drops the bytes below `k/8`,
+shifts the last `k % 8` bits with one pass of byte divisions as before, and for a negative
+product gives `~h` when a bit shifted out was set and `-h` otherwise (`h` the shifted
+magnitude). A constant factor of 8 or more is put into `B` and runs the loop as well
+(`mul_constN`), which is smaller and faster than the unrolled shifts and adds from there
+on: `long * 41` 380 to 85 IR instructions and 8 800 to 5 200 commands, `long * 1103515245`
+2 213 to 85 and 47 800 to 5 400, `int * 12` 91 to 59 and 1 600 to 1 350 (below 8 the
+unrolled code is smaller, at most twice as slow). The byte `*`, `x[- y[- d+ t+] t[- y+]]`,
+was a loop of 3 IR instructions a unit of `x` once its inner loops became multiply-adds; a
+loop whose body is multiply-adds from cells it does not write and one decrement of the
+loop cell is now `IDIOM_PRODUCT` (each `d += s * f * x`, inline in the JIT).
+
+Tests: `word-multiply`, `long-multiply` (`w` = 2, 3, 4, 6 and 8, `n` = 1, 2 and 4) and
+`byte-multiply` in `IDIOM_PROGRAMS`, poked at every cell of the loops, and the two
+multiply programs cut off by the end of RAM in the fault test (now
+`fault-idiom-loops-at-end`); `bf_product` in the fuzzer's brainfuck generator (12% of its
+programs get a product idiom); and a check of the rule against the text on 4 600 random
+states (counter, `P`, `A`, `B`, and in a quarter of them a poked scratch cell) for every
+`n` and `w`, the loop as written against the JIT and the interpreter, run while building
+it. The fuzzer ran `--bfl 2000 --bf 500` and `--bfl 1500 --bf 1000` clean (it runs every
+program with `BF_NO_IDIOMS` as well). The raytracer's 16 frames rendered headless are
+identical to the commit before.
+
+Measured with `tools/bench.py` against the commit before (frame times: the fastest of
+nine runs, the two builds run alternately, three rounds each, on a machine shared with
+other work):
+
+| | before | after |
+|---|---:|---:|
+| `long * long`, IR instructions / commands | 1 695 / 10 937 | 85 / 6 025 |
+| the same, large operands (wraps) | 2 368 / 8 465 | 85 / 5 665 |
+| `int * int` (the statement's own commands) | 470 / 3 725 | 59 / 1 474 |
+| `byte * byte` | 610 / 127 | 14 / 127 |
+| `mulshr(long, long, 12)` | 1 088 / 11 864 | 191 / 7 232 |
+| `mulshr(int, int, 7)` | 487 / 4 932 | 158 / 3 829 |
+| `(long * long) >> 12` | 1 893 / 18 077 | 264 / 13 165 |
+| `lc = fa * fb + la * ld - lb * fa;` | 4 812 / 14 936 | 299 / 10 042 |
+| the same with `BFL_SHARE=0` (own commands) | 4 768 / 35 388 | 261 / 20 652 |
+| `long * long` with `BF_NO_IDIOMS`, IR instructions | 35 435 | 103 522 |
+| `raytracer.bfl`: ms a frame / light map / commands | 58.3 / 90 / 4.06 M | 42.5 / 43 / 3.66 M |
+| `raytracer_text.bfl` | 25.5 / 85 / 3.59 M | 16.0 / 37 / 3.18 M |
+| `cube.bfl`: ms a frame / commands | 1.41 / 313 K | 1.39 / 252 K |
+| `starfield.bfl` | 1.15 / 1.79 M | 1.09 / 1.23 M |
+
+A raytracer frame executes 124 M IR instructions instead of 188 M (and 128 000 multiply
+loops), and the start (the light map) 175 M instead of 412 M. Of the other samples
+`bst.bfl` is 4.6% smaller, `numbers.bfl` 1%, `life.bfl` 0.1% larger; the rest change by
+less.
+
+Found along the way:
+
+- The JIT's inline idioms (carry chains, saturating subtract, halving) read every scratch
+  cell and touch every cell of a carry chain, where the loop as written may stop short: a
+  loop near the end of the tape faulted at once, losing output the interpreter and the
+  unoptimised run had printed (the new fault case, `long-multiply` with `--ram 70`). The
+  inline code now compares the idiom's highest cell with `Ctx::tape_end` (offset 80) and
+  runs the loop as written past it.
+- Without the idioms (`BF_NO_IDIOMS`) the loop always makes `8n` passes, so a 32-bit `*`
+  runs 104 000 to 416 000 IR instructions instead of 35 000 to 106 000, as division did in
+  phase 12; as written the loop alone is 0.2 to 2 million commands.
+- `tools/bench.py` shows the sizes of `long / long` and `long % long` 28% larger, but their
+  statements are unchanged (9 603 commands before and after): an op's size there is the
+  program's minus the setup's, and the setup's constant products are now smaller and lay
+  the globals out differently.
+- Phase 17's premise has moved: `mulshr` no longer depends on the order or size of its
+  operands and runs a constant factor in one step, `mulshr(a, 218, 8)` in 125 IR
+  instructions and 5 100 commands (681 and 8 500 before) against 82 and 5 700 for
+  `(a * 218) >> 8`, which now runs the loop too. What remains is the cost of the signs.
 
 ### Phase 16: shorter trips to operands
 

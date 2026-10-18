@@ -352,24 +352,19 @@ int  x1 = mulshr(x, cosine, 10) + mulshr(z, sine, 10);   // the product needs 32
 - So whenever `a * b` does not overflow, `mulshr(a, b, k)` equals `(a * b) >> k`;
   when it does, `mulshr` still gives the right answer. Two constants fold exactly.
 
-Cost: a shift-and-add loop that runs once per bit of `|b|`. Unlike `*`, which
-compares its operands and loops over the smaller, `mulshr` takes them as written, so
-put the operand with the smaller magnitude second. Each step adds `|a|`, shifted,
-into an accumulator that keeps only the bytes that survive the shift (and one below
-them for the bits): after
-each byte of `b` whose bits are all below the shift, the accumulator's low byte is
-final and is dropped; the last `k % 8` bits are one pass of byte divisions. A Q12
-product of two `long`s runs about 1 100 IR instructions and compiles to about 12 000
-commands, against 1 900 and 18 000 for `(a * b) >> 12` (`tools/bench.py`); for `int`
-it is 490 and 4 900 against 690 and 10 000, since `>>` on an `int` is unrolled bit by
-bit. Each further bit of `|b|` adds about 100 IR instructions: with `b` near 2^31
-and `a` around 5 000, `mulshr(a, b, 12)` runs about 2 900 against 1 800 for
-`(a * b) >> 12`, and 1 100 with the operands the other way round. A constant factor
-runs the same loop, which is slower than the unrolled constant multiply of `*`:
-`mulshr(a, 218, 8)` on `long`s runs about 690 IR instructions against 560 for
-`(a * 218) >> 8`, though it is the smaller code (about 8 000 commands against
-12 000). So `mulshr` pays for two variables in the right order, and wherever `a * b`
-could overflow; a constant factor whose product fits is faster with `*` and `>>`.
+Cost: the multiply loop of `*` ("Idioms used by the compiler"), on the magnitudes,
+computing only the low `n + k/8` bytes of the product (`n` the type's bytes; one more
+when `k % 8` is not 0, at most `2n`), which the optimiser runs in one step; the bytes below the shift are
+dropped and the last `k % 8` bits are one pass of byte divisions. A Q12 product of
+two `long`s runs about 190 IR instructions and compiles to about 7 300 commands,
+against 260 and 13 200 for `(a * b) >> 12` (`tools/bench.py`); for `int` it is 160
+and 3 800 against 260 and 7 700, since `>>` on an `int` is unrolled bit by bit. The
+values of the operands and their order do not change the cost. A constant factor
+runs the same loop: `mulshr(a, 218, 8)` on `long`s runs about 125 IR instructions
+against 80 for `(a * 218) >> 8` (the signs cost the difference), in about 5 100
+commands against 5 700. So `mulshr` pays wherever `a * b` could overflow and for
+two variables; a constant factor whose product fits is a little faster with `*` and
+`>>`.
 
 ## Registers
 
@@ -465,21 +460,21 @@ Cost model, roughly, per operation on bytes:
 | `&`, `\|`, `^` | ~500 | ~5000 |
 | `a[i]` read / write | ~70 | ~15·i |
 
-Word operations are 5 to 20 times a byte's; word `/` and `%` loop once per bit
-of the dividend (16 passes for a word, 32 for a long). The executed column is
+Word operations are 5 to 20 times a byte's; word `*`, `mulshr`, `/` and `%` loop
+once per bit (16 passes for a word, 32 for a long). The executed column is
 what a plain brainfuck interpreter does. On this machine the IR optimiser turns
 the common idioms (clear, move, copy, constant multiply) into single
 instructions, and it also recognises the loops whose trip count is a value: the
 byte compare, the carry and borrow chains of multi-byte `+` and `-`, halving
-(shifts, bitwise operators) and byte division each run as one step (`src/ir.cpp`,
-"loop idioms"), and so does the whole multi-byte division loop ("the division
-loop"). Measured in IR instructions executed, a 32-bit `+` is about 40, `<` about
-120, `*` 1 700 to 2 400 (more for larger operands) and `/` about 200, against
-10 000, 2 300, 129 000 and 290 000 without those idioms. Several of the same
-16- or 32-bit `*`, `mulshr`, `/` or `%` in one sum or run of statements share
-one copy of their code
-("Shared arithmetic" below): three `long` products in a sum are about 15 000
-commands instead of 34 500.
+(shifts, bitwise operators), byte division and the byte `*` each run as one step
+(`src/ir.cpp`, "loop idioms"), and so do the whole multi-byte division and
+multiply loops ("the division loop", "the multiply loop"). Measured in IR
+instructions executed, a 32-bit `+` is about 40, `<` about 120, `*` about 85 and
+`/` about 200, against 10 000, 2 300, 100 000 to 400 000 and 290 000 without
+those idioms; a byte `*` is about 15, where its loop took 3 a unit of a factor. Several
+of the same 16- or 32-bit `*`, `mulshr`, `/` or `%` in one sum or run of
+statements share one copy of their code ("Shared arithmetic" below): three
+`long` products in a sum are about 11 000 commands instead of 20 700.
 `bf --profile` (Run > Profile in the UI) shows where a program's instructions go, by statement. The compiler also tracks cells whose value it knows in straight-line
 code: constants, string output and copies of known variables are emitted as the
 shortest delta, and expressions over known variables fold entirely.
@@ -525,8 +520,27 @@ These are the building blocks; knowing them helps read the output and write
   operands). The optimiser recognises the loop by its exact text and runs all
   the passes in one step; signs, division by zero and the moves in and out are
   done around it.
+- **Multiplication** of words and longs (`n` bytes), and `mulshr` of every
+  width, is one loop on a block of `5n + 4w + 2` temporaries
+  (`bf::multiply_loop` and `bf::MultiplyLayout` in `src/bf.h`), `w` being the
+  bytes of the product it keeps: `n` for `*`, which wraps, up to `2n` for
+  `mulshr`. The block holds the pass counter, set to `8n`, then a group per byte
+  of the product `P` (the byte, two cells for its zero test, a counter, and in
+  the low `n` groups a byte of the factor `A`), four cells per byte of the other
+  factor `B` (the byte, two cells for its zero test, a counter) and the bit `X`.
+  Each pass doubles `P` (high byte first, as division shifts; the top bit is dropped),
+  shifts `B` left by one bit into `X`, and when `X` is set adds `A` to `P`, each
+  byte of `A` counted out with a carry chain up to `P`'s top byte. After the
+  `8n` passes `P` is `A * B` and `B` is 0. As written that is 32 passes for a
+  long whatever the values (about 0.2 to 2 million commands for a 32-bit `*`);
+  the optimiser recognises the loop by its exact text and runs all the passes in
+  one step, about 85 IR instructions for a 32-bit `*` with the moves in and out.
+  Signs and the shift of `mulshr` are done around it. A constant factor from 8
+  up is put into `B` and runs the same loop, which is smaller than the unrolled
+  shifts and adds; a smaller one is copies, shifts and adds. A byte `*` is
+  `x[- y[- d+ t+] t[- y+]]`, which the optimiser runs as one product.
 - **Shared arithmetic.** A 16- or 32-bit `*`, `mulshr`, `/` or `%` is thousands
-  of commands (a 32-bit `*` about 11 000), so when a block would emit the same
+  of commands (a 32-bit `*` about 6 000), so when a block would emit the same
   routine (operator, width, signedness, and for `mulshr` the count) at least
   twice, it emits it once, inside a loop that runs once per operation: a counter
   cell runs the loop, and a flag per operation chooses the code after the
@@ -542,7 +556,7 @@ These are the building blocks; knowing them helps read the output and write
   statement after it, with the cell values the compiler knows; the other
   statements run inside the loop without them. Values known before the loop
   that no statement in it writes are known again after it. A constant factor
-  is not shared (it becomes shifts and adds), nor is an operation that reads a
+  is not shared (it is multiplied on its own, as above), nor is an operation that reads a
   variable whose value the compiler knows: a run ends before its statement,
   which can then fold it or use a constant factor, and its result is known. One
   loop runs at most 16 operations, because the code between the loop's flags

@@ -112,7 +112,7 @@ classic programs by Erik Bosman and Daniel B. Cristofani.
 
 `programs/samples/raytracer.bfl`: four reflective spheres, two lamps with soft shadows and
 a checkerboard floor, in fixed-point BFL on the framebuffer. A 128x64 frame takes about
-55 ms with the JIT.
+42 ms with the JIT.
 
 ## UI
 
@@ -137,8 +137,9 @@ Source is compiled to an optimised IR and then to x64 at run time. `mandelbrot.b
 about 0.4 s with the JIT and 3.2 s on the interpreter; a naive interpreter takes over a
 minute. Besides the usual run folding, offset fusion, clear, multiply and scan loops, the
 optimiser executes candidate loop bodies symbolically and recognises BFL's multi-byte
-arithmetic idioms (carry chains, saturating subtract, halving, division), running the whole
-loop in one step; this made a raytracer frame 16 times faster. `bf --dump` shows the IR.
+arithmetic idioms (carry chains, saturating subtract, halving, division, multiplication),
+running the whole loop in one step; with them a raytracer frame went from 2.3 s to about
+42 ms. `bf --dump` shows the IR.
 
 ## How it works
 
