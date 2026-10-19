@@ -113,11 +113,32 @@ classic programs by Erik Bosman and Daniel B. Cristofani.
 
 ![raytracer.bfl: 16 frames of one camera orbit](docs/raytracer.gif)
 
-`programs/samples/raytracer.bfl`: four reflective spheres, two lamps with soft shadows and
-a checkerboard floor, in fixed-point BFL on the framebuffer. A 128x64 frame takes about
-31 ms with the JIT.
+**`raytracer.bfl`**: four reflective spheres, two lamps with soft shadows and a checkerboard
+floor, in fixed-point BFL on the framebuffer; a 128x64 frame takes about 31 ms with the JIT.\
+596 lines of BFL (495 of code, 561 statements) → 2,770,508 brainfuck commands → 147,245 IR
+instructions → 2.2 MB of x64; 84,062 tape cells; compiled in 371 ms.
+
+![flag.bfl: 2.5 seconds of a chequered flag in gusty wind](docs/flag.gif)
+
+**`flag.bfl`**: 21 x 11 particles of cloth in gusty wind, Verlet integration and
+Gouraud-shaded triangles, drawn into a back buffer (`FB_BUFFER`) and shown whole, at 30 frames
+a second.\
+648 lines of BFL (539 of code, 666 statements) → 4,148,193 brainfuck commands → 152,428 IR
+instructions → 2.2 MB of x64; 52,624 tape cells; compiled in 419 ms.
+
+![life.bfl: 60 generations of Conway's Game of Life](docs/life.gif)
+
+**`life.bfl`**: Conway's Game of Life in the terminal, two heap grids swapped through
+pointers and drawn with ANSI escapes.\
+83 lines of BFL (65 of code, 75 statements) → 75,759 brainfuck commands → 4,290 IR
+instructions → 66 KB of x64; 41,113 tape cells; compiled in 17 ms.
+
+The GIFs are made by `tools/rt_gif.py` and `tools/demo_gif.py`, which also prints these figures
+(`python tools/demo_gif.py stats FILE.bfl`).
 
 ## UI
+
+![bfui with life.bfl: the profiler's heat gutter and top statements, the generated brainfuck, the terminal and the memory viewer, in the dark theme](docs/mainscreen.png)
 
 Device panel, source editor, VT100 terminal, memory viewer and watch list. F5 compiles and
 runs the editor, Shift+F5 stops, Ctrl+B shows the generated brainfuck. The terminal is a
