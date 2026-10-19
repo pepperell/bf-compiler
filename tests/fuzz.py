@@ -1669,7 +1669,9 @@ class Gen:
             elif k < 0.72:
                 # a declaration, usable by the rest of this list
                 q = r.random()
-                if q < 0.15:
+                tramp = [c for c in cx.calls if c.tramp] if cx.in_loop else []
+                tpure = [c for c in cx.pure if c.tramp] if cx.in_loop else []
+                if q < (0.4 if tramp or tpure else 0.15):
                     t = r.choice(self.snames) if self.snames and r.random() < 0.3 else r.choice(TNAMES)
                     name = self.fresh("la")
                     size = r.randint(1, 3) if is_struct(t) else r.randint(2, 5)
@@ -1681,7 +1683,23 @@ class Gen:
                     else:
                         cx.warrs.append((name, t, size, False))
                         cx.arrs.append((name, t, size, False))
-                elif q < 0.23 and cx.hptrs:
+                        if cx.in_loop and r.random() < 0.6:
+                            # read before written: a loop body's array starts at zero on every pass
+                            # with a trampolined call in it or after it, so that in trampolined code the array
+                            # is a frame's (the rest of a list that calls none is generated as plain code)
+                            e = None
+                            if tpure and r.random() < 0.6:
+                                p = r.choice(tpure)
+                                args = self.call_args(cx, p, 1)
+                                e = Call(p.name, args) if args is not None else None
+                            res.append(Assign(IdxL(name, Lit(r.randrange(size))), "+=", e or self.expr(cx, 1)))
+                            for _ in range(3 if not e and tramp and r.random() < 0.8 else 0):
+                                p = r.choice(tramp)
+                                args = self.stmt_args(cx, p)
+                                if args is not None:
+                                    res.append(CallS(p.name, args))
+                                    break
+                elif q < (0.48 if tramp or tpure else 0.23) and cx.hptrs:
                     # a pointer into a heap array, at a constant or a computed element
                     arr, t, size = r.choice(cx.hptrs)
                     name = self.fresh("lp")
@@ -2083,6 +2101,20 @@ class Gen:
                      spure=[p for p in procs if p.kind == "pure" and is_struct(p.ret)],
                      calls=procs, counters=[], in_loop=False, out_ok=True, ret=None)
         main = self.stmts(mcx, r.randint(4, 10), 0)
+        tpure = [p for p in mcx.pure if p.tramp]
+        if tpure and mcx.targets and r.random() < 0.3:
+            # an array of the trampolined main program's frame declared in a loop body, read before it is
+            # written: zero on every pass
+            p = r.choice(tpure)
+            args = self.call_args(mcx, p, 1)
+            if args is not None:
+                cv, la = self.fresh("c"), self.fresh("la")
+                self.vt[cv] = "byte"
+                t, size = r.choice(TNAMES), r.randint(2, 4)
+                j = r.randrange(size)
+                body = [ArrDecl(t, la, size, False), Assign(IdxL(la, Lit(j)), "+=", Call(p.name, args)),
+                        Assign(VarL(r.choice(mcx.targets)), "+=", Idx(la, Lit(j)))]
+                main.insert(r.randint(0, len(main)), For(cv, r.randint(2, 3), body))
         self.mcx = mcx
         dump = []
         for name in g:

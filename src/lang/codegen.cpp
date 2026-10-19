@@ -259,11 +259,12 @@ struct Gen {
     std::optional<int> known_val(int64_t c) const { auto it = known.find(c); if (it == known.end()) return std::nullopt; return it->second; }
     void forget(int64_t c) { known.erase(c); }
     // clear and move loop on their own cells only, so what is known of the others holds after them
+    // (without open and close, which forget everything: copying what is known around every
+    // clear and move was four fifths of the code generation time of the large samples)
     void clear(int64_t c) {
         if (known_is(c, 0)) return;
-        auto before = known;
-        open(c); out += '-'; close();
-        for (auto& kv : before) if (kv.first != c) known.insert(kv);
+        go(c); out += "[-]";
+        if (trackable(c)) known[c] = 0; else known.erase(c);
     }
     void add(int64_t c, int64_t v) {
         v &= 255;
@@ -388,13 +389,13 @@ struct Gen {
             set(from, 0);
             return;
         }
-        auto before = known;
-        open(from);
+        known.erase(from);
+        for (Dst d : dsts) known.erase(d.c);
+        go(from); out += '[';
         add(from, -1);
         for (Dst d : dsts) add(d.c, d.sign);
-        close();
-        for (auto& kv : before)
-            if (kv.first != from && std::none_of(dsts.begin(), dsts.end(), [&](const Dst& d) { return d.c == kv.first; })) known.insert(kv);
+        go(from); out += ']';
+        if (trackable(from)) known[from] = 0;
     }
     // dst += sign*src, src preserved.
     void copy(int64_t from, int64_t dst, int sign = 1) {
@@ -436,15 +437,23 @@ struct Gen {
     }
 
     // dst += 1 if the register is non-zero, without writing the register.
-    // After `reg[ ... P]` the pointer is on reg (not taken) or on P (taken);
-    // moving k = M-reg cells right lands on M (holding 1) or on P+k (zero),
-    // and `[- >*D ]` with D = P-reg brings the first case to P+k as well.
+    // M is the first RAM cell, kept for this (test_cell; zero but here).  After
+    // `M+ reg[ M- dst+ P ]` the pointer is on reg (not taken) or on P (taken);
+    // moving k = M-reg cells right (a few: the registers are just below RAM)
+    // lands on M (holding 1) or on P+k (zero, a free cell just above P), and
+    // `[- >*D ]` with D = P-reg brings the first case to P+k as well.
+    int64_t test_cell = -1;             // M; -1 until the program is known to need it
+    bool tests_regs = false;            // test_reg was called (compile() then generates again with test_cell)
     void test_reg(uint32_t reg, int64_t dst) {
-        int64_t M = tmp(), P = tmp();
-        set(M, 1);
+        tests_regs = true;
+        if (test_cell < 0) return;      // a pass that only finds out whether the cell is needed
+        int64_t M = test_cell, P = tmp();
+        auto before = known;            // what is known of the cells but dst holds after it
+        go(M); out += '+';
         go((int64_t)reg);
         out += '[';
         known.clear();
+        go(M); out += '-';
         add(dst, 1);
         go(P);
         out += ']';
@@ -452,14 +461,15 @@ struct Gen {
         rep('>', k);
         out += "[-"; rep('>', D); out += ']';
         cur = P + k;
-        if (P + k < next_free) internal("test_reg landing cell is in use");
+        if (k <= 0 || P + k < next_free) internal("test_reg landing cell is in use");
         // the landing cell must be zero: compile() places the globals above the
         // temporaries and the heap above the highest one
         land_hi = std::max(land_hi, P + k);
         if ((plan && P + k >= upper_lo && P + k < upper_lo + plan->size) || P + k >= heap_lo) internal("test_reg lands on a variable");
-        known.clear();
-        clear(M);                   // still 1 on the taken path
-        release(P); release(M);
+        known = std::move(before);
+        known.erase(dst);
+        known[M] = 0; known[P] = 0;
+        drop(P);
     }
 
     // ---- arrays in cells (see docs/LANG.md for the layout) ------------------------------------
@@ -2496,7 +2506,7 @@ struct Gen {
              heap_trips, known, prealloc, precomputed, next_is_cont, layout_group, cands, cand_at};
         auto cost = [&] {
             int64_t c = dry_moves - sv.dry_moves;
-            for (size_t k = sv.out; k < out.size(); k++) if (strchr("<>+-[].,", out[k])) c++;
+            for (size_t k = sv.out; k < out.size(); k++) if (strchr("<>+-[].,", out[k]) && out[k]) c++;
             return c;
         };
         auto restore = [&] {
@@ -3246,16 +3256,19 @@ struct Gen {
         case Stmt::Decl: {
             Var v; v.name = s.name; v.type = s.vtype; v.count = s.count;
             if (s.in_heap) { v.is_const = true; v.cval = s.cval; v.owned = false; p->consts.push_back(v); return; }
+            bool in_loop = L.break_state >= 0;
             if (s.count >= 0 && !p->is_main() && p->reentrant) {
-                // a local array of a recursive procedure lives in its heap frame
+                // a local array of a recursive procedure lives in its heap frame, zeroed on entry
+                // (and again where the declaration is met in a loop)
                 Var a; a.name = s.name; a.type = T->ptr(s.vtype); a.arr_ptr = true; a.arr_off = p->heap_frame;
                 p->heap_frame += std::max(s.vtype->size, 1) * s.count;
                 frame_add(p, a, s.pos);
+                if (in_loop) { Action& c = act(L, Action::Clear, &s); c.result = s.name; }
                 return;
             }
             frame_add(p, v, s.pos);
-            if (s.count >= 0) {                            // main: zero from the start; a shared proc's: cleared on every call
-                if (!p->is_main()) { Action& a = act(L, Action::Clear, &s); a.result = s.name; }
+            if (s.count >= 0) {                            // main: zero from the start unless in a loop; a shared proc's: cleared on every call
+                if (!p->is_main() || in_loop) { Action& a = act(L, Action::Clear, &s); a.result = s.name; }
                 return;
             }
             if (!s.e) { Action& a = act(L, Action::Clear, &s); a.result = s.name; return; }
@@ -3462,9 +3475,14 @@ struct Gen {
             copyN(e, v.cell, 2);
             addN_const(v.cell, 2, v.arr_off);
         }
-        // zero the block
-        int64_t a = tmp2(); copyN(e, a, 2);
-        int64_t cnt = tmp2(); setN(cnt, 2, p->heap_frame);
+        heap_zero(e, p->heap_frame);
+        heap_word_write(5, e);
+        drop(e, 2);
+    }
+    // zero the n heap bytes from the address in the 2 cells at from (kept)
+    void heap_zero(int64_t from, int64_t n) {
+        int64_t a = tmp2(); copyN(from, a, 2);
+        int64_t cnt = tmp2(); setN(cnt, 2, n);
         int64_t f = tmp(); nonzeroN(cnt, f, 2);
         open(f);
         {
@@ -3479,8 +3497,6 @@ struct Gen {
         }
         close();
         release(f); release2(cnt); release2(a);
-        heap_word_write(5, e);
-        drop(e, 2);
     }
     void frame_leave(TProc* p) {
         if (p->heap_frame <= 0) return;
@@ -3555,7 +3571,8 @@ struct Gen {
             Var* v = find_var(a.result);
             if (!v) internal("cleared variable missing");
             if (a.src) begin_stmt(*a.src);
-            if (v->count >= 0) { for (int k = 0; k < v->count; k++) for (int b = 0; b < v->size(); b++) clear(array_cell(v->cell, k, b, v->size())); }
+            if (v->arr_ptr) heap_zero(v->cell, (int64_t)std::max(a.src->vtype->size, 1) * a.src->count);
+            else if (v->count >= 0) { for (int k = 0; k < v->count; k++) for (int b = 0; b < v->size(); b++) clear(array_cell(v->cell, k, b, v->size())); }
             else clearN(v->cell, v->size());
             if (a.src) end_stmt();
             return;
@@ -4364,6 +4381,7 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
     // second dry pass with the plan finds where the temporaries end, and the last pass
     // places those globals just above them and the heap above both.
     std::vector<char> choices;          // the shared-run choices for the last pass (Gen::run_pays)
+    bool test_cell = false;             // the program tests a register (Gen::test_reg): its cell M is kept
     // measuring: the first pass, which counts the trips (unless BFL_NO_LAYOUT); the dry passes make the
     // shared-run choices (Gen::run_pays) and the last one follows those of the pass before it
     auto generate = [&](int64_t heap_lo, bool dry, const Gen::Plan* up, int64_t up_lo, bool measuring) -> std::unique_ptr<Gen> {
@@ -4373,6 +4391,7 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
         g->prelude = std::move(prelude);
         g->plan = up; g->upper_lo = up ? up_lo : INT64_MAX; g->stats = measuring && opt.layout;
         g->choosing = dry; g->run_choices = choices;
+        if (test_cell) { g->test_cell = ram_start; g->next_free = g->high = ram_start + 1; }
         if (heap_lo != INT64_MAX) {
             g->heap_lo = heap_lo;
             g->heap_elem0 = heap_lo + (int64_t)HOP * HK;
@@ -4407,6 +4426,10 @@ Result compile(const std::string& source, uint32_t ram_start, const Options& opt
     };
     std::unique_ptr<Gen> g;
     auto g1 = generate(sr.uses_heap ? far_heap : INT64_MAX, true, nullptr, 0, true);
+    if (g1->res.errors.empty() && g1->tests_regs) {     // again, with the first RAM cell kept for test_reg
+        test_cell = true;
+        g1 = generate(sr.uses_heap ? far_heap : INT64_MAX, true, nullptr, 0, true);
+    }
     if (!g1->res.errors.empty()) g = std::move(g1);
     else {
         choices = g1->run_choices;

@@ -840,6 +840,8 @@ heap it could land on a heap byte. `heap 256; byte arr[64]; string s = "abc...";
 (KEY_STATUS) { ... } print s;` printed an empty string in cffb80c (8 of 53 array sizes from 1
 to 160). The measuring pass now records the highest landing cell, and the region above the
 temporaries and the heap start above it (`register-status-heap` in `tests/test_lang.py`).
+(That raised the heap by about the temporaries' height for one test in deep code; the review
+below made the landing cell one just above the temporaries.)
 
 Measured with `tools/bench.py --only sizes` against cffb80c:
 
@@ -912,6 +914,68 @@ with two the run was not the smaller and is no longer shared. The golden files w
 regenerated (all smaller but `leds.b`, unchanged). Both suites pass (`test.py` 83/83, `test_lang.py` 247 tests with the
 grids, all but the golden files also with `BFL_NO_LAYOUT=1`, whose code they do not describe, as
 before); and `tests/fuzz.py --bfl 1500 --bf 300` found nothing, run as it is (seed 1 600 000; 929 programs sharing arithmetic, 406 with shared procs) and with `BFL_NO_LAYOUT=1` (seed 1 700 000), nor did 800 programs each of `--focus shared` and `--focus struct`.
+
+**The phase 16 review's points** (the coordinator's notes):
+
+- *One status-register test in deep code raised the heap by the temporaries' height*: the
+  landing cell was `P + M - reg`, with `M` a temporary as high as `P`, and the heap went above
+  it, so `raytracer.bfl` with `if (KEY_STATUS) { pulse KEY_STATUS; }` after `pulse FB_PLOT`
+  grew from 2 770 508 to 3 322 955 commands. Now `M` is the first RAM cell, kept for the test
+  in a program that has one (`Gen::test_cell`; the measuring pass finds out, and runs again
+  with the cell kept), so `M - reg` is 1 to 22 and the landing cell is a free one a few cells
+  above `P`, under the high-water mark or just past it. The test is `M+ reg[ M- dst+ P ]`
+  then the same resynchronisation: three long trips (down to `M`, up to `dst`, and the
+  resynchronisation's `D`) where the old one made five between the temporaries and the
+  register, and what is known of the other cells holds after it. Measured
+  with `bf --emit` (cffb80c, before the heap fix / 43dd94a / now): that raytracer 3 591 643 /
+  3 322 955 / 2 778 131 (the sample itself is 2 770 508), the reviewer's `p3.bfl` (a heap,
+  strings, status tests in an inlined procedure) 403 067 / 529 360 / 389 947, `p5.bfl` (a
+  test in a `rec proc` with heap-frame arrays) 578 471 / 850 534 / 521 012. No sample changes
+  but `serial_echo.bfl` (the same 2 506 commands; its variables one cell up). Tests:
+  `register-test-cost` (a test in code three inlined procedures deep, below 80 longs of
+  globals: 37 076 commands and 720 cells more than without it in 43dd94a, now 5 079 and 1;
+  the same output in every executor and both layouts) and `register-status-rec` (tests in a
+  re-entrant `rec proc` with a heap frame and in a `shared proc`, a 16-bit save stack,
+  strings after heap arrays). The reviewer's generator of 1 000 random programs mixing heap
+  arrays, strings, arrays in cells, deep inlined temporaries and status tests (extended with
+  tests in `rec` and `shared` procedures calling inlined ones) agrees across the JIT, the
+  interpreter, `--no-opt` and `BFL_NO_LAYOUT=1`, and with 43dd94a (7 of the 1 000 overflowed
+  the default recursion stack the same way in all of them, and agree with `stack 900;`).
+- *An array declared in a loop body of trampolined code was not cleared on each pass*
+  (before phase 16 too): `for (...) { byte a[4]; a[1] = a[1] + f(2); print a[1]; }` with `f`
+  a `rec proc` printed `2 4 6`. A main program's array was taken as zero from the start, and
+  a re-entrant procedure's heap-frame array was zeroed only on entry. Both now get a `Clear`
+  action where the declaration is met inside a loop (the heap-frame one zeroes its bytes
+  through the pointer, `heap_zero`, the loop `frame_enter` uses). Scalars were already
+  cleared at every declaration, and a `shared` or non-re-entrant `rec` procedure's arrays at
+  every declaration; inlined procedures' locals are on the temporaries' stack, cleared at
+  the end of their scope. Test: `trampolined-loop-locals` (all of these). The fuzzer made
+  such arrays but seldom read an element before writing it, and its loops often run once:
+  an array declared in a loop body now gets `a[k] += expr` right after it in six of ten
+  (with a call of a trampolined procedure in it or after it, when one can be called there,
+  so that the array is a frame's), and in three of ten programs whose main program can call
+  a trampolined pure procedure a loop of two or three passes in it declares an array, adds
+  such a call to an element and the element to a global. 43dd94a fails 6 of 300 programs
+  (seed 1 800 000) of the fuzzer as it is now, none of 1 000 before the second change.
+- *Compile time*: the dry passes had roughly doubled it (`bf --emit` of the raytracer 0.60 s
+  against 0.37 s in cffb80c, on this machine, the fastest of five). Most of the code
+  generation time went in `clear` and `move` copying the whole map of known values to keep
+  it through their loops; they now forget only their own cells. The raytracer's three
+  passes took 115, 108 and 70 ms, and now 25, 18 and 17 ms, with the same output for every
+  program under `programs/`. `bf --emit` of the raytracer is 0.35 s, of
+  `raytracer_text.bfl` 0.35 s (0.61 in 43dd94a, 0.34 in cffb80c), most of it now the IR
+  and the JIT, as before phase 16.
+- `run_pays`'s count of commands skips a NUL as `dry_commands` does.
+- `docs/LANG.md` no longer says the variables are allocated upward from the first cell or that
+  a later declaration starts a run above the variables that exist then, without the region
+  above the temporaries.
+
+Both suites pass (`test.py` 83/83, `test_lang.py` 249, all but the golden files also with
+`BFL_NO_LAYOUT=1`); only `golden/serial_echo.b` changed. `tests/fuzz.py --bfl 1500 --bf 300`
+found nothing, as it is (seed 2 000 000; 940 programs sharing arithmetic, 395 with shared
+procs) and with `BFL_NO_LAYOUT=1` (seed 2 100 000). The raytracer's 16 frames
+(`tools/rt_gif.py`) are identical to 43dd94a's, whose brainfuck it is, as for every program
+under `programs/` but `serial_echo.bfl`.
 
 The options the phase listed, and what became of them:
 

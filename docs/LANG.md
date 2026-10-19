@@ -46,7 +46,11 @@ const MAX = 10;      // compile-time constant, occupies no cell
 All integer types wrap on overflow (two's complement). Signed values are stored
 in two's complement, so a `sbyte` holding -1 is the byte 255.
 
-Variables are allocated upward from the first RAM cell (0x100). A variable
+Variables live in RAM, which starts at cell 0x100: the top-level variables at
+the bottom (in an order the compiler chooses, see "Layout of globals"), the
+temporaries and the locals of blocks and inlined procedures as a stack above
+them, then a region for the globals that cost less from above, then the heap.
+(A program that tests a register keeps the first cell for that test.) A variable
 declared inside `{ }` exists until the closing brace and is cleared there, so a
 loop body's locals start at zero on every iteration. Top-level variables keep
 their cells for the whole program. Arrays cannot be initialised in the
@@ -248,8 +252,9 @@ often it is called; both are compiled as a **trampoline** (docs/TRAMPOLINE.md):
   `recursion stack overflow` and halt.
 - Local arrays of a re-entrant procedure live in the heap: each call takes
   their space from the top of the heap (the allocator's end-of-heap word moves
-  down), zeroes it, and gives it back on return; those of any other trampolined
-  procedure live in its cells and are cleared at the declaration. Array
+  down), zeroes it (and again where a loop meets the declaration), and gives it
+  back on return; those of any other trampolined procedure live in its cells and
+  are cleared at the declaration. Array
   parameters (`ref byte a[]`) are passed
   as pointers, so the argument must be a heap array or another such parameter
   or local; an array held in cells has no address.
@@ -513,8 +518,9 @@ These are the building blocks; knowing them helps read the output and write
   calls a `rec` or `shared` proc) is laid out the same way. The plan is kept
   when a second measuring pass with it in place estimates fewer commands than
   the first. The order of declarations within such a run does not matter; a
-  declaration after other statements still starts a new run above the
-  variables that exist then. `BFL_NO_LAYOUT=1` in the environment of `bf` keeps
+  declaration after other statements still starts a new run, placed above the
+  variables below the temporaries that exist then (or, for those the plan
+  moves, in the region above the temporaries). `BFL_NO_LAYOUT=1` in the environment of `bf` keeps
   the declaration order and everything below the temporaries, for measuring;
   `BFL_PLAN_DEBUG=1` prints the measurements, the plan and the shared-run
   choices on stderr.
@@ -530,11 +536,15 @@ These are the building blocks; knowing them helps read the output and write
 - **While** `c[ body ; recompute c ]`; a body containing `break` or
   `continue` gets an `alive` flag that guards the statements after the exit
   point, and `break` also sets a flag that clears the loop cell.
-- **Register test without a write**: `reg[ flag+ P ]` leaves the pointer on
-  `reg` (0) or on `P` (0); moving `M - reg` cells right then lands on `M`,
-  prepared with 1, or on `P + M - reg`, which is free and 0 (the globals above
-  the temporaries and the heap start above the highest such cell); `[- >·D ]` with
-  `D = P - reg` brings the first case to the same cell. Costs about 70 commands.
+- **Register test without a write**: `M+ reg[ M- flag+ P ]`, with `M` the
+  first RAM cell (kept for this, zero but here) and `P` a free temporary, leaves
+  the pointer on `reg` (0) or on `P` (0); moving `M - reg` cells right (1 to 22:
+  the registers are just below RAM) then lands on `M`, still 1, or on
+  `P + M - reg`, a free cell a few above `P` and 0 (the globals above the
+  temporaries and the heap start above the highest such cell); `[- >·D ]` with
+  `D = P - reg` brings the first case to the same cell. Costs about 30 commands
+  near the bottom of RAM, three trips between `M` and the temporaries in deep
+  code.
 - **Division** of words and longs (`n` bytes) is one loop on a block of
   `12n + 2` temporaries (`bf::division_loop` and `bf::DivisionLayout` in
   `src/bf.h`): the pass counter, set to `8n`, then six cells for each byte of
