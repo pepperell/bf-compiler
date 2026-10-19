@@ -324,7 +324,9 @@ enc = 0;
 start(enc);
 while (1) {
     word t0 = millis();
+    FB_BUFFER = 1;
     render();
+    FB_BUFFER = 0;
     word t1 = millis();
     byte s;
     for (s = 0; s < SUB; s++) { step(); }

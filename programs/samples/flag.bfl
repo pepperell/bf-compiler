@@ -643,6 +643,6 @@ while (1) {
     for (s = 0; s < SUB; s++) { step(s == 0); }
     word t2 = millis();
     print "frame ", frame, ": draw ", t1 - t0, " ms, physics ", t2 - t1, " ms\n";
-    while (millis() - t0 < FRAME_MS) { }
+    //while (millis() - t0 < FRAME_MS) { }
     frame++;
 }
