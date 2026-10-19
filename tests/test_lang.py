@@ -627,6 +627,28 @@ SER_CTRL -= 1;
 case("random-latch", "pulse ROLL; byte r = RANDOM; byte s = RANDOM; print r == s;", b"1")
 case("ticks-latch", "pulse TICK_LATCH; byte t = TICKS3; print t;", b"0")
 case("scoped-locals", "byte i; for (i = 0; i < 3; i++) { byte t; t += 5; print t; }", b"555")
+# a loop body's locals start at zero on every pass also where the code is trampolined (frame cells, the
+# heap frame of a re-entrant procedure, a shared procedure's cells, an inlined procedure's locals)
+case("trampolined-loop-locals", """
+rec proc byte f(byte n) { if (n == 0) { return 0; } return f(n - 1) + 1; }
+rec proc byte g(byte n) {
+    byte j; byte r = 0;
+    if (n == 0) { return 0; }
+    for (j = 0; j < 2; j++) { byte a[3]; byte s; a[2] = a[2] + f(1); s = s + 1; r = r + a[2] + s; }
+    return r + g(n - 1);
+}
+shared proc byte h(byte n) {
+    byte j; byte r = 0;
+    for (j = 0; j < 3; j++) { byte a[2]; word w; a[0] = a[0] + f(n); w = w + 5; r = r + a[0] + byte(w); }
+    return r;
+}
+proc byte k(byte x) { byte b[3]; b[1] = b[1] + x; return b[1]; }
+rec proc byte m(byte n) { byte j; byte r = 0; for (j = 0; j < 3; j++) { r = r + k(f(n)); } return r; }
+print g(2), " ", g(2), " ", h(2), " ", h(2), " ", m(2), " ";
+byte i;
+for (i = 0; i < 3; i++) { byte a[4]; long q[2]; a[1] = a[1] + f(2); q[1] = q[1] + long(f(1)); print a[1], q[1]; }
+for (i = 0; i < 2; i++) { byte z; z = z + f(2); while (z < 9) { byte c[2]; c[0] = c[0] + f(1); z = z + c[0] + 2; print c[0]; } }
+""", b"8 8 21 21 6 212121111111")
 case("compound-ops", "byte x = in; x *= 3; print x; x /= 4; print \" \", x; x %= 5; print \" \", x; x <<= 3; print \" \", x; x |= 3; print \" \", x; x &= 0x1E; print \" \", x; x ^= 0xFF; print \" \", x; x >>= 2; print \" \", x;", b"33 8 3 24 27 26 229 57", b"\x0b")
 case("word-compound", "word w = 1000; w *= 3; print w; w /= 7; print \" \", w; w %= 100; print \" \", w; w <<= 4; print \" \", w; w -= 1; print \" \", w;", b"3000 428 28 448 447")
 case("self-assign", "byte x = in; x = x; out x; x = x + x; out x; word w = 300; w = w + w; print w; w = w * 2 - w; print \" \", w;", b"\x05\x0a600 600", b"\x05")
@@ -636,6 +658,25 @@ case("else-if-chain", "byte x = in; if (x < 3) { out 'a'; } else if (x < 6) { ou
 # register, and the cell it lands on must be zero: not in the heap or the globals above the temporaries
 case("register-status-heap", 'heap 256; byte arr[64]; string s = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; arr[0] = 1; byte k = 0; if (KEY_STATUS) { k = 1; } print s, " ", k;',
      b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 0")
+# the same in trampolined code with locals in the heap and in cells, strings after heap arrays
+case("register-status-rec", """
+heap 2000; stack 400; heap byte hb[300]; string g = "hello"; heap long hl[20]; long ga[8]; byte keys = 0;
+rec proc long sumto(byte n) {
+    byte loc[3]; long w = long(n) * 1000;
+    if (n == 0) { return 0; }
+    loc[n % 3] = n;
+    if (KEY_STATUS) { keys++; }
+    long r = sumto(n - 1) + w / 1000 + long(loc[n % 3]);
+    hb[n * 3] = hb[n * 3] + loc[n % 3]; hl[n % 20] = hl[n % 20] + r; ga[n % 8] = ga[n % 8] + r;
+    if (!SER_STATUS) { keys = keys + 2; }
+    return r;
+}
+shared proc byte peek(byte n) { byte z = KEY_STATUS; return z + n; }
+long s = sumto(9) + long(peek(4));
+byte i;
+for (i = 0; i < 20; i++) { s = s + hl[i] + long(hb[i * 3]); }
+print g, " ", s, " ", keys, " ", ga[3];
+""", b"hello 470 27 12", b"x")
 case("while-register-loop", "byte n = 0; while (KEY_STATUS) { pulse KEY_STATUS; n++; } print n;", b"4", b"abcd")
 
 # ---- procedures with return values (inlined) ----
@@ -995,6 +1036,41 @@ def strings_first():
     return ok
 
 
+REG_TEST_SRC = """
+heap 4000; heap byte big[500]; string s = "status"; long acc = 0; byte keys = 0; long pad[80];
+proc long f3(long x, byte j) { long t = (x * long(j) + 99) / (long(j) + 3); long u = mulshr(t, x, 6) - t % 17; TEST return t + u; }
+proc long f2(long x, byte j) { long t = (x * 7 + long(j)) / 3; return f3(t, j + 1) + mulshr(t, x, 3); }
+proc long f1(long x, byte j) { long t = x * x / (long(j) + 1); return f2(t, j) + f2(x, j + 2); }
+byte i;
+for (i = 0; i < 4; i++) { acc = acc + f1(long(i) * 31 + 5, i); big[word(i) * 100] = i + 1; }
+pad[79] = acc; print s, " ", acc, " ", big[300], " ", keys, " ", pad[79] == acc;
+"""
+
+
+def register_test_cost():
+    """A status register test in deep code (Gen::test_reg) uses the first RAM cell and a free cell just
+    above its temporaries, so the heap stays where it is: a few cells and commands more than without.
+    (When it landed as far above the temporaries as they are above the register, and the heap went above
+    that, the test cost 37 076 commands and 720 cells here; now about 5 000 and 1.)"""
+    env = {k: v for k, v in os.environ.items() if k != "BFL_NO_LAYOUT"}
+    stats, outs = [], []
+    for k, test in enumerate(["", "if (KEY_STATUS) { keys++; }"]):
+        src = os.path.join(TMP, f"reg_cost_{k}.bfl")
+        open(src, "w", newline="\n").write(REG_TEST_SRC.replace("TEST", test))
+        r = subprocess.run([BF, "--emit", os.path.join(TMP, "reg_cost.b"), src], capture_output=True, text=True, timeout=60, env=env)
+        m = re.search(r"(\d+) commands.*?(\d+) cells", r.stdout + r.stderr)
+        stats.append((int(m.group(1)), int(m.group(2))) if r.returncode == 0 and m else (0, 0))
+        outs.append({subprocess.run([BF, "--quiet-devices"] + flags + [src], input=b"ab", capture_output=True, timeout=60, env=dict(env, **e)).stdout
+                     for flags, e in (([], {}), (["--interp"], {}), (["--no-opt"], {}), ([], {"BFL_NO_LAYOUT": "1"}))})
+    (c0, n0), (c1, n1) = stats
+    ok = (c0 > 0 and c1 > 0 and n1 - n0 <= 32 and c1 - c0 < 10000
+          and outs[0] == {b"status 2860818 4 0 1"} and outs[1] == {b"status 2860818 4 8 1"})
+    print(("PASS " if ok else "FAIL ") + "register-test-cost")
+    if not ok:
+        print(f"   commands and cells {stats}, outputs {outs}")
+    return ok
+
+
 def shared_fuzz():
     """A few programs of tests/fuzz.py --focus shared: random BFL with shared procedures, checked against
     the model and against the same program with those procedures inlined."""
@@ -1046,6 +1122,8 @@ def main():
     if not layout_plan():
         fails += 1
     if not strings_first():
+        fails += 1
+    if not register_test_cost():
         fails += 1
     if not profile_devices():
         fails += 1
