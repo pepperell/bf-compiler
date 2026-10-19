@@ -588,8 +588,10 @@ word ang = 30;
 word frame = 0;
 while (1) {
     t0 = millis();
+    FB_BUFFER = 1;
     place_camera(ang);
     render();
+    FB_BUFFER = 0;
     print "frame ", frame, " at ", ang, " degrees: ", millis() - t0, " ms\n";
     frame++;
     ang = (ang + STEP) % 360;

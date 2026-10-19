@@ -114,9 +114,10 @@ classic programs by Erik Bosman and Daniel B. Cristofani.
 ![raytracer.bfl: 16 frames of one camera orbit](docs/raytracer.gif)
 
 **`raytracer.bfl`**: four reflective spheres, two lamps with soft shadows and a checkerboard
-floor, in fixed-point BFL on the framebuffer; a 128x64 frame takes about 31 ms with the JIT.\
-596 lines of BFL (495 of code, 561 statements) → 2,770,508 brainfuck commands → 147,245 IR
-instructions → 2.2 MB of x64; 84,062 tape cells; compiled in 371 ms.
+floor, in fixed-point BFL on the framebuffer, each frame drawn into a back buffer
+(`FB_BUFFER`); a 128x64 frame takes about 31 ms with the JIT.\
+598 lines of BFL (497 of code, 563 statements) → 2,773,679 brainfuck commands → 147,247 IR
+instructions → 2.2 MB of x64; 84,062 tape cells; compiled in 365 ms.
 
 ![flag.bfl: 2.5 seconds of a chequered flag in gusty wind](docs/flag.gif)
 
