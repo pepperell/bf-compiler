@@ -4,3 +4,5 @@ out/
 *.ilk
 *.exp
 *.lib
+__pycache__/
+*.pyc
