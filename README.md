@@ -116,26 +116,30 @@ classic programs by Erik Bosman and Daniel B. Cristofani.
 **`raytracer.bfl`**: four reflective spheres, two lamps with soft shadows and a checkerboard
 floor, in fixed-point BFL on the framebuffer, each frame drawn into a back buffer
 (`FB_BUFFER`); a 128x64 frame takes about 31 ms with the JIT.\
-598 lines of BFL (497 of code, 563 statements) → 2,773,679 brainfuck commands → 147,247 IR
-instructions → 2.2 MB of x64; 84,062 tape cells; compiled in 365 ms.
+596 lines of BFL (496 of code, 563 statements) → 2,773,670 brainfuck commands → 147,248 IR
+instructions → 2.2 MB of x64; 2,046 cells of variables and temporaries and a 12,295-byte heap
+(61,571 cells); compiled in 391 ms.
 
 ![flag.bfl: 2.5 seconds of a chequered flag in gusty wind](docs/flag.gif)
 
 **`flag.bfl`**: 21 x 11 particles of cloth in gusty wind, Verlet integration and
 Gouraud-shaded triangles, drawn into a back buffer (`FB_BUFFER`) and shown whole, at 30 frames
 a second.\
-648 lines of BFL (539 of code, 666 statements) → 4,148,193 brainfuck commands → 152,428 IR
-instructions → 2.2 MB of x64; 52,624 tape cells; compiled in 419 ms.
+648 lines of BFL (539 of code, 666 statements) → 4,125,532 brainfuck commands → 152,426 IR
+instructions → 2.2 MB of x64; 11,568 cells of variables and temporaries, no heap; compiled in
+412 ms.
 
 ![life.bfl: 60 generations of Conway's Game of Life](docs/life.gif)
 
 **`life.bfl`**: Conway's Game of Life in the terminal, two heap grids swapped through
 pointers and drawn with ANSI escapes.\
-83 lines of BFL (65 of code, 75 statements) → 75,759 brainfuck commands → 4,290 IR
-instructions → 66 KB of x64; 41,113 tape cells; compiled in 17 ms.
+83 lines of BFL (65 of code, 75 statements) → 75,739 brainfuck commands → 4,291 IR
+instructions → 66 KB of x64; 57 cells of variables and temporaries and a 1,287-byte heap
+(6,531 cells); compiled in 26 ms.
 
 The GIFs are made by `tools/rt_gif.py` and `tools/demo_gif.py`, which also prints these figures
-(`python tools/demo_gif.py stats FILE.bfl`).
+(`python tools/demo_gif.py stats FILE.bfl`). Each heap byte takes 5 tape cells; a program that
+never allocates gets a heap just big enough for its static data.
 
 ## UI
 

@@ -452,7 +452,8 @@ STRUCTS
   sizeof(Point)                        4
 
 POINTERS AND THE HEAP
-  heap 16384;                 heap size in bytes (default 8192, at most 65535)
+  heap 16384;                 heap size in bytes, at most 65535 (default: the
+                              static data when nothing allocates, else 8192)
   heap byte buf[100];         a static array in the heap
   byte* p = &buf[10];         an address; *p, p[3], p + 1, p++ (scaled by size)
   word* w = (word*)p;         pointer casts; null is address 0

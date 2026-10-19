@@ -93,7 +93,7 @@ of up to 64 KB, addressed by 16-bit pointers, where data can be reached through
 an address computed at run time:
 
 ```
-heap 16384;                  // heap size in bytes (top level; default 8192)
+heap 16384;                  // heap size in bytes (top level; default: see below)
 heap byte buf[100];          // a static array in the heap
 heap int scores[50];         // heap arrays may hold any type
 byte* p = &buf[10];          // the address of a heap element
@@ -115,7 +115,13 @@ Rules:
   location reached through a pointer, a field of a struct in the heap. Variables
   held in cells have no address.
 - Address 0 is null and addresses 1 to 6 hold the allocator's bookkeeping;
-  static data starts at 7. Accessing a null or out-of-range address is not
+  static data starts at 7.
+- Size: `heap N;` sets it. Without it, a program that never takes heap space
+  at run time (no `alloc`, `free` or `new` in anything it can call, no local
+  arrays of a re-entrant procedure, which come off the top of the heap) and
+  never asks `heap_unused()` gets a heap just big enough for its static data
+  (heap arrays and string literals); any other program gets 8192 bytes. A program
+  that uses no heap at all has none. Each heap byte takes 5 tape cells. Accessing a null or out-of-range address is not
   checked unless the program is compiled with `--check-heap` (bf.exe) or Run >
   Check heap accesses (UI), which print `heap access out of range` and halt.
 - Cost: an access through a runtime address walks the heap (docs/HEAP.md). With

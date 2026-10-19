@@ -23,8 +23,6 @@
 //                                          opens by itself), Shift+F5 stops
 //     bf programs\samples\raytracer.bfl     renders headless; frame times on stdout
 
-heap 16384;
-
 const W = 128;
 const H = 64;
 const NS = 4;               // spheres

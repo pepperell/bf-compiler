@@ -158,13 +158,21 @@ def stats(path, bf):
         line = (r.stdout + r.stderr).decode('latin-1')
         cmds, cells, ir, x64 = (int(m) for m in re.search(
             r'(\d+) commands .*?, (\d+) cells, (\d+) IR instructions, (\d+) bytes of x64', line).groups())
-        files, stmts = {}, set()
+        files, stmts, heap = {}, set(), 0
         for l in open(b + '.map', encoding='utf-8'):
             p = l.split()
             if p[:1] == ['F']:
                 files[p[1]] = p[2]
             elif p[:1] == ['S']:
                 stmts.add((p[8], p[1], p[2]))          # file, line, column: once however often inlined
+            elif l.startswith('# heap:'):
+                heap = int(p[2])                        # bytes
+    # the cells counted are the variables and temporaries, then (with a heap) a gap of 16 and
+    # 5 cells for each heap byte and for each of 16 bytes of the walk's own (src/lang/codegen.cpp)
+    heap_cells = 5 * (16 + heap) + 16 if heap else 0
+    var_cells = cells - heap_cells
+    memory = f'{var_cells:,} cells of variables and temporaries' + (
+        f' and a {heap:,}-byte heap ({heap_cells:,} cells)' if heap else ', no heap')
     src = open(path, encoding='utf-8').read().splitlines()
     code = sum(1 for l in src if l.strip() and not l.strip().startswith('//'))
     name = os.path.basename(path)
@@ -172,7 +180,7 @@ def stats(path, bf):
     size = f'{mb:.1f} MB' if mb >= 1 else f'{x64 / 1e3:.0f} KB'
     return (f'`{name}`: {len(src):,} lines of BFL ({code:,} of code, {len(stmts):,} statements) → '
             f'{cmds:,} brainfuck commands → {ir:,} IR instructions → {size} of x64; '
-            f'{cells:,} tape cells; compiled in ' + (f'{took:.1f} s' if took >= 1 else f'{took * 1000:.0f} ms'))
+            f'{memory}; compiled in ' + (f'{took:.1f} s' if took >= 1 else f'{took * 1000:.0f} ms'))
 
 
 def main():

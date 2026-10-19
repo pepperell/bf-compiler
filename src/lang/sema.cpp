@@ -62,6 +62,7 @@ struct Sema {
     int  item = 0;                   // current top-level item index
     std::vector<CallSite> main_calls;
     std::vector<std::pair<std::string, Pos>> main_locals;
+    bool heap_declared = false;      // 'heap N;' seen: keep its size
 
     Sema(Types& t, const Features& f, bool w) : T(t), F(f), warn(w) {}
 
@@ -677,6 +678,7 @@ struct Sema {
                 if (!F.heap) { error(s.pos, "the heap is not available yet"); return; }
                 if (v < 16 || v > 65535) { error(s.count_e->pos, "heap size must be 16..65535 bytes"); return; }
                 R.heap_size = (int)v;
+                heap_declared = true;
             }
             s.count = (int)v;
             return;
@@ -945,15 +947,15 @@ struct Sema {
             if (s.kind == Stmt::Struct) continue;     // done above
             stmt(s);
         }
-        if (R.uses_heap && R.heap_static_end > R.heap_size)
-            error(Pos{}, "heap arrays and string literals need " + std::to_string(R.heap_static_end) + " bytes of heap but the heap has " +
-                         std::to_string(R.heap_size) + "; declare a larger one with 'heap N;'");
         // unused globals
         for (auto& kv : scopes.front()) {
             Sym* g = kv.second;
             if (g->k == Sym::Var && !g->used && !g->quiet) warning(g->pos, "variable '" + g->name + "' is never read");
         }
-        call_graph();
+        call_graph();                    // also sizes a heap that was not declared
+        if (R.uses_heap && R.heap_static_end > R.heap_size)
+            error(Pos{}, "heap arrays and string literals need " + std::to_string(R.heap_static_end) + " bytes of heap but the heap has " +
+                         std::to_string(R.heap_size) + "; declare a larger one with 'heap N;'");
     }
 
     void call_graph() {
@@ -986,12 +988,47 @@ struct Sema {
             }
         }
         for (const CallSite& c : main_calls) if (R.tramp.count(c.callee)) R.main_tramp = true;
-        // trampoline rules
+        // trampoline rules.  A trampolined procedure that can come back to itself through calls is
+        // re-entrant (as codegen's compute_reach decides): only its local arrays live in the heap
+        auto reaches = [&](const std::string& from, const std::string& to) {
+            std::vector<std::string> work{from};
+            std::set<std::string> seen;
+            while (!work.empty()) {
+                std::string n = work.back(); work.pop_back();
+                auto it = procs.find(n);
+                if (it == procs.end()) continue;
+                for (const std::string& c : it->second.callees) {
+                    if (c == to) return true;
+                    if (R.tramp.count(c) && seen.insert(c).second) work.push_back(c);
+                }
+            }
+            return false;
+        };
+        bool heap_frames = false;
         for (const std::string& n : R.tramp) {
             ProcSig& ps = procs[n];
-            check_tramp_names(ps.locals, "'" + n + "'", ps.decl);
+            bool reentrant = reaches(n, n);
+            check_tramp_names(ps.locals, "'" + n + "'", ps.decl, reentrant);
+            if (reentrant && ps.has_array_local) heap_frames = true;
         }
-        if (R.main_tramp) check_tramp_names(main_locals, "the main program", nullptr);
+        if (R.main_tramp) check_tramp_names(main_locals, "the main program", nullptr, false);
+        // Without 'heap N;', a program that never takes heap space at run time (no alloc or free in
+        // anything it can call, which covers new, and no re-entrant local arrays, which come off the
+        // top of the heap) and does not ask how much is left (heap_unused) gets a heap just big
+        // enough for its static data instead of 8 KB.
+        if (!heap_declared && R.uses_heap && !heap_frames) {
+            std::set<std::string> called;
+            std::vector<std::string> work;
+            for (const CallSite& c : main_calls) work.push_back(c.callee);
+            while (!work.empty()) {
+                std::string n = work.back(); work.pop_back();
+                if (!called.insert(n).second) continue;
+                auto it = procs.find(n);
+                if (it != procs.end()) for (const std::string& c : it->second.callees) work.push_back(c);
+            }
+            if (!called.count("alloc") && !called.count("free") && !called.count("heap_unused"))   // it asks: keep the room
+                R.heap_size = std::max(R.heap_static_end, 16);
+        }
         // a procedure must not run before the globals it uses exist
         std::map<std::string, std::set<Sym*>> closure;
         std::function<const std::set<Sym*>&(const std::string&, std::set<std::string>&)> globals_of =
@@ -1016,7 +1053,7 @@ struct Sema {
                 if (g->item > c.item) error(c.pos, "'" + c.callee + "' uses '" + g->name + "', which is declared after this call");
         }
     }
-    void check_tramp_names(const std::vector<std::pair<std::string, Pos>>& locals, const std::string& where, const Stmt* proc) {
+    void check_tramp_names(const std::vector<std::pair<std::string, Pos>>& locals, const std::string& where, const Stmt* proc, bool reentrant) {
         std::map<std::string, Pos> seen;
         for (auto& l : locals) {
             if (seen.count(l.first)) error(l.second, "'" + l.first + "' is declared twice in " + where + "; variables of code that calls a rec or shared proc need unique names");
@@ -1024,7 +1061,7 @@ struct Sema {
         }
         if (!proc) return;
         for (const Param& prm : proc->params) if (prm.array) R.uses_heap = true;      // arrays are passed as heap pointers
-        if (procs[proc->name].has_array_local) R.uses_heap = true;                   // local arrays live in the heap
+        if (reentrant && procs[proc->name].has_array_local) R.uses_heap = true;      // its local arrays live in the heap
     }
 };
 

@@ -860,6 +860,43 @@ print s;
 """
 
 
+HEAP_SIZES = [
+    # source, heap bytes expected (None: no heap at all), output
+    # a shared proc's local array is in its cells, not the heap: no heap
+    ("shared proc f(byte a) { byte t[3]; t[0] = a; out t[0]; } f(65); f(66);", None, b"AB"),
+    # static data only: the heap is the static data (7 bookkeeping bytes and the array)
+    ("heap byte g[100]; g[5] = 67; out g[5];", 107, b"C"),
+    # a program that allocates keeps the default
+    ("heap byte g[10]; byte* p = alloc(4); p[1] = 68; out p[1];", 8192, b"D"),
+    # so does one that asks how much is left
+    ('import "memory.bfl"; heap byte g[10]; print heap_unused() > 7000;', 8192, b"1"),
+    # a re-entrant procedure's local arrays come off the top of the heap: the default
+    ("rec proc byte f(byte n) { byte t[2]; t[1] = n; if (n == 0) { return 0; } return f(n - 1) + t[1]; } print f(3);", 8192, b"6"),
+    # a declared size is kept
+    ("heap 300; heap byte g[10]; g[0] = 69; out g[0];", 300, b"E"),
+]
+
+
+def heap_sizes():
+    """The heap the compiler gives a program without 'heap N;': none when nothing needs one, the static
+    data when nothing takes space at run time, else 8 KB."""
+    ok = True
+    for src, want, out in HEAP_SIZES:
+        path = os.path.join(TMP, "heapsize.bfl")
+        with open(path, "w", newline="\n") as f:
+            f.write(src)
+        emitted = os.path.join(TMP, "heapsize.b")
+        subprocess.run([BF, "--emit", emitted, path], capture_output=True, timeout=60)
+        m = re.search(r"# heap: (\d+) bytes", open(emitted + ".map").read())
+        got = int(m.group(1)) if m else None
+        rc, o, err = run(src)
+        if got != want or rc != 0 or o != out:
+            ok = False
+            print(f"   {src[:60]!r}: heap {got}, expected {want}; output {o!r}, expected {out!r}")
+    print(("PASS " if ok else "FAIL ") + "heap-sizes")
+    return ok
+
+
 def profile_devices():
     """bf --profile counts the instructions the literal program runs while the pointer can reach the
     device window: the lines writing LEDS and the framebuffer registers have counts, and the rows add
@@ -1142,6 +1179,8 @@ def main():
         fails += 1
     if not profile_devices():
         fails += 1
+    if not heap_sizes():
+        fails += 1
     if not shared_fuzz():
         fails += 1
     if not bfl_fuzz():
@@ -1202,7 +1241,7 @@ def main():
     for name, src, frags, flags, rc in DIAGS:
         if not check_diags(name, src.replace("\\n", "\n"), frags, flags, rc):
             fails += 1
-    total = len(CASES) + 9 + len(errors) + len(DIAGS) + len(GRIDS) + len(MULSHR_GRIDS) + n_samples
+    total = len(CASES) + 10 + len(errors) + len(DIAGS) + len(GRIDS) + len(MULSHR_GRIDS) + n_samples
     print(f"{total - fails}/{total} passed")
     sys.exit(1 if fails else 0)
 

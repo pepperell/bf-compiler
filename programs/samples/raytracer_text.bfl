@@ -17,8 +17,6 @@
 //                                                 Ctrl+C stops
 //     bfui programs\samples\raytracer_text.bfl    F5 runs it, Shift+F5 stops
 
-heap 16384;
-
 const COLOUR = 1;           // 0: plain ASCII, no escape codes for colour
 const W = 79;               // picture size in character cells (one column spare: no auto-wrap)
 const H = 22;
