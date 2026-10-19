@@ -199,7 +199,14 @@ FRAMEBUFFER
                              the screen row by row
     FB_FILL (<24)            fill the screen with the written value
     FB_READ (<25)            load FB_COLOR with the pixel under the cursor
-  programs\fb.b paints a gradient over the whole screen.
+    FB_BUFFER (<26)          double buffering: while it is 1, plot, fill and
+                             read work on a back buffer (a copy of the screen
+                             taken when it was set); setting it back to 0
+                             shows the whole frame at once.  While it is 0,
+                             drawing goes straight to the screen.
+  programs\fb.b paints a gradient over the whole screen.  A program that
+  redraws every frame avoids tearing with FB_BUFFER = 1; ... draw ...
+  FB_BUFFER = 0; (programs\samples\flag.bfl does).
 
 ADDING A DEVICE
   Derive from bf::Device (src\bf.h), override read(rel) and write(rel, v)
@@ -464,6 +471,9 @@ REGISTERS
   Write-only registers (CONOUT, HALT, TICK_LATCH, ROLL, SER_TX, FB_PLOT,
   FB_FILL, FB_READ) accept only pulse; every write a brainfuck program can
   make is an increment, so they always receive 1.
+  The switch register FB_BUFFER holds its value, but changing it has an
+  effect, so it is read only by testing and written only with a constant:
+  FB_BUFFER = 1, FB_BUFFER = 0.
 
   Typical keyboard and serial loops:
       while (KEY_STATUS) { pulse KEY_STATUS; c = KEY_DATA; ... }
@@ -486,7 +496,8 @@ std::string register_kinds() {
     std::string s;
     char line[128];
     for (const bf::RegisterInfo& r : bf::register_map()) {
-        const char* k = r.kind == bf::REG_LATCH ? "latch" : r.kind == bf::REG_STATUS ? "status (test only; pulse / += 1 / -= 1)" : "write-only (pulse)";
+        const char* k = r.kind == bf::REG_LATCH ? "latch" : r.kind == bf::REG_STATUS ? "status (test only; pulse / += 1 / -= 1)"
+                      : r.kind == bf::REG_SWITCH ? "switch (test only; = 0 / = 1)" : "write-only (pulse)";
         snprintf(line, sizeof line, "  %-11s %s\n", r.name, k);
         s += line;
     }

@@ -2647,6 +2647,11 @@ struct Gen {
     void gen_assign_reg(const LV& lv, const std::string& op, const Expr& e, Pos pos) {
         const bf::RegisterInfo& r = *lv.reg;
         auto k = fold(e);
+        if (r.kind == bf::REG_SWITCH) {                 // a constant only: '=' clears it with [-] and adds
+            if (!k) fail(e.pos, std::string(r.name) + " only accepts a constant");
+            if (op == "=") set(lv.cell, *k); else add(lv.cell, op == "+=" ? *k : -*k);
+            return;
+        }
         if (r.kind != bf::REG_LATCH) {
             if (op == "=") fail(pos, std::string(r.name) + " cannot be assigned: write it with 'pulse " + r.name + "' or '" + r.name + " += 1'");
             if (!k) fail(e.pos, std::string(r.name) + " only accepts a constant with += or -=");

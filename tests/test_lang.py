@@ -610,6 +610,21 @@ case("asm-block", "byte x = 'A'; asm { ++ } out x;", b"C")
 case("halt", "out 'a'; halt; out 'b';", b"a")
 case("register-latch", "LEDS = 0x41; byte x = LEDS; out x; LEDS += 1; out LEDS; LEDS = LEDS + 1; out LEDS; LEDS++; out LEDS;", b"ABCD")
 case("register-number", "NUMBER0 = 7; NUMBER1 = 3; byte x = NUMBER1 * 10 + NUMBER0; print x;", b"37")
+# FB_BUFFER: while it is set, plot, fill and read work on a copy of the screen taken when it was set;
+# setting it back to 0 shows that copy, and drawing then goes straight to the screen again
+case("register-fb-buffer", """
+FB_X = 0; FB_Y = 0; FB_COLOR = 65; pulse FB_PLOT;
+FB_BUFFER = 1;
+if (FB_BUFFER) { out 'b'; }
+FB_X = 0; FB_Y = 0; FB_COLOR = 66; pulse FB_PLOT;
+FB_X = 0; FB_Y = 0; pulse FB_READ; out FB_COLOR;
+FB_X = 1; FB_Y = 0; FB_COLOR = 9; pulse FB_READ; out FB_COLOR + '0';
+FB_BUFFER = 0;
+if (!FB_BUFFER) { out 'u'; }
+FB_X = 0; FB_Y = 0; pulse FB_READ; out FB_COLOR;
+FB_COLOR = 67; FB_X = 0; FB_Y = 0; pulse FB_PLOT; FB_X = 0; pulse FB_READ; out FB_COLOR;
+FB_BUFFER = 1; FB_BUFFER = 1; FB_X = 0; FB_Y = 0; pulse FB_READ; out FB_COLOR; FB_BUFFER = 0;
+""", b"bB0uBCC")
 case("register-status-test", """
 byte c;
 if (KEY_STATUS) { out 'K'; }                 // test without popping
@@ -1174,6 +1189,7 @@ def main():
         ("err-unterminated-string", 'out "abc;', "unterminated string"),
         ("err-string-in-expr", 'byte x = "a";', "cannot convert 'byte*' to 'byte'"),
         ("err-pulse-var", "byte x; pulse x;", "not a register"),
+        ("err-switch-variable", "byte x = 1; FB_BUFFER = x;", "only accepts a constant"),
         ("err-mulshr-count", "byte a = in; byte k = 3; byte r = mulshr(a, a, k);", "must be a constant"),
         ("err-mulshr-negative", "byte a = in; byte r = mulshr(a, a, -1);", "cannot be negative"),
         ("err-mulshr-pointer", "heap byte buf[4]; byte* p = buf; byte r = mulshr(p, 2, 1);", "needs two integers"),

@@ -16,6 +16,10 @@
 //   0xE9  <23  FB_PLOT     w     plot FB_COLOR at (FB_X, FB_Y), then advance X (wrapping to the next row)
 //   0xE8  <24  FB_FILL     w     fill the whole screen with the written value
 //   0xE7  <25  FB_READ     w     load FB_COLOR with the pixel at (FB_X, FB_Y)
+//   0xE6  <26  FB_BUFFER   r/w   non-zero: plot, fill and read work on a back buffer (a copy of
+//                                the screen taken when it is switched on); switching it back to
+//                                0 shows the back buffer at once.  While it is 0, drawing goes
+//                                straight to the screen.
 #pragma once
 #include "bf.h"
 #define WIN32_LEAN_AND_MEAN
@@ -42,6 +46,7 @@ constexpr uint32_t A_FB_COLOR   = 0xEA;
 constexpr uint32_t A_FB_PLOT    = 0xE9;
 constexpr uint32_t A_FB_FILL    = 0xE8;
 constexpr uint32_t A_FB_READ    = 0xE7;
+constexpr uint32_t A_FB_BUFFER  = 0xE6;
 
 constexpr int SER_BAUDS[8] = {300, 1200, 2400, 9600, 19200, 38400, 57600, 115200};
 
@@ -141,17 +146,24 @@ struct SerialDevice : Device {
     }
 };
 
-// Mapped at A_FB_READ, size 6: rel 0 read-trigger, 1 fill, 2 plot, 3 colour, 4 y, 5 x.
+// Mapped at A_FB_BUFFER, size 7: rel 0 buffer switch, 1 read-trigger, 2 fill, 3 plot, 4 colour, 5 y, 6 x.
 struct FramebufferDevice : Device {
     static constexpr int W = 128, H = 64;
-    uint8_t pixels[W * H] = {};
-    uint8_t x = 0, y = 0, color = 0;
+    uint8_t pixels[W * H] = {};            // what the screen shows
+    uint8_t back[W * H] = {};              // what is drawn while FB_BUFFER is non-zero
+    uint8_t x = 0, y = 0, color = 0, buffer = 0;
+    std::mutex mu;                         // held while pixels changes all at once, and while the UI paints it
     std::atomic<bool> dirty{false};
     std::function<void()> on_first_plot;   // UI: show the window
     bool plotted = false;
 
-    void clear() { memset(pixels, 0, sizeof pixels); x = y = color = 0; dirty = true; plotted = false; }
+    void clear() {
+        std::lock_guard<std::mutex> g(mu);
+        memset(pixels, 0, sizeof pixels); memset(back, 0, sizeof back);
+        x = y = color = buffer = 0; dirty = true; plotted = false;
+    }
     void touch() { dirty = true; if (!plotted) { plotted = true; if (on_first_plot) on_first_plot(); } }
+    uint8_t* target() { return buffer ? back : pixels; }
 
     static COLORREF colour(uint8_t v) {            // RRRGGGBB
         int r = (v >> 5) * 255 / 7, g = ((v >> 2) & 7) * 255 / 7, b = (v & 3) * 255 / 3;
@@ -159,28 +171,39 @@ struct FramebufferDevice : Device {
     }
 
     uint8_t read(uint32_t rel) override {
-        switch (rel) { case 3: return color; case 4: return y; case 5: return x; default: return 0; }
+        switch (rel) { case 0: return buffer; case 4: return color; case 5: return y; case 6: return x; default: return 0; }
     }
-    bool plain(uint32_t rel) const override { return rel == 3; }     // the colour latch (x and y wrap)
+    bool plain(uint32_t rel) const override { return rel == 4; }     // the colour latch (x and y wrap)
     void write(uint32_t rel, uint8_t v) override {
         switch (rel) {
-        case 0: color = pixels[(y % H) * W + (x % W)]; break;
-        case 1: memset(pixels, v, sizeof pixels); touch(); break;
-        case 2:
-            pixels[(y % H) * W + (x % W)] = color;
-            if (++x >= W) { x = 0; if (++y >= H) y = 0; }
-            touch();
+        case 0:
+            if (v && !buffer) memcpy(back, pixels, sizeof back);                 // draw on from what is shown
+            else if (!v && buffer) {                                             // show the finished frame
+                { std::lock_guard<std::mutex> g(mu); memcpy(pixels, back, sizeof pixels); }
+                touch();
+            }
+            buffer = v;
             break;
-        case 3: color = v; break;
-        case 4: y = v % H; break;
-        case 5: x = v % W; break;
+        case 1: color = target()[(y % H) * W + (x % W)]; break;
+        case 2:
+            memset(target(), v, sizeof pixels);
+            if (!buffer) touch();
+            break;
+        case 3:
+            target()[(y % H) * W + (x % W)] = color;
+            if (++x >= W) { x = 0; if (++y >= H) y = 0; }
+            if (!buffer) touch();
+            break;
+        case 4: color = v; break;
+        case 5: y = v % H; break;
+        case 6: x = v % W; break;
         }
     }
 };
 
 inline void install_hw(Machine& m, SerialDevice& ser, FramebufferDevice& fb) {
     m.map(A_SER_BAUD, 5, &ser);
-    m.map(A_FB_READ, 6, &fb);
+    m.map(A_FB_BUFFER, 7, &fb);
 }
 
 // COM ports present on this machine ("COM1", ...).

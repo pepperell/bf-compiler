@@ -17,7 +17,9 @@ namespace bf {
 //   STATUS   readable, but every write has a side effect (pop, open/close):
 //            read only by testing, write only with pulse / += 1 / -= 1
 //   TRIGGER  write-only: reads give 0, any write fires; use pulse
-enum RegKind : uint8_t { REG_LATCH, REG_STATUS, REG_TRIGGER };
+//   SWITCH   holds a value, but changing it has an effect: read only by
+//            testing, write with a constant (= 0, = 1, += 1, -= 1, pulse)
+enum RegKind : uint8_t { REG_LATCH, REG_STATUS, REG_TRIGGER, REG_SWITCH };
 
 struct RegisterInfo {
     uint32_t    addr;        // cell index inside the device window
@@ -54,6 +56,7 @@ inline const std::vector<RegisterInfo>& register_map() {
         {A_FB_PLOT,    "FB_PLOT",    "w",   "plot FB_COLOR at the cursor, then advance (wraps to the next row)", REG_TRIGGER},
         {A_FB_FILL,    "FB_FILL",    "w",   "fill the whole screen with the written value", REG_TRIGGER},
         {A_FB_READ,    "FB_READ",    "w",   "load FB_COLOR with the pixel under the cursor", REG_TRIGGER},
+        {A_FB_BUFFER,  "FB_BUFFER",  "r/w", "1: draw into a back buffer; 1 to 0 shows it; 0: draw straight to the screen", REG_SWITCH},
     };
     return regs;
 }

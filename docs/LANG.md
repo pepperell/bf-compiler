@@ -403,6 +403,11 @@ brainfuck program can only ever read a cell, add one, or subtract one:
 - **Write-only** registers (CONOUT, HALT, TICK_LATCH, ROLL, SER_TX, FB_PLOT,
   FB_FILL, FB_READ) accept only `pulse`, which writes 1, or `REG += n`. Reading
   one is a compile error.
+- **Switch** registers (FB_BUFFER) hold their value, but changing it has an
+  effect, so like status registers they are only tested, and they are written
+  only with a constant: `FB_BUFFER = 1`, `FB_BUFFER = 0` (or `+=`, `-=`,
+  `pulse`). `= 0` from 1 is a single write of 0; `= 1` clears the cell first,
+  so setting an FB_BUFFER that is already 1 shows the frame drawn so far.
 
 The usual patterns:
 
@@ -411,6 +416,7 @@ while (KEY_STATUS) { pulse KEY_STATUS; c = KEY_DATA; ... }   // drain the keyboa
 SER_DATA = c; pulse SER_TX;                                   // send a byte
 while (SER_STATUS) { pulse SER_STATUS; out SER_DATA; }        // print received bytes
 pulse TICK_LATCH; t = TICKS0;                                 // sample the clock
+FB_BUFFER = 1; draw(); FB_BUFFER = 0;                         // show a frame whole, without tearing
 ```
 
 `while (REG)` and `if (REG)` test the register without writing it: the compiler

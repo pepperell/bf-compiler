@@ -68,12 +68,14 @@ the UI's help (F1).
 | 0xE9 | <23 | FB_PLOT | w | plot FB_COLOR at the cursor, then advance (wraps to the next row) |
 | 0xE8 | <24 | FB_FILL | w | fill the whole screen with the written value |
 | 0xE7 | <25 | FB_READ | w | load FB_COLOR with the pixel under the cursor |
+| 0xE6 | <26 | FB_BUFFER | r/w | 1: draw into a back buffer; 1 to 0 shows it; 0: draw straight to the screen |
 
 Readable registers are latches that read back what was last written, so the usual copy
 idiom `[>+<-]` works on them. Triggers (sends, pops, plots) are separate cells from their
 data latches, so `+` loops never fire one by accident. The serial device talks to a real
 COM port (Devices menu, or `bf --serial COM3`; `loopback` for testing). The framebuffer
-opens in its own window on the first plot (Ctrl+F).
+opens in its own window on the first plot (Ctrl+F). Setting FB_BUFFER to 1 draws into a back
+buffer that setting it back to 0 shows whole, so an animation never shows a half-drawn frame.
 
 Optimised code never touches a register. Every program keeps a literal
 one-instruction-per-command copy, and whenever a block could reach the device window the

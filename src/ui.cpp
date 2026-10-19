@@ -1375,9 +1375,12 @@ LRESULT CALLBACK fb_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         static uint32_t pix[FramebufferDevice::W * FramebufferDevice::H];
-        for (int i = 0; i < FramebufferDevice::W * FramebufferDevice::H; i++) {
-            COLORREF c = FramebufferDevice::colour(app.fb.pixels[i]);
-            pix[i] = (uint32_t)(GetRValue(c) << 16 | GetGValue(c) << 8 | GetBValue(c));
+        {
+            std::lock_guard<std::mutex> g(app.fb.mu);       // a buffered frame is shown whole
+            for (int i = 0; i < FramebufferDevice::W * FramebufferDevice::H; i++) {
+                COLORREF c = FramebufferDevice::colour(app.fb.pixels[i]);
+                pix[i] = (uint32_t)(GetRValue(c) << 16 | GetGValue(c) << 8 | GetBValue(c));
+            }
         }
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof bi.bmiHeader;

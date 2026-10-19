@@ -827,6 +827,10 @@ struct Sema {
         const Type* lt = lvalue(tg, s.op);
         const Type* rt = expr(*s.e);
         if (lt->is_error() || rt->is_error()) return;
+        if (reg && reg->kind == bf::REG_SWITCH) {
+            if (!s.e->is_const) error(s.e->pos, std::string(reg->name) + " only accepts a constant");
+            return;
+        }
         if (reg && reg->kind != bf::REG_LATCH) {
             if (s.op != "+=" && s.op != "-=") error(s.pos, std::string(reg->name) + " cannot be assigned: write it with 'pulse " + reg->name + "' or '" + reg->name + " += 1'");
             else if (!s.e->is_const) error(s.e->pos, std::string(reg->name) + " only accepts a constant with += or -=");

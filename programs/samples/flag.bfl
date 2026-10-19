@@ -632,10 +632,12 @@ while (1) {
     word t0 = millis();
     weather();
     place_camera(word(350 + mulshr(long(sin1024(frame / 2)), 30, 10)));
+    FB_BUFFER = 1;                       // draw the frame out of sight...
     background();
     shadow();
     pole();
     cloth();
+    FB_BUFFER = 0;                       // ...and show it whole, without tearing
     word t1 = millis();
     byte s;
     for (s = 0; s < SUB; s++) { step(s == 0); }
