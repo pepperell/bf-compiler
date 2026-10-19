@@ -1,0 +1,646 @@
+// flag.bfl - a chequered flag flying from a pole in gusty wind, simulated as
+// cloth and drawn as smooth-shaded triangles on the framebuffer while the
+// camera drifts round it.
+//
+// Everything is whole numbers in fixed point: positions in units of 1/4096 m
+// (Q12), unit vectors in Q12, light in 0..255.
+//
+//   - The cloth is 21 x 11 particles joined by springs along the weave and
+//     across each square, moved by Verlet integration (the velocity is the
+//     step from the last position, so nothing is stored for it) three times a
+//     frame at 90 steps a second.
+//   - Springs are relaxed by moving both ends, Gauss-Seidel fashion, with
+//     Jakobsen's square-root-free correction: d * (r^2 / (d.d + r^2) - 1/2)
+//     pulls a stretched pair together and pushes a squashed one apart.
+//   - A particle's normal is the cross product of the lines through its
+//     neighbours, across and down the weave.  The wind presses on the cloth
+//     along it in proportion to how squarely it meets it (the wind relative
+//     to the cloth, so the cloth's own motion damps it), with a little drag
+//     along it.  Gusts and a ripple travelling down the flag start it flapping.
+//   - The same normals light it: the sun on the side it shines on, and some
+//     of it through the cloth onto the other side.
+//   - The squares are sorted far to near into depth buckets and drawn as two
+//     triangles each, brightness interpolated across them (Gouraud shading),
+//     with a 4 x 4 ordered dither to RRRGGGBB.  The flag's shadow is drawn
+//     on the grass first.
+//   - Walking a row, each particle and its neighbours are carried along in
+//     variables, so every particle is read and written once per pass.  An
+//     array access copies each byte of an element over the distance from the
+//     temporaries to the array, so the arrays are few, of 16-bit values, and
+//     touched in few places; the triangle filler is a shared proc for the same
+//     reason (one copy for its three callers).
+//
+//     bfui programs\samples\flag.bfl   F5 runs it (the framebuffer window opens
+//                                     by itself), Shift+F5 stops
+//     bf programs\samples\flag.bfl     runs headless; frame times on stdout
+
+const NX = 21;              // particles along the flag
+const NY = 11;              // and down it
+const N = 231;
+const REST = 410;           // spring length along the weave: 0.1 m, Q12
+const REST2 = 168100;       // its square
+const DIAG2 = 336200;       // a diagonal's square
+const TOPY = 12288;         // the flag's top edge, 3 m up
+const POLEX = -120;         // the pole's axis, just behind the hoist
+const POLETOP = 12900;      // 3.15 m
+const GRAV = 5;             // 9.8 m/s^2 over a step of 1/90 s, Q12
+const DAMP = 4072;          // share of its velocity a particle keeps per step, Q12
+const SUB = 3;              // steps per frame
+const ITER = 4;             // relaxation passes per step
+const CN = 240;             // pressure on the cloth, Q12
+const CT = 120;             // drag along it, Q12
+const FRAME_MS = 33;        // 30 frames a second, when the machine keeps up
+const FOC = 1776;           // focal length: 111 pixels, in sixteenths of a pixel
+const AMB = 80;             // light: ambient, sun, sun through the cloth (0..255)
+const SUN = 200;
+const THRU = 60;
+const NB = 48;              // depth buckets
+
+// ---- the cloth ----------------------------------------------------------------------------
+struct Vec { int x; int y; int z; }                    // the flag stays within 8 m of the pole
+struct Scr { int x; int y; int z; byte f; byte b; }   // a particle on the screen: sixteenths of a
+                                                       // pixel, depth (Q8 m), brightness front and back
+Vec pos[231];               // particle positions, Q12 metres
+Vec old[231];               // and where they were one step ago
+Scr scr[231];
+byte head[48];  byte link[200];                // depth buckets of squares
+byte bayer[16];
+
+// ---- per frame ----------------------------------------------------------------------------
+long ex;  long ey;  long ez;                   // camera position, Q12
+long fx;  long fy;  long fz;                   // forward, right (its y is 0) and up, Q12
+long rx;  long rz;
+long ux;  long uy;  long uz;
+long lx;  long ly;  long lz;                   // towards the sun, Q12
+long wx;  long wz;                             // the wind, Q12 metres per step
+long t;                                        // steps simulated
+dword seed = 8191;
+long gust = 0;  long gtarget = 0;              // the gust: its strength now and where it is going
+long nx;  long ny;  long nz;                   // the normal worked out by normal(), Q12
+int  cr;  int cg;  int cb;                     // a row of sky or grass, from row_colour()
+
+// The triangle being drawn: corners in sixteenths of a pixel, brightness 0..255,
+// and the colour's channels times their levels (7, 7, 3).
+int  tx0; int ty0; int ti0;
+int  tx1; int ty1; int ti1;
+int  tx2; int ty2; int ti2;
+word kr;  word kg;  word kb;
+byte flat;                                     // 1: the shadowed grass of each row instead
+
+
+// ---- maths --------------------------------------------------------------------------------
+// Sine of whole degrees times 1024 (Bhaskara I's formula, error under 0.2%).
+proc int sin1024(word deg) {
+    deg = deg % 360;
+    byte neg = 0;
+    if (deg >= 180) { deg -= 180; neg = 1; }
+    long p = long(deg) * (180 - deg);
+    int s = int((4096 * p) / (40500 - p));
+    if (neg) { return -s; }
+    return s;
+}
+
+// Square root of a non-negative 32-bit value: a power-of-four bound, then Newton.
+proc long isqrt(long v) {
+    if (v <= 0) { return 0; }
+    long bit = 1073741824;
+    long root = 32768;
+    while ((bit >> 8) > v) { bit = bit >> 8; root = root >> 4; }
+    while (bit > v) { bit = bit >> 2; root = root >> 1; }
+    long g = root + (root >> 1);
+    byte step;
+    for (step = 0; step < 3; step++) { g = (g + v / g) >> 1; }
+    return g;
+}
+
+proc word rnd(word n) {                        // 0 .. n-1
+    seed = seed * 1103515245 + 12345;
+    return mulshr(word(seed >> 16), n, 16);
+}
+
+shared proc word millis() {               // shared: the main loop asks four times
+    pulse TICK_LATCH;
+    return word(TICKS1) * 256 + TICKS0;
+}
+
+// RRRGGGBB for a colour (0..255 each) at dither threshold th (8..248).
+proc byte dither(int r, int g, int b, int th) {
+    if (r < 0) { r = 0; } if (r > 255) { r = 255; }
+    if (g < 0) { g = 0; } if (g > 255) { g = 255; }
+    if (b < 0) { b = 0; } if (b > 255) { b = 255; }
+    byte r3 = byte((r * 7 + th) >> 8);
+    byte g3 = byte((g * 7 + th) >> 8);
+    byte b2 = byte((b * 3 + th) >> 8);
+    return r3 * 32 + g3 * 4 + b2;
+}
+
+// The unit normal of the cloth at a particle with neighbours l and r across
+// the weave and u and d down it, into nx, ny, nz (towards +z on the flag as
+// it starts).  At an edge the particle itself stands in for the one missing.
+proc normal(ref Vec l, ref Vec r, ref Vec u, ref Vec d) {
+    long ax = r.x - l.x;  long ay = r.y - l.y;  long az = r.z - l.z;
+    long bx = d.x - u.x;  long by = d.y - u.y;  long bz = d.z - u.z;
+    long cx = (by * az - bz * ay) >> 8;
+    long cy = (bz * ax - bx * az) >> 8;
+    long cz = (bx * ay - by * ax) >> 8;
+    long len = isqrt(cx * cx + cy * cy + cz * cz);
+    nx = 0;  ny = 0;  nz = 4096;
+    if (len > 0) {
+        nx = (cx << 12) / len;
+        ny = (cy << 12) / len;
+        nz = (cz << 12) / len;
+    }
+}
+
+// ---- physics ------------------------------------------------------------------------------
+// Pull particles p and q towards rest length (rest2 its square).  A pinned p
+// stays put and q takes the whole correction.
+proc pull(ref Vec p, ref Vec q, long rest2, byte pinned) {
+    long dx = q.x - p.x;
+    long dy = q.y - p.y;
+    long dz = q.z - p.z;
+    long f = (rest2 << 12) / (dx * dx + dy * dy + dz * dz + rest2) - 2048;    // Q12, -1/2 .. 1/2
+    long cx = mulshr(dx, f, 12);
+    long cy = mulshr(dy, f, 12);
+    long cz = mulshr(dz, f, 12);
+    if (pinned) {
+        q.x += int(cx + cx);  q.y += int(cy + cy);  q.z += int(cz + cz);
+    } else {
+        p.x -= int(cx);  p.y -= int(cy);  p.z -= int(cz);
+        q.x += int(cx);  q.y += int(cy);  q.z += int(cz);
+    }
+}
+
+// The wind this frame: a steady breeze from the hoist, turning a little,
+// with gusts that build and die away at random.
+proc weather() {
+    if (rnd(40) == 0) { gtarget = long(rnd(160)) - 40; }     // a new gust now and then
+    gust = gust + (gtarget - gust) / 16;
+    long speed = 300 + gust;                                // Q12 metres per step: 300 is 6.6 m/s
+    word a = word(t / 9) % 360;
+    long turn = mulshr(long(sin1024(a)), 180, 10);          // up to 10 degrees either way, Q10
+    wx = speed - mulshr(speed, mulshr(turn, turn, 10), 11);  // cos ~ 1 - turn^2 / 2
+    wz = mulshr(speed, turn, 10);
+}
+
+// One step: move every free particle on by its velocity and gravity, then
+// relax the springs.  On the first step of a frame (windy) the wind on each
+// bit of cloth is added too, as the push of the frame's three steps at once:
+// in Verlet integration a push is just a change of position.  Walking a row,
+// the particle and its neighbours are carried along in variables.
+proc step(byte windy) {
+    byte k = 0;
+    byte j;
+    for (j = 0; j < NY; j++) {
+        Vec here = pos[k];
+        Vec left = here;
+        byte i;
+        for (i = 0; i < NX; i++) {
+            Vec right = here;
+            if (windy && i + 1 < NX) { right = pos[k + 1]; }
+            if (i != 0) {                           // the hoist is tied to the pole
+                Vec o = old[k];
+                long vx = here.x - o.x;             // Q12 metres per step
+                long vy = here.y - o.y;
+                long vz = here.z - o.z;
+                Vec p = here;
+                p.x += int(mulshr(vx, DAMP, 12));
+                p.y += int(mulshr(vy, DAMP, 12)) - GRAV;
+                p.z += int(mulshr(vz, DAMP, 12));
+                if (windy) {
+                    Vec up = here;    if (j != 0) { up = pos[k - NX]; }
+                    Vec down = here;  if (j + 1 < NY) { down = pos[k + NX]; }
+                    normal(left, right, up, down);
+                    // the wind as the cloth meets it, with a ripple travelling down the flag
+                    word ph = (word(i) * 37 + 4320 - word(t % 360) * 12) % 360;
+                    long rlx = wx - vx;
+                    long rly = -vy;
+                    long rlz = wz - vz + mulshr(long(sin1024(ph)), 90, 10);
+                    long s = mulshr(mulshr(rlx, nx, 12) + mulshr(rly, ny, 12) + mulshr(rlz, nz, 12), CN * SUB, 12);
+                    p.x += int(mulshr(nx, s, 12) + mulshr(rlx, CT * SUB, 12));
+                    p.y += int(mulshr(ny, s, 12) + mulshr(rly, CT * SUB, 12));
+                    p.z += int(mulshr(nz, s, 12) + mulshr(rlz, CT * SUB, 12));
+                }
+                old[k] = here;
+                pos[k] = p;
+            }
+            left = here;
+            here = right;
+            if (!windy && i + 1 < NX) { here = pos[k + 1]; }
+            k++;
+        }
+    }
+    byte it;
+    for (it = 0; it < ITER; it++) {
+        k = 0;
+        for (j = 0; j < NY; j++) {
+            byte below = j + 1 < NY;
+            Vec p = pos[k];                     // particle (i, j)
+            Vec d;                              // and (i, j + 1)
+            if (below) { d = pos[k + NX]; }
+            byte i;
+            for (i = 0; i + 1 < NX; i++) {
+                Vec r = pos[k + 1];             // (i + 1, j)
+                pull(p, r, REST2, i == 0);
+                if (below) {
+                    Vec e = pos[k + NX + 1];    // (i + 1, j + 1)
+                    if (i != 0) { pull(p, d, REST2, 0); }
+                    pull(p, e, DIAG2, i == 0);
+                    pull(d, r, DIAG2, i == 0);
+                    pos[k + NX] = d;
+                    d = e;
+                }
+                pos[k] = p;
+                p = r;
+                k++;
+            }
+            if (below) { pull(p, d, REST2, 0); pos[k + NX] = d; }
+            pos[k] = p;
+            k++;
+        }
+    }
+    t++;
+}
+
+// ---- the camera and the light ------------------------------------------------------------
+proc place_camera(word ang) {
+    long sn = sin1024(ang);
+    long cs = sin1024(ang + 90);
+    long tx = 4100;   long ty = 9400;    long tz = 0;           // looks at the middle of the flag
+    ex = tx + mulshr(sn, 16000, 10);
+    ey = 9000;
+    ez = tz + mulshr(cs, 16000, 10);
+    long vx = tx - ex;
+    long vy = ty - ey;
+    long vz = tz - ez;
+    long len = isqrt(mulshr(vx, vx, 4) + mulshr(vy, vy, 4) + mulshr(vz, vz, 4)) << 2;
+    fx = (vx << 12) / len;
+    fy = (vy << 12) / len;
+    fz = (vz << 12) / len;
+    long hl = isqrt(fx * fx + fz * fz);
+    rx = (-fz << 12) / hl;
+    rz = (fx << 12) / hl;
+    ux = mulshr(-rz, fy, 12);                  // up = right x forward
+    uy = mulshr(rz, fx, 12) - mulshr(rx, fz, 12);
+    uz = mulshr(rx, fy, 12);
+}
+
+// Every particle on the screen, and its brightness from the front and the back.
+proc project() {
+    byte k = 0;
+    byte j;
+    for (j = 0; j < NY; j++) {
+        Vec here = pos[k];
+        Vec left = here;
+        byte i;
+        for (i = 0; i < NX; i++) {
+            Vec right = here;
+            if (i + 1 < NX) { right = pos[k + 1]; }
+            Vec up = here;    if (j != 0) { up = pos[k - NX]; }
+            Vec down = here;  if (j + 1 < NY) { down = pos[k + NX]; }
+            normal(left, right, up, down);
+            long vx = here.x - ex;
+            long vy = here.y - ey;
+            long vz = here.z - ez;
+            long zc = mulshr(vx, fx, 12) + mulshr(vy, fy, 12) + mulshr(vz, fz, 12);
+            long xc = mulshr(vx, rx, 12) + mulshr(vz, rz, 12);
+            long yc = mulshr(vx, ux, 12) + mulshr(vy, uy, 12) + mulshr(vz, uz, 12);
+            Scr s;
+            s.x = int(1024 + (xc * FOC) / zc);
+            s.y = int(512 - (yc * FOC) / zc);
+            s.z = int(zc >> 4);
+            long nl = (mulshr(nx, lx, 12) + mulshr(ny, ly, 12) + mulshr(nz, lz, 12)) >> 4;   // -256..256
+            long front = AMB;
+            long back = AMB;
+            if (nl > 0) {
+                front += mulshr(nl, SUN, 8);
+                back += mulshr(nl, THRU, 8);
+            } else {
+                front -= mulshr(nl, THRU, 8);
+                back -= mulshr(nl, SUN, 8);
+            }
+            if (front > 255) { front = 255; }
+            if (back > 255) { back = 255; }
+            s.f = byte(front);
+            s.b = byte(back);
+            scr[k] = s;
+            left = here;
+            here = right;
+            k++;
+        }
+    }
+}
+
+// ---- drawing ------------------------------------------------------------------------------
+// The colour of sky or grass along screen row y, into cr, cg, cb: the height
+// of the ray through the middle of the row decides it.
+proc row_colour(byte y) {
+    long dy = fy - (uy * (long(y) * 16 + 8 - 512)) / FOC;     // Q12
+    if (dy > 0) {
+        long up = dy >> 2;
+        if (up > 256) { up = 256; }
+        int u = int(up);
+        cr = 200 + mulshr(-150, u, 8);
+        cg = 215 + mulshr(-125, u, 8);
+        cb = 235 + mulshr(-55, u, 8);
+    } else {
+        long near = (-dy) >> 2;                              // 0 at the horizon
+        if (near > 256) { near = 256; }
+        int n = int(near);
+        cr = 175 + mulshr(-120, n, 8);
+        cg = 195 + mulshr(-60, n, 8);
+        cb = 175 + mulshr(-140, n, 8);
+    }
+}
+
+// The sky and the grass, row by row: each row is one colour, dithered.
+proc background() {
+    FB_X = 0;
+    FB_Y = 0;
+    byte y;
+    for (y = 0; y < 64; y++) {
+        row_colour(y);
+        byte row = (y & 3) * 4;
+        byte c0 = dither(cr, cg, cb, int(bayer[row]) * 16 + 8);
+        byte c1 = dither(cr, cg, cb, int(bayer[row + 1]) * 16 + 8);
+        byte c2 = dither(cr, cg, cb, int(bayer[row + 2]) * 16 + 8);
+        byte c3 = dither(cr, cg, cb, int(bayer[row + 3]) * 16 + 8);
+        byte x;
+        for (x = 0; x < 32; x++) {
+            FB_COLOR = c0; pulse FB_PLOT;
+            FB_COLOR = c1; pulse FB_PLOT;
+            FB_COLOR = c2; pulse FB_PLOT;
+            FB_COLOR = c3; pulse FB_PLOT;
+        }
+    }
+}
+
+// Fill the triangle in tx0..ti2, kr, kg, kb.  A pixel is filled when its
+// centre is inside, by the same sums for an edge from either side, so the
+// triangles of a mesh meet without gaps or overlaps.
+shared proc tri() {
+    // corners sorted top to bottom
+    int sw;
+    if (ty1 < ty0) { sw = tx0; tx0 = tx1; tx1 = sw; sw = ty0; ty0 = ty1; ty1 = sw; sw = ti0; ti0 = ti1; ti1 = sw; }
+    if (ty2 < ty0) { sw = tx0; tx0 = tx2; tx2 = sw; sw = ty0; ty0 = ty2; ty2 = sw; sw = ti0; ti0 = ti2; ti2 = sw; }
+    if (ty2 < ty1) { sw = tx1; tx1 = tx2; tx2 = sw; sw = ty1; ty1 = ty2; ty2 = sw; sw = ti1; ti1 = ti2; ti2 = sw; }
+    long area = long(tx1 - tx0) * (ty2 - ty0) - long(tx2 - tx0) * (ty1 - ty0);
+    if (area == 0) { return; }
+    // brightness as a plane over the screen: change per pixel across and down, Q8
+    long ga = 0;  long gb = 0;
+    if (!flat && (area > 255 || area < -255)) {
+        ga = ((long(ti1 - ti0) * (ty2 - ty0) - long(ti2 - ti0) * (ty1 - ty0)) << 12) / area;
+        gb = ((long(ti2 - ti0) * (tx1 - tx0) - long(ti1 - ti0) * (tx2 - tx0)) << 12) / area;
+    }
+    int ya = (ty0 + 7) >> 4;                    // rows whose centre is at or below the top corner
+    int yb = (ty2 + 7) >> 4;                    // and above the bottom one
+    if (ya < 0) { ya = 0; }
+    if (yb > 64) { yb = 64; }
+    int y;
+    for (y = ya; y < yb; y++) {
+        int yc = y * 16 + 8;
+        long xl = tx0 + (long(yc - ty0) * (tx2 - tx0)) / (ty2 - ty0);       // the long edge
+        long xr;
+        if (yc < ty1) {
+            xr = tx0 + (long(yc - ty0) * (tx1 - tx0)) / (ty1 - ty0);
+        } else {
+            xr = tx1 + (long(yc - ty1) * (tx2 - tx1)) / (ty2 - ty1);
+        }
+        if (xr < xl) { long xs = xl; xl = xr; xr = xs; }
+        long xa = (xl + 7) >> 4;
+        long xb = (xr + 7) >> 4;
+        if (xa < 0) { xa = 0; }
+        if (xb > 128) { xb = 128; }
+        if (xa < xb) {
+            byte row = byte(y & 3) * 4;
+            if (flat) {
+                // the grass of this row in shadow, dithered across it
+                row_colour(byte(y));
+                int sr = mulshr(cr, 150, 8);  int sg = mulshr(cg, 155, 8);  int sbl = mulshr(cb, 165, 8);
+                byte sc[4];
+                byte m;
+                for (m = 0; m < 4; m++) { sc[m] = dither(sr, sg, sbl, int(bayer[row + m]) * 16 + 8); }
+                FB_X = byte(xa);
+                FB_Y = byte(y);
+                byte sx;
+                for (sx = byte(xa); sx < byte(xb); sx++) { FB_COLOR = sc[sx & 3]; pulse FB_PLOT; }
+            } else {
+                FB_X = byte(xa);
+                FB_Y = byte(y);
+                long lit = (long(ti0) << 8) + ((ga * (xa * 16 + 8 - tx0) + gb * (yc - ty0)) >> 4);
+                byte x;
+                for (x = byte(xa); x < byte(xb); x++) {
+                    long li = lit >> 8;
+                    if (li < 0) { li = 0; }
+                    if (li > 255) { li = 255; }
+                    word l = word(li);
+                    word th = word(bayer[row + (x & 3)]) * 16 + 8;
+                    byte r3 = byte((mulshr(kr, l, 8) + th) >> 8);
+                    byte g3 = byte((mulshr(kg, l, 8) + th) >> 8);
+                    byte b2 = byte((mulshr(kb, l, 8) + th) >> 8);
+                    FB_COLOR = r3 * 32 + g3 * 4 + b2;
+                    pulse FB_PLOT;
+                    lit += ga;
+                }
+            }
+        }
+    }
+}
+
+// The flag's shadow on the grass: each particle moved down along the sun's
+// rays to the ground, the squares filled with the shadowed grass of their rows.
+proc shadow() {
+    byte k;
+    for (k = 0; k < N; k++) {
+        Vec p = pos[k];
+        long sx = p.x - (p.y * lx) / ly;
+        long sz = p.z - (p.y * lz) / ly;
+        long vx = sx - ex;
+        long vy = -ey;
+        long vz = sz - ez;
+        long zc = mulshr(vx, fx, 12) + mulshr(vy, fy, 12) + mulshr(vz, fz, 12);
+        long xc = mulshr(vx, rx, 12) + mulshr(vz, rz, 12);
+        long yc = mulshr(vx, ux, 12) + mulshr(vy, uy, 12) + mulshr(vz, uz, 12);
+        if (zc < 1024) { zc = 1024; }
+        scr[k].x = int(1024 + (xc * FOC) / zc);
+        scr[k].y = int(512 - (yc * FOC) / zc);
+    }
+    flat = 1;
+    byte sk = 0;
+    byte sj;
+    for (sj = 0; sj + 1 < NY; sj++) {
+        byte si;
+        for (si = 0; si + 1 < NX; si++) {
+            Scr s0 = scr[sk];  Scr s1 = scr[sk + 1];  Scr s2 = scr[sk + NX];  Scr s3 = scr[sk + NX + 1];
+            byte sh;
+            for (sh = 0; sh < 2; sh++) {
+                tx0 = s0.x;  ty0 = s0.y;
+                tx1 = s3.x;  ty1 = s3.y;
+                if (sh) { tx2 = s2.x;  ty2 = s2.y; } else { tx2 = s1.x;  ty2 = s1.y; }
+                tri();
+            }
+            sk++;
+        }
+        sk++;
+    }
+    flat = 0;
+}
+
+// The pole: a thin quad facing the camera, and a gilt ball on top.
+proc pole() {
+    long px4[4];  long py4[4];
+    byte c;
+    for (c = 0; c < 4; c++) {
+        long px = POLEX;
+        long pz = 0;
+        if (c & 1) { px += mulshr(rx, 100, 12); pz += mulshr(rz, 100, 12); } else { px -= mulshr(rx, 100, 12); pz -= mulshr(rz, 100, 12); }
+        long py = 0;
+        if (c & 2) { py = POLETOP; }
+        long vx = px - ex;
+        long vy = py - ey;
+        long vz = pz - ez;
+        long zc = mulshr(vx, fx, 12) + mulshr(vy, fy, 12) + mulshr(vz, fz, 12);
+        long xc = mulshr(vx, rx, 12) + mulshr(vz, rz, 12);
+        long yc = mulshr(vx, ux, 12) + mulshr(vy, uy, 12) + mulshr(vz, uz, 12);
+        px4[c] = 1024 + (xc * FOC) / zc;
+        py4[c] = 512 - (yc * FOC) / zc;
+    }
+    kr = 230 * 7;  kg = 230 * 7;  kb = 225 * 3;
+    byte ph;
+    for (ph = 0; ph < 2; ph++) {
+        tx0 = int(px4[0]);  ty0 = int(py4[0]);  ti0 = 150;
+        tx1 = int(px4[3]);  ty1 = int(py4[3]);  ti1 = 235;
+        tx2 = int(px4[1]);  ty2 = int(py4[1]);  ti2 = 190;
+        if (ph) { tx2 = int(px4[2]);  ty2 = int(py4[2]);  ti2 = 200; }
+        tri();
+    }
+    // the ball: a disc of three pixels' radius, lit from the sun's side
+    int bx = int((px4[2] + px4[3]) >> 5);
+    int by = int((py4[2] + py4[3]) >> 5) - 2;
+    int dy;
+    for (dy = -2; dy <= 2; dy++) {
+        int dx;
+        for (dx = -2; dx <= 2; dx++) {
+            if (dx * dx + dy * dy <= 5) {
+                int qx = bx + dx;  int qy = by + dy;
+                if (qx >= 0 && qx < 128 && qy >= 0 && qy < 64) {
+                    FB_X = byte(qx);  FB_Y = byte(qy);
+                    int glint = 200 - (dx + dy) * 25;
+                    FB_COLOR = dither(glint, mulshr(glint, 200, 8), mulshr(glint, 70, 8), int(bayer[(qy & 3) * 4 + (qx & 3)]) * 16 + 8);
+                    pulse FB_PLOT;
+                }
+            }
+        }
+    }
+}
+
+// The squares sorted far to near and drawn.
+proc cloth() {
+    project();
+    int zmin = 32767;  int zmax = -32768;
+    byte k;
+    for (k = 0; k < N; k++) {
+        int z = scr[k].z;
+        if (z < zmin) { zmin = z; }
+        if (z > zmax) { zmax = z; }
+    }
+    long span = long(zmax - zmin) * 4 + 4;
+    byte bk;
+    for (bk = 0; bk < NB; bk++) { head[bk] = 255; }
+    byte q = 0;
+    k = 0;
+    byte j;
+    for (j = 0; j + 1 < NY; j++) {
+        byte i;
+        for (i = 0; i + 1 < NX; i++) {
+            long zs = long(scr[k].z) + scr[k + 1].z + scr[k + NX].z + scr[k + NX + 1].z - long(zmin) * 4;
+            bk = byte((zs * NB) / span);
+            link[q] = head[bk];
+            head[bk] = q;
+            q++;
+            k++;
+        }
+        k++;
+    }
+    bk = NB;
+    while (bk > 0) {
+        bk--;
+        q = head[bk];
+        while (q != 255) {
+            byte qj = q / (NX - 1);
+            byte qi = q - qj * (NX - 1);
+            k = qj * NX + qi;
+            // chequers of two squares by two, white and black
+            if (((qi >> 1) ^ (qj >> 1)) & 1) { kr = 28 * 7; kg = 28 * 7; kb = 34 * 3; } else { kr = 240 * 7; kg = 238 * 7; kb = 228 * 3; }
+            Scr c0 = scr[k];  Scr c1 = scr[k + 1];  Scr c2 = scr[k + NX];  Scr c3 = scr[k + NX + 1];
+            byte h;
+            for (h = 0; h < 2; h++) {
+                // corners 0 1 3, then 0 3 2: the same way round as the square
+                Scr m = c1;
+                Scr e = c3;
+                if (h) { m = c3; e = c2; }
+                tx0 = c0.x;  ty0 = c0.y;
+                tx1 = m.x;   ty1 = m.y;
+                tx2 = e.x;   ty2 = e.y;
+                // the side facing the camera decides which brightness the corners show
+                long turn = long(tx1 - tx0) * (ty2 - ty0) - long(tx2 - tx0) * (ty1 - ty0);
+                if (turn > 0) {
+                    ti0 = c0.f;  ti1 = m.f;  ti2 = e.f;
+                } else {
+                    ti0 = c0.b;  ti1 = m.b;  ti2 = e.b;
+                }
+                tri();
+            }
+            q = link[q];
+        }
+    }
+}
+
+// ---- run ----------------------------------------------------------------------------------
+byte b0;
+for (b0 = 0; b0 < 16; b0++) {
+    // 4 x 4 Bayer matrix: 0 8 2 10 / 12 4 14 6 / 3 11 1 9 / 15 7 13 5
+    byte row = b0 >> 2;
+    byte col = b0 & 3;
+    byte v = ((col ^ row) & 1) * 8 + (row & 1) * 4 + ((col ^ row) >> 1 & 1) * 2 + (row >> 1);
+    bayer[b0] = v;
+}
+
+// the sun: behind the camera, to its left and low enough to throw the
+// flag's shadow onto the grass in view
+lx = -1442;  ly = 1360;  lz = 3585;
+
+// the flag starts out straight, as though the wind had just dropped
+byte k0 = 0;
+byte j0;
+for (j0 = 0; j0 < NY; j0++) {
+    byte i0;
+    for (i0 = 0; i0 < NX; i0++) {
+        Vec p;
+        p.x = int(i0) * REST;
+        p.y = TOPY - int(j0) * REST;
+        p.z = sin1024(word(i0) * 40) >> 4;
+        pos[k0] = p;
+        old[k0] = p;
+        k0++;
+    }
+}
+
+print "BFL flag: ", N, " particles of cloth in the wind, ", SUB, " steps a frame.\n";
+word frame = 0;
+while (1) {
+    word t0 = millis();
+    weather();
+    place_camera(word(350 + mulshr(long(sin1024(frame / 2)), 30, 10)));
+    background();
+    shadow();
+    pole();
+    cloth();
+    word t1 = millis();
+    byte s;
+    for (s = 0; s < SUB; s++) { step(s == 0); }
+    word t2 = millis();
+    print "frame ", frame, ": draw ", t1 - t0, " ms, physics ", t2 - t1, " ms\n";
+    while (millis() - t0 < FRAME_MS) { }
+    frame++;
+}

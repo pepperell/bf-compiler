@@ -5,8 +5,9 @@ pointers and the heap, strings, imports, and recursion. Run one with
 `bf programs\samples\NAME.bfl`, or open it in `bfui` and press F5 (Ctrl+F5 to
 debug it statement by statement). `tests\test_lang.py` runs every sample and
 compares its output with `tests\samples\NAME.out`; `cube.bfl`,
-`starfield.bfl`, `raytracer.bfl` and `raytracer_text.bfl` run until stopped,
-so they are only compiled there.
+`starfield.bfl`, `raytracer.bfl`, `raytracer_text.bfl`, `flag.bfl`,
+`galaxies.bfl` and `traffic.bfl` run until stopped, so they are only
+compiled there.
 
 | File | What it does | Features it shows |
 |------|--------------|-------------------|
@@ -22,6 +23,9 @@ so they are only compiled there.
 | `starfield.bfl` | The Enterprise-D's main viewscreen: stars at impulse, then streaking at warp, with LCARS panels, Ops and Conn, and the captain giving the order | A 3D starfield with perspective, double-buffered output that sends only changed characters, 256-colour backgrounds, a pixel-map picture |
 | `raytracer.bfl` | Four reflective spheres on a checkerboard, two coloured lamps with soft shadows, the camera circling the scene on the framebuffer (about 31 ms a frame; [one orbit](../../docs/raytracer.gif), made by `tools/rt_gif.py`) | Fixed-point ray tracing with `mulshr` and incremental primary rays, screen-box culling, a precomputed floor light map in the heap, one reflection bounce, Blinn highlights, ordered dithering to RRRGGGBB, a `shared proc` |
 | `raytracer_text.bfl` | The same scene drawn as coloured text in any terminal (`bf` in Windows Terminal, xterm, the UI): 79 x 22 cells, about 8 ms a frame | Brightness to a character ramp, colour to the nearest of 256 ANSI colours, a camera with tall cells |
+| `flag.bfl` | A chequered flag flying from a pole in gusty wind, the camera drifting round it on the framebuffer: 21 x 11 particles of simulated cloth (about 28 ms a frame, paced to 30 frames a second) | Verlet integration, springs relaxed with Jakobsen's square-root-free correction, normals from neighbouring particles for the wind and the light, light through the cloth, depth buckets, a triangle filler with Gouraud shading and gap-free edges, a cast shadow, a `shared proc` with three callers |
+| `galaxies.bfl` | Two disc galaxies swing past each other, throw out tidal tails and a bridge, and merge; four encounters with the discs tilted different ways, 500 stars on the framebuffer (about 20 ms a frame) | Toomre and Toomre's restricted three-body method, Q20 positions and Q24 velocities, softened gravity with an integer square root, discs started in exact circular orbits, dynamical friction, additive blending with `FB_READ`, a zoom that follows the stars, structs of structs (both galaxies in one array) |
+| `traffic.bfl` | A traffic jam out of nothing: 22 cars following the Intelligent Driver Model round a 230 m ring (Sugiyama's experiment) break into stop-and-go waves, shown on the ring and in a time-space diagram; keys add and remove cars and make a driver brake | Car following in fixed point, a ring of cars kept in order as they pass the start line, keyboard input during an animation, drawing by erasing and redrawing only what moved, a sweeping time-space plot |
 | `life.bfl` | Conway's Game of Life, animated in the terminal | Swapping heap grids through pointers, ANSI escapes, the `TICKS` clock |
 
 Things to try in the UI:
@@ -37,3 +41,8 @@ Things to try in the UI:
   step over a recursive call: it runs until the stack is back at the same depth.
 - **Interactive input.** `calc.bfl` reads the keyboard; click in the terminal
   before typing.
+- **Jams.** Run `traffic.bfl` and wait for the first red band in the
+  time-space diagram (about two minutes of simulated time, fifteen seconds
+  on the screen), then click in the terminal and press `-` until 12 cars are
+  left: the waves die away and the flow settles at over 30 km/h. `+` brings
+  them back.

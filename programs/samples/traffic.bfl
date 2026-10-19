@@ -1,0 +1,360 @@
+// traffic.bfl - a traffic jam out of nothing: cars on a ring road, every
+// driver keeping a safe distance, and still the flow breaks down into
+// stop-and-go waves that run backwards round the ring.
+//
+// This is the experiment of Sugiyama et al. (New Journal of Physics, 2008):
+// 22 cars on a 230 m circuit, told to drive steadily.  Here each driver
+// follows the Intelligent Driver Model (Treiber, Hennecke and Helbing, 2000):
+//
+//     a = A (1 - (v / V0)^4 - (s* / s)^2),   s* = S0 + v T + v dv / (2 sqrt(A B))
+//
+// with s the gap to the car ahead and dv how fast it is closing.  Drivers are
+// not perfect: each one's acceleration wobbles a little at random, and at
+// this density the even flow cannot absorb the wobbles.  A small slow-down is
+// copied a little harder by the car behind, and after a minute or two cars are
+// stopping, then pulling away from the front of the jam, while the jam itself
+// drifts backwards against the traffic.
+//
+//   - Positions and speeds are in units of 1/4096 m and 1/4096 m/s (Q12); a
+//     step is a tenth of a second, three of them a frame, so it runs at 9
+//     times real time.  All accelerations are worked out before any car moves.
+//   - Left: the ring, each car coloured by its speed (red stopped, through
+//     yellow, green from 25 km/h), and inside it the cars' mean speed over
+//     the last minute.
+//   - Right: a time-space diagram.  Each row is one moment, with a dot at each
+//     car's place round the ring; a row is written every other frame (0.6 s),
+//     sweeping down the panel, so it holds the last 38 seconds.  Cars trace
+//     lines running down and to the right; a jam is a red band slanting down
+//     to the left.
+//
+// Keys (click the terminal in the UI first): + adds a car in the longest
+// gap, - takes one away, b makes a driver brake hard, n turns the drivers'
+// wobble off and on.  Stats go to the terminal every few seconds.
+//
+//     bfui programs\samples\traffic.bfl   F5 runs it (the framebuffer window
+//                                        opens by itself), Shift+F5 stops
+//     bf programs\samples\traffic.bfl     runs headless; stats on stdout
+
+const MAXCARS = 40;
+const RING = 942080;        // the circuit: 230 m, Q12
+const LEN = 18432;          // a car's length: 4.5 m
+const V0 = 57344;           // desired speed: 14 m/s (50 km/h)
+const TH = 4915;            // time headway T: 1.2 s, Q12
+const S0 = 8192;            // standstill gap: 2 m
+const AMAX = 2458;          // acceleration A: 0.6 m/s^2
+const INVK = 2159;          // 1 / (2 sqrt(A B)) with B = 1.5 m/s^2, Q12
+const BRAKE = 36864;        // the hardest a car can brake: 9 m/s^2
+const WOBBLE = 1638;        // drivers' random acceleration: up to 0.4 m/s^2 either way
+const VFULL = 28672;        // 7 m/s (25 km/h): green on the screen, the top of the chart
+const SUB = 3;              // steps a frame
+const FRAME_MS = 33;
+
+long x[40];     long v[40];     long acc[40];   // position round the ring, speed, acceleration (Q12)
+byte dx0[40];   byte dy0[40];                   // where each car was last drawn on the ring
+byte cars = 22;
+byte wobble = 1;
+byte hard = 255;                                // a car braking hard, and for how many more steps
+byte hardfor = 0;
+byte hist[32];                                  // mean speed over the last minute, pixels high
+byte histn = 0;
+long histsum = 0;  byte histcount = 0;
+byte row = 0;                                   // the time-space diagram's next row
+dword seed = 2008;
+long t = 0;                                     // steps simulated
+
+// ---- maths --------------------------------------------------------------------------------
+// Sine of whole degrees times 1024 (Bhaskara I's formula, error under 0.2%).
+proc int sin1024(word deg) {
+    deg = deg % 360;
+    byte neg = 0;
+    if (deg >= 180) { deg -= 180; neg = 1; }
+    long p = long(deg) * (180 - deg);
+    int s = int((4096 * p) / (40500 - p));
+    if (neg) { return -s; }
+    return s;
+}
+
+proc word rnd(word n) {                        // 0 .. n-1
+    seed = seed * 1103515245 + 12345;
+    return mulshr(word(seed >> 16), n, 16);
+}
+
+proc word millis() {
+    pulse TICK_LATCH;
+    return word(TICKS1) * 256 + TICKS0;
+}
+
+// The gap from car i to the one ahead of it, bumper to bumper (Q12).
+proc long gap(byte i) {
+    byte j = i + 1;
+    if (j == cars) { j = 0; }
+    long d = x[j] - x[i];
+    if (d < 0) { d += RING; }
+    return d - LEN;
+}
+
+// ---- driving ------------------------------------------------------------------------------
+// Every car's acceleration from the Intelligent Driver Model, then every car moves.
+proc step() {
+    byte i;
+    for (i = 0; i < cars; i++) {
+        byte j = i + 1;
+        if (j == cars) { j = 0; }
+        long vi = v[i];
+        long s = gap(i);
+        if (s < 410) { s = 410; }                               // 10 cm: never quite touching
+        // the gap this driver wants: standstill gap, headway, and more when closing in
+        long want = mulshr(vi, TH, 12) + mulshr(mulshr(vi, vi - v[j], 12), INVK, 12);
+        if (want < 0) { want = 0; }
+        want += S0;
+        long r = (vi << 12) / V0;                               // v / V0
+        long r2 = mulshr(r, r, 12);
+        long q = (want << 12) / s;                              // s* / s
+        if (q > 65536) { q = 65536; }
+        long a = mulshr(AMAX, 4096 - mulshr(r2, r2, 12) - mulshr(q, q, 12), 12);
+        if (wobble) { a += long(rnd(WOBBLE * 2)) - WOBBLE; }
+        if (i == hard) { a = -BRAKE; }
+        if (a < -BRAKE) { a = -BRAKE; }
+        acc[i] = a;
+    }
+    for (i = 0; i < cars; i++) {
+        long vi = v[i];
+        long nv = vi + acc[i] / 10;
+        if (nv < 0) { nv = 0; }
+        long p = x[i] + (vi + nv) / 20;                         // the mean speed over a tenth of a second
+        if (p >= RING) { p -= RING; }
+        x[i] = p;
+        v[i] = nv;
+    }
+    // the car at the end of the list has passed the start line: keep the
+    // list in order round the ring by moving it to the front
+    while (x[cars - 1] < x[0]) {
+        long lx = x[cars - 1];  long lv = v[cars - 1];
+        byte ex = dx0[cars - 1];  byte ey = dy0[cars - 1];
+        byte k = cars - 1;
+        while (k > 0) {
+            x[k] = x[k - 1];  v[k] = v[k - 1];
+            dx0[k] = dx0[k - 1];  dy0[k] = dy0[k - 1];
+            k--;
+        }
+        x[0] = lx;  v[0] = lv;  dx0[0] = ex;  dy0[0] = ey;
+        if (hard != 255) { hard++; if (hard == cars) { hard = 0; } }
+    }
+    if (hardfor > 0) { hardfor--; if (hardfor == 0) { hard = 255; } }
+    t++;
+}
+
+// A car in the middle of the longest gap, at the speed of the car behind it.
+proc add_car() {
+    if (cars < MAXCARS) {
+        byte best = 0;
+        long most = 0;
+        byte i;
+        for (i = 0; i < cars; i++) {
+            long g = gap(i);
+            if (g > most) { most = g; best = i; }
+        }
+        if (most > LEN * 2 + S0 * 2) {
+            long p = x[best] + LEN + most / 2 - LEN / 2;
+            if (p >= RING) { p -= RING; }
+            long sp = v[best];
+            // make room in the list after best (the new car may sit past the start line)
+            byte at = best + 1;
+            if (p < x[best]) { at = 0; }
+            byte k = cars;
+            while (k > at) {
+                x[k] = x[k - 1];  v[k] = v[k - 1];
+                dx0[k] = dx0[k - 1];  dy0[k] = dy0[k - 1];
+                k--;
+            }
+            x[at] = p;  v[at] = sp;  dx0[at] = 255;
+            cars++;
+            hard = 255;
+        }
+    }
+}
+
+proc remove_car() {
+    if (cars > 2) {
+        byte k = byte(rnd(cars));
+        // its last picture is erased with the others' before the next frame
+        erase(dx0[k], dy0[k]);
+        while (k + 1 < cars) {
+            x[k] = x[k + 1];  v[k] = v[k + 1];
+            dx0[k] = dx0[k + 1];  dy0[k] = dy0[k + 1];
+            k++;
+        }
+        cars--;
+        hard = 255;
+    }
+}
+
+// ---- drawing ------------------------------------------------------------------------------
+// The road under the ring's pixel (x, y): asphalt between 25.5 and 29.5
+// pixels from the middle, white kerbs at its edges, grass round it, and the
+// dark field the speed chart sits on inside.
+proc byte ground(byte px, byte py) {
+    int ddx = int(px) * 2 - 63;                 // twice the distance from the middle, 31.5
+    int ddy = int(py) * 2 - 63;
+    int d2 = ddx * ddx + ddy * ddy;             // four times the distance squared
+    if (d2 < 2401) { return 0x04; }             // inside 24.5: the chart's field
+    if (d2 < 2601) { return 0x28; }             // to 25.5: grass
+    if (d2 < 2809) { return 0xDB; }             // to 26.5: kerb
+    if (d2 < 3249) { return 0x49; }             // to 28.5: asphalt
+    if (d2 < 3481) { return 0xDB; }             // to 29.5: kerb
+    return 0x28;
+}
+
+proc erase(byte px, byte py) {
+    if (px != 255) {
+        byte ax;
+        for (ax = px; ax < px + 2; ax++) {
+            byte ay;
+            for (ay = py; ay < py + 2; ay++) {
+                FB_X = ax;  FB_Y = ay;  FB_COLOR = ground(ax, ay);  pulse FB_PLOT;
+            }
+        }
+    }
+}
+
+// Red when stopped, through yellow, to green from 25 km/h.
+proc byte speed_colour(long sp) {
+    long f = (sp * 14) / VFULL;                 // 0 .. 14
+    if (f > 14) { f = 14; }
+    byte r3 = 7;  byte g3 = 7;
+    if (f > 7) { r3 = byte(14 - f); } else { g3 = byte(f); }
+    return r3 * 32 + g3 * 4;
+}
+
+proc draw_ground() {
+    FB_X = 0;  FB_Y = 0;
+    byte py;
+    for (py = 0; py < 64; py++) {
+        byte px;
+        for (px = 0; px < 128; px++) {
+            if (px < 64) { FB_COLOR = ground(px, py); } else { FB_COLOR = 0x00; }
+            pulse FB_PLOT;
+        }
+    }
+    // a line between the two panels
+    byte y;
+    for (y = 0; y < 64; y++) { FB_X = 64; FB_Y = y; FB_COLOR = 0x6D; pulse FB_PLOT; }
+}
+
+// The cars on the ring: every old picture erased first, then every car drawn.
+proc draw_ring() {
+    byte i;
+    for (i = 0; i < cars; i++) { erase(dx0[i], dy0[i]); }
+    for (i = 0; i < cars; i++) {
+        // the angle round the ring in tenths of a degree, the sine between whole degrees
+        long tenths = mulshr(x[i], 3600 * 1140, 30);           // x / RING * 3600 (RING * 1140 is about 2^30)
+        word deg = word(tenths / 10);
+        long fr = tenths % 10;
+        long sn = sin1024(deg);    sn += ((sin1024(deg + 1) - sn) * fr) / 10;
+        long cs = sin1024(deg + 90);  cs += ((sin1024(deg + 91) - cs) * fr) / 10;
+        // radius 27.5 pixels from the middle at 31.5, less one for the 2 x 2 block's corner
+        byte px = byte(31 + ((cs * 55) >> 11));
+        byte py = byte(31 + ((sn * 55) >> 11));
+        byte c = speed_colour(v[i]);
+        if (i == hard) { c = 0xE3; }            // braking hard: magenta
+        FB_COLOR = c;
+        FB_X = px;  FB_Y = py;      pulse FB_PLOT;  pulse FB_PLOT;
+        FB_X = px;  FB_Y = py + 1;  pulse FB_PLOT;  pulse FB_PLOT;
+        dx0[i] = px;  dy0[i] = py;
+    }
+}
+
+// One row of the time-space diagram: dark, a dot per car coloured by speed,
+// and a bright line under it where the next row will go.
+proc draw_row() {
+    FB_X = 65;  FB_Y = row;  FB_COLOR = 0x00;
+    byte c;
+    for (c = 65; c < 128; c++) { pulse FB_PLOT; }
+    byte i;
+    for (i = 0; i < cars; i++) {
+        FB_X = 65 + byte(mulshr(x[i], 63 * 1140, 30));      // 63 columns round the ring
+        FB_Y = row;
+        FB_COLOR = speed_colour(v[i]);
+        pulse FB_PLOT;
+    }
+    row++;
+    if (row == 64) { row = 0; }
+    FB_X = 65;  FB_Y = row;  FB_COLOR = 0x6D;
+    for (c = 65; c < 128; c++) { pulse FB_PLOT; }
+}
+
+// Inside the ring: the mean speed of the last 32 two-second spells, as bars
+// up to 18 pixels high (for 25 km/h) in a 32 x 18 field.
+proc draw_chart() {
+    byte b;
+    for (b = 0; b < 32; b++) {
+        byte h = hist[(histn + b) & 31];
+        byte y;
+        FB_X = 16 + b;
+        for (y = 0; y < 18; y++) {
+            FB_X = 16 + b;  FB_Y = 40 - y;
+            if (y < h) { FB_COLOR = 0x5E; } else { FB_COLOR = 0x04; }
+            pulse FB_PLOT;
+        }
+    }
+}
+
+// ---- run ----------------------------------------------------------------------------------
+word frame = 0;
+long mean;                                      // the cars' mean speed and the slowest one's, this frame
+long slow;
+
+// One frame: three steps, the cars on the ring, a row of the diagram every
+// other frame, and every seven frames (two seconds) a bar of the chart.
+proc tick() {
+    byte s;
+    for (s = 0; s < SUB; s++) { step(); }
+    draw_ring();
+    if (frame & 1) { draw_row(); }
+    long sum = 0;
+    slow = V0;
+    byte i;
+    for (i = 0; i < cars; i++) { sum += v[i]; if (v[i] < slow) { slow = v[i]; } }
+    mean = sum / cars;
+    histsum += mean;
+    histcount++;
+    if (histcount == 7) {
+        long h = (histsum / 7 * 18) / VFULL;
+        if (h > 18) { h = 18; }
+        hist[histn] = byte(h);
+        histn = (histn + 1) & 31;
+        histsum = 0;
+        histcount = 0;
+        draw_chart();
+    }
+    frame++;
+}
+
+print "BFL traffic: ", cars, " cars on a 230 m ring, each following the car ahead.\n";
+print "Keys: + more cars, - fewer, b a driver brakes hard, n drivers' wobble off and on.\n";
+byte i0;
+for (i0 = 0; i0 < cars; i0++) {
+    x[i0] = (RING / cars) * i0;
+    v[i0] = 20480;                             // all at 5 m/s to start
+    dx0[i0] = 255;
+}
+draw_ground();
+while (1) {
+    word t0 = millis();
+    // the keyboard
+    while (KEY_STATUS) {
+        pulse KEY_STATUS;
+        byte key = KEY_DATA;
+        if (key == '+' || key == '=') { add_car(); }
+        if (key == '-') { remove_car(); }
+        if (key == 'b' && hard == 255) { hard = byte(rnd(cars)); hardfor = 20; }
+        if (key == 'n') { wobble = !wobble; }
+    }
+    tick();
+    if (frame % 50 == 1) {
+        word kmh = word((mean * 36) / 40960);                  // Q12 m/s times 3.6
+        word flow = word(((mean * 3600) / 4096) * cars / 230);  // cars an hour past a point
+        print "  ", t / 10, " s: ", cars, " cars, mean speed ", kmh, " km/h, slowest ", word((slow * 36) / 40960), " km/h, flow ", flow, " cars/h\n";
+    }
+    while (millis() - t0 < FRAME_MS) { }
+}

@@ -105,7 +105,8 @@ It has signed and unsigned 8, 16 and 32-bit integers, pointers into a 64 KB heap
 (`rec proc` compiles to a trampoline with an explicit stack, `docs/TRAMPOLINE.md`).
 `bf --emit` writes the generated code with a source comment before each statement.
 `programs/samples/` has a linked list, a tree, a calculator, N queens, merge sort, a maze
-solver, Life, a revolving cube, a starfield and a raytracer; `programs/thirdparty/` has
+solver, Life, a revolving cube, a starfield, a raytracer, and three simulations: a flag
+of cloth in the wind, colliding galaxies and a traffic jam on a ring road; `programs/thirdparty/` has
 classic programs by Erik Bosman and Daniel B. Cristofani.
 
 ![raytracer.bfl: 16 frames of one camera orbit](docs/raytracer.gif)

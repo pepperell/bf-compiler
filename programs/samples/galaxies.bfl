@@ -1,0 +1,341 @@
+// galaxies.bfl - two disc galaxies meet, swing past each other and merge,
+// throwing out tidal tails and a bridge of stars, on the framebuffer.
+//
+// The method is Toomre and Toomre's (1972): each galaxy is a heavy core
+// with a disc of stars in circular orbits round it, and the stars are moved
+// by the gravity of both cores but have none of their own, so 500 stars cost
+// 1000 attractions a step rather than 125 000.
+//
+//   - Positions are in units of 1/2^20 (Q20), velocities in units of 1/2^24 a
+//     step (Q24), so a step adds the velocity shifted down 4 bits and nothing
+//     is ever multiplied by the time step.  A unit of length is 2 kpc and a
+//     step 0.45 million years.
+//   - A star's acceleration towards a core is GM dt^2 / (r^2 + e^2) along the
+//     unit vector to it: one integer square root and three divisions.  The
+//     softening e keeps a close pass finite.  Velocity first, then position
+//     (symplectic Euler), which keeps the orbits from spiralling in or out.
+//   - The discs start in exact circular orbits worked out with the same
+//     arithmetic as the steps, so they turn steadily until the other galaxy
+//     comes near.  Each has 100 stars 1 to 3 units out and 150 from 3 to 6,
+//     so the outer disc, where the tails come from, is well filled.
+//   - The cores fall past each other on a parabola, pericentre 7 units.  While
+//     they are close their dark haloes overlap and dynamical friction drags
+//     on their relative motion, so they fall back and merge.
+//   - Stars are drawn by adding their colour into the pixel under them
+//     (FB_READ, then each channel added and limited), so crowded parts of a
+//     disc glow brighter.  The camera looks down on the orbit at 55 degrees,
+//     turning slowly; it zooms out while many stars are off the screen and
+//     back in when few are, always keeping both cores in view.
+//   - The two galaxies' stars number k share an element of one array.  An
+//     access to a cell array copies its bytes over the distance from the
+//     temporaries to the array, so one array close by makes much less code
+//     than two, the second beyond the first.
+//
+// After 400 frames the next encounter starts, with the discs tilted another
+// way: both flat and turning with the orbit, which makes the longest tails;
+// one tilted steeply; one turning against the orbit, which comes through
+// almost untouched; both tilted.
+//
+//     bfui programs\samples\galaxies.bfl   F5 runs it (the framebuffer window
+//                                         opens by itself), Shift+F5 stops
+//     bf programs\samples\galaxies.bfl     runs headless; progress on stdout
+
+const NS = 250;             // stars in a disc
+const NIN = 100;            // of them in its inner part
+const SUB = 4;              // steps a frame
+const STEPS = 1600;         // steps an encounter lasts (720 million years)
+const MAGK = 386547057;     // GM dt^2 * 2^36: GM = 1 per core, dt = 0.075
+const EPS2 = 5898;          // a star's softening squared, Q16 (0.3 units)
+const CEPS2 = 65536;        // a core's (1 unit: the haloes are broad)
+const FAR = 26000;          // beyond 100 units (Q8) a core's pull is ignored
+const FRIC = 33;            // friction on the cores' relative motion per step, Q16
+const FRICR = 10;           // within this many units of each other
+const FRAME_MS = 33;
+
+struct Star { long x; long y; long z; long vx; long vy; long vz; }   // Q20, Q24
+struct Pair { Star a; Star b; }
+Pair st[250];                       // star k of galaxy A and of galaxy B
+
+// the cores
+long ax;  long ay;  long az;  long au;  long av;  long aw;
+long bx;  long by;  long bz;  long bu;  long bv;  long bw;
+
+// the camera: right and up, Q12, and the zoom in pixels a unit, Q8
+long rx;  long rz;
+long ux;  long uy;  long uz;
+long zoom;
+word lost;                          // stars drawn off the screen this frame
+
+// the acceleration worked out by pull(), Q24 per step
+long gx;  long gy;  long gz;
+
+word frame;
+word steps;
+dword seed = 1972;
+byte fsx[40];  byte fsy[40];        // faint stars of our own galaxy, in the background
+byte enc;
+
+// ---- maths --------------------------------------------------------------------------------
+// Sine of whole degrees times 1024 (Bhaskara I's formula, error under 0.2%).
+proc int sin1024(word deg) {
+    deg = deg % 360;
+    byte neg = 0;
+    if (deg >= 180) { deg -= 180; neg = 1; }
+    long p = long(deg) * (180 - deg);
+    int s = int((4096 * p) / (40500 - p));
+    if (neg) { return -s; }
+    return s;
+}
+
+// Square root of a non-negative 32-bit value: a power-of-four bound, then Newton.
+proc long isqrt(long v) {
+    if (v <= 0) { return 0; }
+    long bit = 1073741824;
+    long root = 32768;
+    while ((bit >> 8) > v) { bit = bit >> 8; root = root >> 4; }
+    while (bit > v) { bit = bit >> 2; root = root >> 1; }
+    long g = root + (root >> 1);
+    byte step;
+    for (step = 0; step < 3; step++) { g = (g + v / g) >> 1; }
+    return g;
+}
+
+proc word rnd(word n) {                        // 0 .. n-1
+    seed = seed * 1103515245 + 12345;
+    return mulshr(word(seed >> 16), n, 16);
+}
+
+shared proc word millis() {
+    pulse TICK_LATCH;
+    return word(TICKS1) * 256 + TICKS0;
+}
+
+// ---- gravity ------------------------------------------------------------------------------
+// The pull of a core at c on a body at p, into gx, gy, gz (Q24 per step^2).
+proc pull(long px, long py, long pz, long cx, long cy, long cz, long e2) {
+    long dx = (cx - px) >> 12;                  // Q8
+    long dy = (cy - py) >> 12;
+    long dz = (cz - pz) >> 12;
+    gx = 0;  gy = 0;  gz = 0;
+    if (dx > -FAR && dx < FAR && dy > -FAR && dy < FAR && dz > -FAR && dz < FAR) {
+        long r2 = dx * dx + dy * dy + dz * dz + e2;          // Q16
+        long inv = 16777216 / isqrt(r2);                     // 1 / r, Q16
+        long mag = MAGK / (r2 >> 4);                         // GM dt^2 / r^2, Q24
+        gx = mulshr(mulshr(dx, inv, 12), mag, 12);           // the unit vector (Q12) times it
+        gy = mulshr(mulshr(dy, inv, 12), mag, 12);
+        gz = mulshr(mulshr(dz, inv, 12), mag, 12);
+    }
+}
+
+// One step for a star: the pull of both cores, then the move.
+proc move(ref Star p) {
+    pull(p.x, p.y, p.z, ax, ay, az, EPS2);
+    p.vx += gx;  p.vy += gy;  p.vz += gz;
+    pull(p.x, p.y, p.z, bx, by, bz, EPS2);
+    p.vx += gx;  p.vy += gy;  p.vz += gz;
+    p.x += p.vx >> 4;
+    p.y += p.vy >> 4;
+    p.z += p.vz >> 4;
+}
+
+// One step for everything: the stars feel the cores where they were at the
+// start of the step, then the cores move.
+proc step() {
+    byte k;
+    for (k = 0; k < NS; k++) {
+        Pair q = st[k];
+        move(q.a);
+        move(q.b);
+        st[k] = q;
+    }
+    pull(ax, ay, az, bx, by, bz, CEPS2);         // equal masses: B feels the opposite pull
+    au += gx;  av += gy;  aw += gz;
+    bu -= gx;  bv -= gy;  bw -= gz;
+    // dynamical friction while the haloes overlap
+    long dx = (bx - ax) >> 20;
+    long dz = (bz - az) >> 20;
+    if (dx * dx + dz * dz < FRICR * FRICR) {
+        long fu = mulshr(bu - au, FRIC, 16);
+        long fv = mulshr(bv - av, FRIC, 16);
+        long fw = mulshr(bw - aw, FRIC, 16);
+        au += fu;  av += fv;  aw += fw;
+        bu -= fu;  bv -= fv;  bw -= fw;
+    }
+    ax += au >> 4;  ay += av >> 4;  az += aw >> 4;
+    bx += bu >> 4;  by += bv >> 4;  bz += bw >> 4;
+    steps++;
+}
+
+// ---- setting up ---------------------------------------------------------------------------
+// Star k of a disc round a core at c moving at v, tilted by incl degrees
+// about the x axis and then turned by node degrees about the vertical.  spin
+// is 1 for a disc turning with the orbit, 0 against it.
+proc place(ref Star p, byte k, long cx, long cy, long cz, long cu, long cv, long cw,
+           long si, long ci, long sn, long cn, byte spin) {
+    // the radius evenly spread in each part, so the disc is densest in the middle
+    long r8 = 768 + long(rnd(768));             // Q8: 3 to 6 units
+    if (k < NIN) { r8 = 256 + long(rnd(512)); }  // 1 to 3
+    // circular speed from the same sums as pull(): v^2 = a r
+    long r2 = r8 * r8 + EPS2;
+    long a = mulshr(MAGK / (r2 >> 4), (r8 << 16) / isqrt(r2), 16);    // Q24 per step^2
+    long vel = isqrt(a * r8) << 8;               // Q24 per step
+    word ang = rnd(360);
+    long c = sin1024(ang + 90);
+    long d = sin1024(ang);
+    // in the disc's own plane, Q20 and Q24
+    long px = c * r8 * 4;
+    long pz = d * r8 * 4;
+    long vx = -mulshr(d, vel, 10);
+    long vz = mulshr(c, vel, 10);
+    if (!spin) { vx = -vx; vz = -vz; }
+    // tilt about x
+    long py = -mulshr(pz, si, 10);
+    pz = mulshr(pz, ci, 10);
+    long vy = -mulshr(vz, si, 10);
+    vz = mulshr(vz, ci, 10);
+    // turn about y
+    long tx = mulshr(px, cn, 10) + mulshr(pz, sn, 10);
+    pz = mulshr(pz, cn, 10) - mulshr(px, sn, 10);
+    px = tx;
+    tx = mulshr(vx, cn, 10) + mulshr(vz, sn, 10);
+    vz = mulshr(vz, cn, 10) - mulshr(vx, sn, 10);
+    vx = tx;
+    p.x = cx + px;  p.y = cy + py;  p.z = cz + pz;
+    p.vx = cu + vx; p.vy = cv + vy; p.vz = cw + vz;
+}
+
+// The cores 18 units apart on a parabola with pericentre 7 (worked out by
+// hand: half the separation and half the relative velocity each), and their
+// discs, tilted the way encounter `which` has them.
+proc start(byte which) {
+    bx = -2097152;  by = 0;  bz = -9201217;
+    bu = 231849;    bv = 0;  bw = 184951;
+    ax = -bx;  ay = 0;  az = -bz;
+    au = -bu;  av = 0;  aw = -bw;
+    word ia = 0;    word na = 0;    word ib = 0;    word nb = 0;    byte sp = 1;
+    if (which == 1) { ib = 70;  nb = 30; }
+    if (which == 2) { ia = 35;  na = 300; sp = 0; }
+    if (which == 3) { ia = 50;  na = 80;  ib = 300; nb = 200; }
+    long sia = sin1024(ia);  long cia = sin1024(ia + 90);
+    long sna = sin1024(na);  long cna = sin1024(na + 90);
+    long sib = sin1024(ib);  long cib = sin1024(ib + 90);
+    long snb = sin1024(nb);  long cnb = sin1024(nb + 90);
+    byte k;
+    for (k = 0; k < NS; k++) {
+        Pair q;
+        place(q.a, k, ax, ay, az, au, av, aw, sia, cia, sna, cna, 1);
+        place(q.b, k, bx, by, bz, bu, bv, bw, sib, cib, snb, cnb, sp);
+        st[k] = q;
+    }
+    steps = 0;
+    zoom = 0;                               // fit the cores at once
+    print "Encounter ", which + 1, ": ";
+    if (which == 0) { print "both discs flat in the orbit, turning with it\n"; }
+    if (which == 1) { print "the second disc tilted 70 degrees\n"; }
+    if (which == 2) { print "the second disc turning against the orbit\n"; }
+    if (which == 3) { print "both discs tilted\n"; }
+}
+
+// ---- drawing ------------------------------------------------------------------------------
+// Add a colour (amounts per channel, packed as RRRGGGBB) into the pixel at
+// x, y, or count it lost if that is off the screen.  Shared: one copy for its
+// many callers, each of which would otherwise make its own trips down to the
+// registers.
+shared proc add(long x, long y, byte c) {
+    if (x >= 0 && x < 128 && y >= 0 && y < 64) {
+        FB_X = byte(x);
+        FB_Y = byte(y);
+        pulse FB_READ;
+        byte p = FB_COLOR;
+        byte r = p / 32 + c / 32;
+        byte g = p / 4 % 8 + c / 4 % 8;
+        byte b = p % 4 + c % 4;
+        if (r > 7) { r = 7; }
+        if (g > 7) { g = 7; }
+        if (b > 3) { b = 3; }
+        FB_COLOR = r * 32 + g * 4 + b;
+        pulse FB_PLOT;
+    } else {
+        lost++;
+    }
+}
+
+proc long scr_x(long px, long pz) { return 64 + mulshr(mulshr(px, rx, 12) + mulshr(pz, rz, 12), zoom, 28); }
+proc long scr_y(long px, long py, long pz) { return 32 - mulshr(mulshr(px, ux, 12) + mulshr(py, uy, 12) + mulshr(pz, uz, 12), zoom, 28); }
+
+// A core: a bright point in a soft glow.
+proc draw_core(long px, long py, long pz) {
+    long x = scr_x(px, pz);
+    long y = scr_y(px, py, pz);
+    add(x, y, 0xB6);
+    add(x - 1, y, 0x49);  add(x + 1, y, 0x49);
+    add(x, y - 1, 0x49);  add(x, y + 1, 0x49);
+    add(x - 1, y - 1, 0x24);  add(x + 1, y - 1, 0x24);
+    add(x - 1, y + 1, 0x24);  add(x + 1, y + 1, 0x24);
+}
+
+proc render() {
+    // the camera: 55 degrees above the orbit, turning a degree every three frames
+    word turn = (frame / 3 + 75) % 360;
+    long sp = sin1024(turn);  long cp = sin1024(turn + 90);
+    rx = cp << 2;   rz = -sp << 2;
+    ux = -mulshr(sp, 3355, 10);                 // sin 55 = 0.819, Q12 3355
+    uy = 2349;                                  // cos 55
+    uz = -mulshr(cp, 3355, 10);
+    // the most zoom that keeps both cores and 6 units round them on the screen
+    long dx = bx - ax;
+    long dy = by - ay;
+    long dz = bz - az;
+    long hx = (mulshr(dx, rx, 12) + mulshr(dz, rz, 12)) >> 13;                    // half the separation across, Q8
+    long hy = (mulshr(dx, ux, 12) + mulshr(dy, uy, 12) + mulshr(dz, uz, 12)) >> 13;  // and up the screen
+    if (hx < 0) { hx = -hx; }
+    if (hy < 0) { hy = -hy; }
+    long fit = (60 << 16) / (hx + 1536);        // Q8 pixels a unit
+    long fity = (28 << 16) / (hy + 1280);
+    if (fity < fit) { fit = fity; }
+    // out while more than one star in twelve was lost last frame, in while fewer than one in forty
+    if (lost > NS / 6) { zoom -= zoom >> 5; } else if (lost < NS / 20) { zoom += zoom >> 6; }
+    if (zoom == 0 || zoom > fit) { zoom = fit; }
+    lost = 0;
+    // black sky with a few faint stars of our own galaxy
+    FB_X = 0;  FB_Y = 0;  FB_COLOR = 0;
+    word i;
+    for (i = 0; i < 8192; i++) { pulse FB_PLOT; }
+    byte f;
+    for (f = 0; f < 40; f++) { add(fsx[f], fsy[f], 0x21); }
+    // the stars: A white inside and blue outside, B gold inside and orange outside
+    byte k;
+    for (k = 0; k < NS; k++) {
+        Pair q = st[k];
+        byte ca = 0x4A;  byte cb = 0x68;
+        if (k < NIN) { ca = 0x6E;  cb = 0x8C; }
+        add(scr_x(q.a.x, q.a.z), scr_y(q.a.x, q.a.y, q.a.z), ca);
+        add(scr_x(q.b.x, q.b.z), scr_y(q.b.x, q.b.y, q.b.z), cb);
+    }
+    draw_core(ax, ay, az);
+    draw_core(bx, by, bz);
+}
+
+// ---- run ----------------------------------------------------------------------------------
+print "BFL galaxies: two discs of ", NS, " stars each, ", SUB, " steps a frame.\n";
+byte f0;
+for (f0 = 0; f0 < 40; f0++) { fsx[f0] = byte(rnd(128)); fsy[f0] = byte(rnd(64)); }
+enc = 0;
+start(enc);
+while (1) {
+    word t0 = millis();
+    render();
+    word t1 = millis();
+    byte s;
+    for (s = 0; s < SUB; s++) { step(); }
+    word t2 = millis();
+    if (frame % 25 == 0) {
+        print "  ", (dword(steps) * 9) / 20, " million years: draw ", t1 - t0, " ms, physics ", t2 - t1, " ms\n";
+    }
+    while (millis() - t0 < FRAME_MS) { }
+    frame++;
+    if (steps >= STEPS) {
+        enc = (enc + 1) % 4;
+        start(enc);
+    }
+}
