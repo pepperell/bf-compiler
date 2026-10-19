@@ -111,7 +111,7 @@ solver, Life, a revolving cube, a starfield, a raytracer, and three simulations:
 of cloth in the wind, colliding galaxies and a traffic jam on a ring road; `programs/thirdparty/` has
 classic programs by Erik Bosman and Daniel B. Cristofani.
 
-![raytracer.bfl: 16 frames of one camera orbit](docs/raytracer.gif)
+![raytracer.bfl: one camera orbit, 36 frames at 10 degrees, at about the speed the JIT draws them](docs/raytracer.gif)
 
 **`raytracer.bfl`**: four reflective spheres, two lamps with soft shadows and a checkerboard
 floor, in fixed-point BFL on the framebuffer, each frame drawn into a back buffer
